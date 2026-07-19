@@ -472,6 +472,11 @@ struct PortableSearch;
 
 impl PortableSearch {
     #[inline]
+    fn find_byte(bytes: &[u8], needle: u8) -> Option<usize> {
+        bytes.iter().position(|&byte| byte == needle)
+    }
+
+    #[inline]
     fn find_any2(bytes: &[u8], first: u8, second: u8) -> Option<usize> {
         bytes.iter().position(|&byte| byte == first || byte == second)
     }
@@ -1287,20 +1292,28 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         let text_start = self.position + 2;
                         self.position += 2;
                         loop {
-                            match self.peek() {
-                                None => {
-                                    return Err(JsonError::Syntax {
-                                        offset: comment_start,
-                                        kind: SyntaxKind::UnterminatedComment,
-                                    })
-                                }
-                                Some(b'*') if self.peek_at(1) == Some(b'/') => {
-                                    self.record_comment(text_start, self.position, CommentStyle::Block)?;
-                                    self.position += 2;
-                                    break;
-                                }
-                                Some(_) => self.position += 1,
+                            let remaining = &self.source[self.position..];
+                            let Some(relative_star) = ActiveSearch::find_byte(remaining, b'*') else {
+                                self.check_limit(
+                                    self.position.saturating_sub(text_start).saturating_add(remaining.len()),
+                                    self.options.limits.max_comment_bytes,
+                                )?;
+                                return Err(JsonError::Syntax {
+                                    offset: comment_start,
+                                    kind: SyntaxKind::UnterminatedComment,
+                                });
+                            };
+                            self.check_limit(
+                                self.position.saturating_sub(text_start).saturating_add(relative_star),
+                                self.options.limits.max_comment_bytes,
+                            )?;
+                            self.position += relative_star;
+                            if self.peek_at(1) == Some(b'/') {
+                                self.record_comment(text_start, self.position, CommentStyle::Block)?;
+                                self.position += 2;
+                                break;
                             }
+                            self.position += 1;
                         }
                     }
                     _ => return Ok(()),
@@ -4066,9 +4079,31 @@ impl<'src, A: Allocator> BoundJsonView<'src, A> {
         self.root().get(key)
     }
 
+    /// Like [`get`](BoundJsonView::get), but distinguishes a missing child.
+    pub fn try_get<K: ResolveKey<A>>(&self, key: K) -> Option<Resolved<'_, A>> {
+        self.root().try_get(key)
+    }
+
+    /// Resolves an RFC 6901 pointer from the root.
+    pub fn pointer(&self, pointer: &str) -> Resolved<'_, A> {
+        self.root().pointer(pointer)
+    }
+
+    /// Like [`pointer`](BoundJsonView::pointer), but distinguishes a miss.
+    pub fn try_pointer(&self, pointer: &str) -> Option<Resolved<'_, A>> {
+        self.root().try_pointer(pointer)
+    }
+
     /// Writes compact JSON without accepting a separate source argument.
     pub fn write_json<W: fmt::Write>(&self, writer: &mut W) -> fmt::Result {
         self.root().write_json(writer)
+    }
+
+    /// Renders compact JSON without accepting a separate source argument.
+    pub fn to_json_string(&self) -> String {
+        let mut output = String::new();
+        let _ = self.write_json(&mut output);
+        output
     }
 
     /// Returns the source bytes retained by this view.
@@ -5500,6 +5535,14 @@ mod tests {
             parse_with(b"/* long */ 1", &comments),
             Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
         ));
+        let bounded_comment = ParseOptions::jsonc().limits(ParseLimits {
+            max_comment_bytes: Some(2),
+            ..ParseLimits::unlimited()
+        });
+        assert!(matches!(
+            parse_with(b"/* long", &bounded_comment),
+            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+        ));
     }
 
     #[test]
@@ -5540,7 +5583,8 @@ mod tests {
     fn bound_view_carries_its_source() {
         let document = view_bound(br#"{"a":{"b":[10,20]}}"#).unwrap();
         assert_eq!(document.get("a").get("b").get(1).as_u64(), Some(20));
-        assert_eq!(document.root().to_string(), r#"{"a":{"b":[10,20]}}"#);
+        assert_eq!(document.pointer("/a/b/1").as_u64(), Some(20));
+        assert_eq!(document.to_json_string(), r#"{"a":{"b":[10,20]}}"#);
     }
 
     /// A distinct allocator type that just forwards to the global heap, used to
