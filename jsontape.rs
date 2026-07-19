@@ -474,25 +474,51 @@ fn hex4_at(bytes: &[u8], start: usize) -> Option<u16> {
     Some(value)
 }
 
-/// Private byte-search seam for scanner hot paths. The scalar implementation is
-/// deliberately simple today; a future `speed` feature can replace this one
-/// implementation with StringZilla without leaking that dependency into parser
-/// control flow or public APIs.
-struct PortableSearch;
+/// A private set of all possible byte values. The representation maps directly
+/// to StringZilla's byte-mask search API while staying dependency-free today.
+#[derive(Clone, Copy)]
+struct ByteMask([u64; 4]);
 
-impl PortableSearch {
-    #[inline]
-    fn find_byte(bytes: &[u8], needle: u8) -> Option<usize> {
-        bytes.iter().position(|&byte| byte == needle)
+impl ByteMask {
+    const fn with(byte: u8) -> Self {
+        let mut words = [0; 4];
+        words[(byte / 64) as usize] = 1u64 << (byte % 64);
+        Self(words)
+    }
+
+    const fn union(self, other: Self) -> Self {
+        Self([
+            self.0[0] | other.0[0],
+            self.0[1] | other.0[1],
+            self.0[2] | other.0[2],
+            self.0[3] | other.0[3],
+        ])
     }
 
     #[inline]
-    fn find_any2(bytes: &[u8], first: u8, second: u8) -> Option<usize> {
-        bytes.iter().position(|&byte| byte == first || byte == second)
+    const fn contains(self, byte: u8) -> bool {
+        self.0[(byte / 64) as usize] & (1u64 << (byte % 64)) != 0
+    }
+}
+
+/// Private byte-search seam for scanner hot paths.
+trait ByteSearch {
+    fn find_first(bytes: &[u8], mask: ByteMask) -> Option<usize>;
+}
+
+struct PortableSearch;
+
+impl ByteSearch for PortableSearch {
+    #[inline]
+    fn find_first(bytes: &[u8], mask: ByteMask) -> Option<usize> {
+        bytes.iter().position(|&byte| mask.contains(byte))
     }
 }
 
 type ActiveSearch = PortableSearch;
+
+const LINE_BREAKS: ByteMask = ByteMask::with(b'\n').union(ByteMask::with(b'\r'));
+const ASTERISK: ByteMask = ByteMask::with(b'*');
 
 /// Decodes an RFC 6901 reference token, unescaping `~1` to `/` and `~0` to `~`.
 /// Allocates only when a `~` is present; the order matters so `~01` becomes `~1`.
@@ -1326,7 +1352,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         let text_start = self.position + 2;
                         self.position += 2;
                         let remaining = &self.source[self.position..];
-                        self.position += ActiveSearch::find_any2(remaining, b'\n', b'\r')
+                        self.position += ActiveSearch::find_first(remaining, LINE_BREAKS)
                             .unwrap_or(remaining.len());
                         self.record_comment(text_start, self.position, CommentStyle::Line)?;
                     }
@@ -1336,7 +1362,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         self.position += 2;
                         loop {
                             let remaining = &self.source[self.position..];
-                            let Some(relative_star) = ActiveSearch::find_byte(remaining, b'*') else {
+                            let Some(relative_star) = ActiveSearch::find_first(remaining, ASTERISK) else {
                                 self.check_limit(
                                     self.position.saturating_sub(text_start).saturating_add(remaining.len()),
                                     self.options.limits.max_comment_bytes,
@@ -5655,6 +5681,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn byte_masks_find_first_interesting_byte() {
+        let mask = ByteMask::with(b'"').union(ByteMask::with(b'\\'));
+        assert!(mask.contains(b'"'));
+        assert!(mask.contains(b'\\'));
+        assert!(!mask.contains(b'x'));
+        assert_eq!(ActiveSearch::find_first(b"plain\\escape", mask), Some(5));
+        assert_eq!(ActiveSearch::find_first(b"plain", mask), None);
     }
 
     /// A distinct allocator type that just forwards to the global heap, used to
