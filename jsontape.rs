@@ -549,30 +549,48 @@ pub enum Indent {
 /// Controls how a document is rendered back to JSON text.
 ///
 /// `indent` of `None` writes compact JSON with no insignificant whitespace;
-/// `Some(indent)` expands each container one element per line at the given
-/// indentation. Construct one with [`FormatOptions::compact`] or
-/// [`FormatOptions::pretty`] and pass it to `to_string_with` / `write_json_with`.
+/// `Some(indent)` indents nested containers at the given step. When `max_width`
+/// is `None` every non-empty container expands one element per line; when it is
+/// `Some(columns)` a container is printed inline if its single-line form fits in
+/// the remaining columns and expanded otherwise. Construct one with
+/// [`FormatOptions::compact`], [`FormatOptions::pretty`], or
+/// [`FormatOptions::pretty_width`] and pass it to `to_string_with` /
+/// `write_json_with`.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct FormatOptions {
     /// Indentation per nesting level, or `None` for compact output.
     pub indent: Option<Indent>,
+    /// Column budget for width-based wrapping, or `None` to always expand.
+    pub max_width: Option<usize>,
 }
 
 impl FormatOptions {
     /// Compact output: no newlines and no spaces around `,` or `:`.
     pub const fn compact() -> Self {
-        Self { indent: None }
+        Self { indent: None, max_width: None }
     }
 
-    /// Indented output at two spaces per nesting level.
+    /// Indented output at two spaces per nesting level, always expanded.
     pub const fn pretty() -> Self {
-        Self { indent: Some(Indent::Spaces(2)) }
+        Self { indent: Some(Indent::Spaces(2)), max_width: None }
+    }
+
+    /// Two-space indentation that keeps a container on one line while it fits
+    /// within `columns`, wrapping to one element per line only when it does not.
+    pub const fn pretty_width(columns: usize) -> Self {
+        Self { indent: Some(Indent::Spaces(2)), max_width: Some(columns) }
     }
 
     /// Sets the indentation, returning the updated options.
     pub const fn with_indent(mut self, indent: Indent) -> Self {
         self.indent = Some(indent);
+        self
+    }
+
+    /// Sets the wrapping column budget, returning the updated options.
+    pub const fn with_max_width(mut self, columns: usize) -> Self {
+        self.max_width = Some(columns);
         self
     }
 }
@@ -599,6 +617,51 @@ fn write_indent<W: fmt::Write>(writer: &mut W, indent: Indent, depth: usize) -> 
         }
     }
     Ok(())
+}
+
+/// Column reached by an indent of `depth` levels; a tab counts as one column.
+fn indent_cols(indent: Indent, depth: usize) -> usize {
+    match indent {
+        Indent::Spaces(width) => width as usize * depth,
+        Indent::Tabs => depth,
+    }
+}
+
+/// A [`fmt::Write`] sink that counts columns and refuses further input once it
+/// would exceed `limit`, so a fits-check stops the instant a line overflows.
+struct WidthLimit {
+    used: usize,
+    limit: usize,
+}
+
+impl WidthLimit {
+    fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+}
+
+impl fmt::Write for WidthLimit {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.used += text.chars().count();
+        if self.used > self.limit {
+            return Err(fmt::Error);
+        }
+        Ok(())
+    }
+}
+
+/// Columns the escaped, quoted form of `text` occupies on one line.
+fn escaped_width(text: &str) -> usize {
+    let mut counter = WidthLimit::new(usize::MAX);
+    let _ = write_escaped_str(&mut counter, text);
+    counter.used
+}
+
+/// Columns the raw source span `span` occupies on one line.
+fn raw_string_width(source: &[u8], span: Span) -> usize {
+    let mut counter = WidthLimit::new(usize::MAX);
+    let _ = write_raw_string(&mut counter, source, span);
+    counter.used
 }
 
 /// Writes `text` as a quoted JSON string, escaping what the grammar requires.
@@ -2277,6 +2340,105 @@ impl<A: Allocator> Json<A> {
         }
     }
 
+    /// Writes this value on a single line, spacing `,` and `:` for readability.
+    fn write_inline<W: fmt::Write>(&self, writer: &mut W) -> fmt::Result {
+        match self {
+            Json::Null => writer.write_str("null"),
+            Json::Boolean(value) => writer.write_str(if *value { "true" } else { "false" }),
+            Json::Integer(value) => write!(writer, "{value}"),
+            Json::Unsigned(value) => write!(writer, "{value}"),
+            Json::Float(value) => write_number(writer, *value),
+            Json::BigNumber(number) => writer.write_str(number.as_str()),
+            Json::String(string) => write_escaped_str(writer, string.as_str()),
+            Json::Array(items) => {
+                writer.write_char('[')?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        writer.write_str(", ")?;
+                    }
+                    item.write_inline(writer)?;
+                }
+                writer.write_char(']')
+            }
+            Json::Object(entries) => {
+                writer.write_char('{')?;
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        writer.write_str(", ")?;
+                    }
+                    write_escaped_str(writer, key.as_str())?;
+                    writer.write_str(": ")?;
+                    value.write_inline(writer)?;
+                }
+                writer.write_char('}')
+            }
+        }
+    }
+
+    /// Columns the single-line form occupies, or `None` once it exceeds `limit`.
+    fn inline_width(&self, limit: usize) -> Option<usize> {
+        let mut counter = WidthLimit::new(limit);
+        match self.write_inline(&mut counter) {
+            Ok(()) => Some(counter.used),
+            Err(_) => None,
+        }
+    }
+
+    /// Writes this value wrapping to `max_width` columns, starting at column
+    /// `col`; returns the column reached. A container that fits on the current
+    /// line is emitted inline with no per-child re-measurement, otherwise it is
+    /// expanded one element per line and each child is placed recursively.
+    fn write_wrapped<W: fmt::Write>(
+        &self,
+        writer: &mut W,
+        indent: Indent,
+        max_width: usize,
+        depth: usize,
+        col: usize,
+    ) -> Result<usize, fmt::Error> {
+        if let Some(width) = self.inline_width(max_width.saturating_sub(col)) {
+            self.write_inline(writer)?;
+            return Ok(col + width);
+        }
+        match self {
+            Json::Array(items) if !items.is_empty() => {
+                writer.write_char('[')?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        writer.write_char(',')?;
+                    }
+                    write_indent(writer, indent, depth + 1)?;
+                    let start = indent_cols(indent, depth + 1);
+                    item.write_wrapped(writer, indent, max_width, depth + 1, start)?;
+                }
+                write_indent(writer, indent, depth)?;
+                writer.write_char(']')?;
+                Ok(indent_cols(indent, depth) + 1)
+            }
+            Json::Object(entries) if !entries.is_empty() => {
+                writer.write_char('{')?;
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        writer.write_char(',')?;
+                    }
+                    write_indent(writer, indent, depth + 1)?;
+                    write_escaped_str(writer, key.as_str())?;
+                    writer.write_str(": ")?;
+                    let start = indent_cols(indent, depth + 1) + escaped_width(key.as_str()) + 2;
+                    value.write_wrapped(writer, indent, max_width, depth + 1, start)?;
+                }
+                write_indent(writer, indent, depth)?;
+                writer.write_char('}')?;
+                Ok(indent_cols(indent, depth) + 1)
+            }
+            // A scalar or empty container wider than the budget still prints inline.
+            _ => {
+                self.write_inline(writer)?;
+                Ok(col + self.inline_width(usize::MAX).unwrap_or(0))
+            }
+        }
+    }
+
     /// Writes this value as compact JSON.
     pub fn write_json<W: fmt::Write>(&self, writer: &mut W) -> fmt::Result {
         self.write_layout(writer, FormatOptions::compact(), 0)
@@ -2294,7 +2456,12 @@ impl<A: Allocator> Json<A> {
         writer: &mut W,
         options: FormatOptions,
     ) -> fmt::Result {
-        self.write_layout(writer, options, 0)
+        match (options.indent, options.max_width) {
+            (Some(indent), Some(max_width)) => {
+                self.write_wrapped(writer, indent, max_width, 0, 0).map(|_| ())
+            }
+            _ => self.write_layout(writer, options, 0),
+        }
     }
 
     /// Renders this value as JSON indented by `indent` spaces per level.
@@ -2492,6 +2659,102 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
+    /// Writes this view on a single line, spacing `,` and `:` for readability.
+    fn write_inline<W: fmt::Write>(&self, source: &[u8], writer: &mut W) -> fmt::Result {
+        match self {
+            JsonView::Null => writer.write_str("null"),
+            JsonView::Boolean(value) => writer.write_str(if *value { "true" } else { "false" }),
+            JsonView::Integer(value) => write!(writer, "{value}"),
+            JsonView::Unsigned(value) => write!(writer, "{value}"),
+            JsonView::Float(value) => write_number(writer, *value),
+            JsonView::BigNumber(span) => writer.write_str(span.resolve(source).unwrap_or("")),
+            JsonView::String(span) => write_raw_string(writer, source, *span),
+            JsonView::Array(items) => {
+                writer.write_char('[')?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        writer.write_str(", ")?;
+                    }
+                    item.write_inline(source, writer)?;
+                }
+                writer.write_char(']')
+            }
+            JsonView::Object(entries) => {
+                writer.write_char('{')?;
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        writer.write_str(", ")?;
+                    }
+                    write_raw_string(writer, source, *key)?;
+                    writer.write_str(": ")?;
+                    value.write_inline(source, writer)?;
+                }
+                writer.write_char('}')
+            }
+        }
+    }
+
+    /// Columns the single-line form occupies, or `None` once it exceeds `limit`.
+    fn inline_width(&self, source: &[u8], limit: usize) -> Option<usize> {
+        let mut counter = WidthLimit::new(limit);
+        match self.write_inline(source, &mut counter) {
+            Ok(()) => Some(counter.used),
+            Err(_) => None,
+        }
+    }
+
+    /// Writes this view wrapping to `max_width` columns; see [`Json::write_wrapped`].
+    fn write_wrapped<W: fmt::Write>(
+        &self,
+        source: &[u8],
+        writer: &mut W,
+        indent: Indent,
+        max_width: usize,
+        depth: usize,
+        col: usize,
+    ) -> Result<usize, fmt::Error> {
+        if let Some(width) = self.inline_width(source, max_width.saturating_sub(col)) {
+            self.write_inline(source, writer)?;
+            return Ok(col + width);
+        }
+        match self {
+            JsonView::Array(items) if !items.is_empty() => {
+                writer.write_char('[')?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        writer.write_char(',')?;
+                    }
+                    write_indent(writer, indent, depth + 1)?;
+                    let start = indent_cols(indent, depth + 1);
+                    item.write_wrapped(source, writer, indent, max_width, depth + 1, start)?;
+                }
+                write_indent(writer, indent, depth)?;
+                writer.write_char(']')?;
+                Ok(indent_cols(indent, depth) + 1)
+            }
+            JsonView::Object(entries) if !entries.is_empty() => {
+                writer.write_char('{')?;
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        writer.write_char(',')?;
+                    }
+                    write_indent(writer, indent, depth + 1)?;
+                    write_raw_string(writer, source, *key)?;
+                    writer.write_str(": ")?;
+                    let start = indent_cols(indent, depth + 1) + raw_string_width(source, *key) + 2;
+                    value.write_wrapped(source, writer, indent, max_width, depth + 1, start)?;
+                }
+                write_indent(writer, indent, depth)?;
+                writer.write_char('}')?;
+                Ok(indent_cols(indent, depth) + 1)
+            }
+            _ => {
+                self.write_inline(source, writer)?;
+                Ok(col + self.inline_width(source, usize::MAX).unwrap_or(0))
+            }
+        }
+    }
+
     /// Writes this view as compact JSON, resolving spans against `source`.
     pub fn write_json<W: fmt::Write>(&self, source: &[u8], writer: &mut W) -> fmt::Result {
         self.write_layout(source, writer, FormatOptions::compact(), 0)
@@ -2515,7 +2778,12 @@ impl<A: Allocator> JsonView<A> {
         writer: &mut W,
         options: FormatOptions,
     ) -> fmt::Result {
-        self.write_layout(source, writer, options, 0)
+        match (options.indent, options.max_width) {
+            (Some(indent), Some(max_width)) => {
+                self.write_wrapped(source, writer, indent, max_width, 0, 0).map(|_| ())
+            }
+            _ => self.write_layout(source, writer, options, 0),
+        }
     }
 
     /// Renders this view as compact JSON.
@@ -3802,6 +4070,40 @@ mod tests {
         // Tabs indent one tab per level instead of spaces.
         let tabbed = document.to_string_with(FormatOptions::pretty().with_indent(Indent::Tabs));
         assert_eq!(tabbed, "{\n\t\"a\": [\n\t\t1,\n\t\t2\n\t],\n\t\"b\": {}\n}");
+    }
+
+    #[test]
+    fn width_based_wrapping() {
+        let document = parse(br#"{"a":[1,2],"b":{}}"#).unwrap();
+
+        // A generous budget keeps the whole document on one readable line.
+        assert_eq!(
+            document.to_string_with(FormatOptions::pretty_width(80)),
+            r#"{"a": [1, 2], "b": {}}"#,
+        );
+        // A tighter budget expands the object but keeps the short array inline.
+        assert_eq!(
+            document.to_string_with(FormatOptions::pretty_width(20)),
+            "{\n  \"a\": [1, 2],\n  \"b\": {}\n}",
+        );
+        // A degenerate budget expands everything the always-expand printer would,
+        // still keeping empty containers and scalars on their own line.
+        assert_eq!(
+            document.to_string_with(FormatOptions::pretty_width(1)),
+            document.to_string_pretty(2),
+        );
+
+        // The zero-copy view wraps identically against its source.
+        let source = br#"{"a":[1,2],"b":{}}"#;
+        let view = view(source).unwrap();
+        assert_eq!(
+            view.to_json_string_with(source, FormatOptions::pretty_width(80)),
+            r#"{"a": [1, 2], "b": {}}"#,
+        );
+        assert_eq!(
+            view.to_json_string_with(source, FormatOptions::pretty_width(20)),
+            "{\n  \"a\": [1, 2],\n  \"b\": {}\n}",
+        );
     }
 
     #[test]
