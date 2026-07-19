@@ -5587,6 +5587,29 @@ mod tests {
         assert_eq!(document.to_json_string(), r#"{"a":{"b":[10,20]}}"#);
     }
 
+    #[test]
+    fn scanner_paths_agree_under_byte_mutation() {
+        // A compact, deterministic fuzz-regression corpus. Every mutation must
+        // either be rejected by both DOM builders or re-serialize as strict JSON.
+        let seed = br#"{"key":"a\nb","items":[0,true,null],"ratio":1.25e-2}"#;
+        let replacements = [0, b' ', b'"', b'\\', b'[', b']', b'{', b'}', b',', b':', b'0', b'x', 0xff];
+        for index in 0..seed.len() {
+            for replacement in replacements {
+                let mut source = seed.to_vec();
+                source[index] = replacement;
+                let owned = parse(&source);
+                let borrowed = view(&source);
+                assert_eq!(owned.is_ok(), borrowed.is_ok(), "mutation at {index} to {replacement:#x}");
+                if let Ok(document) = owned {
+                    assert!(parse(document.to_string().as_bytes()).is_ok());
+                }
+                if let Ok(document) = borrowed {
+                    assert!(parse(document.to_json_string(&source).as_bytes()).is_ok());
+                }
+            }
+        }
+    }
+
     /// A distinct allocator type that just forwards to the global heap, used to
     /// prove the ergonomics work for any allocator, not only `Global`.
     #[derive(Clone, Copy)]
