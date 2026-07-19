@@ -294,16 +294,6 @@ fn hex_value(byte: u8) -> Option<u16> {
     }
 }
 
-/// FNV-1a hash of a byte sequence, used to deduplicate object keys.
-fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 /// Decodes an RFC 6901 reference token, unescaping `~1` to `/` and `~0` to `~`.
 /// Allocates only when a `~` is present; the order matters so `~01` becomes `~1`.
 fn decode_pointer_token(raw: &str) -> Cow<'_, str> {
@@ -649,10 +639,8 @@ trait DomBuilder<A: Allocator + Clone> {
     fn key(source: &[u8], span: Span, allocator: &A) -> Result<Self::Key, JsonError>;
     fn array(items: Vec<Self::Value, A>) -> Self::Value;
     fn object(entries: Vec<(Self::Key, Self::Value), A>) -> Self::Value;
-    /// Whether two object keys decode to the same string, for duplicate handling.
-    fn keys_equal(source: &[u8], left: &Self::Key, right: &Self::Key) -> bool;
-    /// A hash of a key's decoded bytes, for duplicate detection on large objects.
-    fn key_hash(source: &[u8], key: &Self::Key) -> u64;
+    /// Orders two object keys by their decoded bytes, for duplicate handling.
+    fn key_compare(source: &[u8], left: &Self::Key, right: &Self::Key) -> Ordering;
 }
 
 struct Parser<'a, A: Allocator + Clone, B: DomBuilder<A>> {
@@ -971,7 +959,6 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
         self.position += 1; // opening brace
         let mut entries: Vec<(B::Key, B::Value), A> = Vec::new_in(self.allocator.clone());
-        let mut index: KeyIndex<A> = KeyIndex::new_in(self.allocator.clone());
         self.skip_whitespace();
         if self.peek() == Some(b'}') {
             self.position += 1;
@@ -991,7 +978,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
             self.position += 1;
             let value = self.value()?;
-            self.insert_object_entry(&mut entries, &mut index, key, value)?;
+            self.try_push(&mut entries, (key, value))?;
             self.skip_whitespace();
             match self.peek() {
                 Some(b',') => self.position += 1,
@@ -1003,6 +990,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 _ => return self.fault(),
             }
         }
+        self.dedup_object(&mut entries)?;
         self.depth -= 1;
         Ok(B::object(entries))
     }
@@ -1013,156 +1001,138 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(())
     }
 
-    /// Adds a key and value to an object under the configured duplicate policy.
-    /// Small objects use a linear scan; once an object grows past
-    /// `DEDUP_LINEAR_LIMIT` a hash `index` keeps total dedup work linear.
-    fn insert_object_entry(
-        &self,
-        entries: &mut Vec<(B::Key, B::Value), A>,
-        index: &mut KeyIndex<A>,
-        key: B::Key,
-        value: B::Value,
-    ) -> Result<(), JsonError> {
-        if self.options.duplicate_keys == DuplicateKeys::KeepAll {
-            return self.try_push(entries, (key, value));
-        }
-
-        // Small objects: a linear scan is cheaper than maintaining the index.
-        if !index.is_built() {
-            if entries.len() < DEDUP_LINEAR_LIMIT {
-                if let Some(position) = entries
-                    .iter()
-                    .position(|(existing, _)| B::keys_equal(self.source, existing, &key))
-                {
-                    return self.apply_duplicate_policy(entries, position, value);
-                }
-                return self.try_push(entries, (key, value));
-            }
-            // Crossed the threshold: build the index over the existing keys.
-            // Under a merging policy every entry is a distinct first-occurrence
-            // key, so positions are exactly `0..entries.len()`.
-            index.build(entries.len())?;
-            for position in 0..entries.len() as u32 {
-                index.insert_slot(B::key_hash(self.source, &entries[position as usize].0), position);
-            }
-        }
-
-        let hash = B::key_hash(self.source, &key);
-        if let Some(position) = index.lookup(hash, |position| {
-            B::keys_equal(self.source, &entries[position as usize].0, &key)
-        }) {
-            return self.apply_duplicate_policy(entries, position as usize, value);
-        }
-        let new_position = entries.len() as u32;
-        self.try_push(entries, (key, value))?;
-        index.reserve(|position| B::key_hash(self.source, &entries[position as usize].0))?;
-        index.insert_slot(hash, new_position);
-        Ok(())
-    }
-
-    fn apply_duplicate_policy(
-        &self,
-        entries: &mut Vec<(B::Key, B::Value), A>,
-        position: usize,
-        value: B::Value,
-    ) -> Result<(), JsonError> {
-        match self.options.duplicate_keys {
-            DuplicateKeys::LastWins => entries[position].1 = value,
-            DuplicateKeys::FirstWins => {}
-            DuplicateKeys::Reject => return self.fault_kind(SyntaxKind::DuplicateKey),
-            DuplicateKeys::KeepAll => unreachable!(),
-        }
-        Ok(())
-    }
-}
-
-/// Objects below this many entries deduplicate with a linear scan; larger ones
-/// build a [`KeyIndex`] to stay linear-total.
-const DEDUP_LINEAR_LIMIT: usize = 16;
-
-/// A small open-addressing table mapping a key hash to an object-entry position,
-/// so duplicate detection on a large object is linear rather than quadratic. It
-/// allocates nothing until [`build`](KeyIndex::build) is called, and every stored
-/// position is a distinct first-occurrence key, so positions are contiguous.
-struct KeyIndex<A: Allocator> {
-    // Each slot holds `position + 1`; `0` marks an empty slot.
-    slots: Vec<u32, A>,
-    mask: usize,
-    filled: usize,
-}
-
-impl<A: Allocator + Clone> KeyIndex<A> {
-    fn new_in(allocator: A) -> Self {
-        KeyIndex {
-            slots: Vec::new_in(allocator),
-            mask: 0,
-            filled: 0,
-        }
-    }
-
-    fn is_built(&self) -> bool {
-        self.mask != 0
-    }
-
-    /// Allocates a zeroed table sized to hold `entry_count` keys below a 3/4 load
-    /// factor, then leaves it empty for the caller to fill.
-    fn build(&mut self, entry_count: usize) -> Result<(), JsonError> {
-        let capacity = (entry_count.max(1) * 2).next_power_of_two().max(32);
-        self.allocate(capacity)
-    }
-
-    fn allocate(&mut self, capacity: usize) -> Result<(), JsonError> {
-        self.slots.clear();
-        self.slots
-            .try_reserve(capacity)
-            .map_err(|_| JsonError::Allocation)?;
-        self.slots.resize(capacity, 0);
-        self.mask = capacity - 1;
-        self.filled = 0;
-        Ok(())
-    }
-
-    /// Inserts `position` under `hash` by linear probing. A free slot is assumed
-    /// to exist (guaranteed by a preceding [`reserve`](KeyIndex::reserve)).
-    fn insert_slot(&mut self, hash: u64, position: u32) {
-        let mut slot = (hash as usize) & self.mask;
-        while self.slots[slot] != 0 {
-            slot = (slot + 1) & self.mask;
-        }
-        self.slots[slot] = position + 1;
-        self.filled += 1;
-    }
-
-    /// Returns a stored position whose key satisfies `equal`, or `None`.
-    fn lookup(&self, hash: u64, mut equal: impl FnMut(u32) -> bool) -> Option<u32> {
-        let mut slot = (hash as usize) & self.mask;
-        loop {
-            let stored = self.slots[slot];
-            if stored == 0 {
-                return None;
-            }
-            let position = stored - 1;
-            if equal(position) {
-                return Some(position);
-            }
-            slot = (slot + 1) & self.mask;
-        }
-    }
-
-    /// Ensures room for one more key, doubling and rehashing positions
-    /// `0..filled` via `hash_of` if the load factor would exceed 3/4.
-    fn reserve(&mut self, hash_of: impl Fn(u32) -> u64) -> Result<(), JsonError> {
-        if (self.filled + 1) * 4 <= (self.mask + 1) * 3 {
+    /// Applies the duplicate-key policy to a fully collected object. `KeepAll`
+    /// keeps every entry; the others keep one entry per key in first-occurrence
+    /// order — `LastWins` with the last value, `FirstWins` with the first,
+    /// `Reject` faulting. Small objects dedup with a linear scan; larger ones sort
+    /// a permutation of key positions, so the work stays `O(n log n)` on any
+    /// input — no hash, so no hash-collision denial of service.
+    fn dedup_object(&self, entries: &mut Vec<(B::Key, B::Value), A>) -> Result<(), JsonError> {
+        if self.options.duplicate_keys == DuplicateKeys::KeepAll || entries.len() < 2 {
             return Ok(());
         }
-        let count = self.filled;
-        self.allocate((self.mask + 1) * 2)?;
+        if entries.len() <= DEDUP_LINEAR_LIMIT {
+            self.dedup_linear(entries)
+        } else {
+            self.dedup_sorted(entries)
+        }
+    }
+
+    fn dedup_linear(&self, entries: &mut Vec<(B::Key, B::Value), A>) -> Result<(), JsonError> {
+        let mut current = 1;
+        while current < entries.len() {
+            let earlier = (0..current).find(|&j| {
+                B::key_compare(self.source, &entries[j].0, &entries[current].0) == Ordering::Equal
+            });
+            match earlier {
+                None => current += 1,
+                Some(first) => match self.options.duplicate_keys {
+                    DuplicateKeys::LastWins => {
+                        let (_, value) = entries.remove(current);
+                        entries[first].1 = value;
+                    }
+                    DuplicateKeys::FirstWins => {
+                        entries.remove(current);
+                    }
+                    DuplicateKeys::Reject => return self.fault_kind(SyntaxKind::DuplicateKey),
+                    DuplicateKeys::KeepAll => unreachable!(),
+                },
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)] // the take-by-index slot buffer is local
+    fn dedup_sorted(&self, entries: &mut Vec<(B::Key, B::Value), A>) -> Result<(), JsonError> {
+        let count = entries.len();
+
+        // Sort a permutation of positions by decoded key, so equal keys are adjacent.
+        let mut order: Vec<u32, A> = Vec::new_in(self.allocator.clone());
+        order.try_reserve(count).map_err(|_| JsonError::Allocation)?;
         for position in 0..count as u32 {
-            self.insert_slot(hash_of(position), position);
+            order.push(position);
+        }
+        order.sort_unstable_by(|&a, &b| {
+            B::key_compare(self.source, &entries[a as usize].0, &entries[b as usize].0)
+        });
+
+        // Decide each position's fate: kept positions take their own value unless a
+        // later duplicate overrides it (`LastWins`); others are removed.
+        let mut removed: Vec<bool, A> = Vec::new_in(self.allocator.clone());
+        let mut value_from: Vec<u32, A> = Vec::new_in(self.allocator.clone());
+        removed.try_reserve(count).map_err(|_| JsonError::Allocation)?;
+        value_from.try_reserve(count).map_err(|_| JsonError::Allocation)?;
+        for position in 0..count as u32 {
+            removed.push(false);
+            value_from.push(position);
+        }
+
+        let mut run_start = 0;
+        while run_start < count {
+            let mut run_end = run_start + 1;
+            while run_end < count
+                && B::key_compare(
+                    self.source,
+                    &entries[order[run_end] as usize].0,
+                    &entries[order[run_start] as usize].0,
+                ) == Ordering::Equal
+            {
+                run_end += 1;
+            }
+            if run_end - run_start > 1 {
+                if self.options.duplicate_keys == DuplicateKeys::Reject {
+                    return self.fault_kind(SyntaxKind::DuplicateKey);
+                }
+                // `sort_unstable` doesn't preserve input order within a run, so scan
+                // for the first and last original positions of this key.
+                let mut first = u32::MAX;
+                let mut last = 0;
+                for slot in run_start..run_end {
+                    let position = order[slot];
+                    first = first.min(position);
+                    last = last.max(position);
+                }
+                for slot in run_start..run_end {
+                    let position = order[slot];
+                    if position != first {
+                        removed[position as usize] = true;
+                    }
+                }
+                if self.options.duplicate_keys == DuplicateKeys::LastWins {
+                    value_from[first as usize] = last;
+                }
+            }
+            run_start = run_end;
+        }
+
+        // Rebuild in original order, moving a winning later value into its keeper.
+        let old = core::mem::replace(entries, Vec::new_in(self.allocator.clone()));
+        let mut slots: Vec<Option<(B::Key, B::Value)>, A> = Vec::new_in(self.allocator.clone());
+        slots.try_reserve(count).map_err(|_| JsonError::Allocation)?;
+        for entry in old {
+            slots.push(Some(entry));
+        }
+        for position in 0..count {
+            if removed[position] {
+                continue;
+            }
+            let source = value_from[position] as usize;
+            let entry = if source == position {
+                slots[position].take().unwrap()
+            } else {
+                let key = slots[position].take().unwrap().0;
+                let value = slots[source].take().unwrap().1;
+                (key, value)
+            };
+            self.try_push(entries, entry)?;
         }
         Ok(())
     }
 }
+
+/// Objects at or below this many entries deduplicate with a linear scan; larger
+/// ones sort key positions to stay sub-quadratic.
+const DEDUP_LINEAR_LIMIT: usize = 16;
 
 /// An immutable JSON document that borrows its text from the parsed source.
 /// String values and object keys are stored as [`Span`]s, so nothing is copied;
@@ -1240,11 +1210,8 @@ impl<A: Allocator + Clone> DomBuilder<A> for ViewBuilder {
     fn object(entries: Vec<(Span, JsonView<A>), A>) -> JsonView<A> {
         JsonView::Object(entries)
     }
-    fn keys_equal(source: &[u8], left: &Span, right: &Span) -> bool {
-        escaped_span_compare(source, *left, *right) == Ordering::Equal
-    }
-    fn key_hash(source: &[u8], key: &Span) -> u64 {
-        fnv1a(UnescapeBytes::new(key.bytes(source).unwrap_or(&[])))
+    fn key_compare(source: &[u8], left: &Span, right: &Span) -> Ordering {
+        escaped_span_compare(source, *left, *right)
     }
 }
 
@@ -1789,11 +1756,8 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
     fn object(entries: Vec<(JsonString<A>, Json<A>), A>) -> Json<A> {
         Json::Object(entries)
     }
-    fn key_hash(_source: &[u8], key: &JsonString<A>) -> u64 {
-        fnv1a(key.as_bytes().iter().copied())
-    }
-    fn keys_equal(_source: &[u8], left: &JsonString<A>, right: &JsonString<A>) -> bool {
-        left == right
+    fn key_compare(_source: &[u8], left: &JsonString<A>, right: &JsonString<A>) -> Ordering {
+        left.as_bytes().cmp(right.as_bytes())
     }
 }
 
@@ -3981,6 +3945,34 @@ mod tests {
         let all =
             parse_with(source.as_bytes(), &ParseOptions::default().duplicate_keys(DuplicateKeys::KeepAll)).unwrap();
         assert_eq!(all.len(), count + 2);
+    }
+
+    #[test]
+    fn sorted_dedup_heavy_duplication() {
+        // 100 keys declared three times each in rising rounds. Well past the
+        // linear threshold, so this drives the sort path's run detection and
+        // last-value moves — and, without a hash, no crafted-key blowup.
+        let mut source = String::from("{");
+        for round in 0..3u64 {
+            for key in 0..100u64 {
+                source.push_str("\"k");
+                source.push_str(&key.to_string());
+                source.push_str("\":");
+                source.push_str(&(round * 1000 + key).to_string());
+                source.push(',');
+            }
+        }
+        source.pop(); // drop the trailing comma
+        source.push('}');
+
+        let document = parse(source.as_bytes()).unwrap();
+        assert_eq!(document.len(), 100);
+        // Last-wins keeps the final round's value in the first occurrence's slot.
+        assert_eq!(document.get("k0").and_then(|v| v.as_u64()), Some(2000));
+        assert_eq!(document.get("k99").and_then(|v| v.as_u64()), Some(2099));
+        let entries = document.as_object().unwrap();
+        assert_eq!(entries[0].0.as_str(), "k0"); // first-occurrence order preserved
+        assert_eq!(entries[99].0.as_str(), "k99");
     }
 
     #[test]
