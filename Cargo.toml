@@ -1,0 +1,21 @@
+[package]
+name = "jsontape"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
+description = "A minimalistic allocator-aware, zero-copy JSON parser in pure Rust"
+license = "Apache-2.0"
+keywords = ["json", "parser", "no-std", "allocator", "zero-copy"]
+categories = ["parser-implementations", "no-std"]
+
+[lib]
+path = "jsontape.rs"
+
+[dependencies]
+allocator-api2 = { version = "0.3", default-features = false, features = [
+    "alloc",
+] }
+
+[features]
+default = ["std"]
+std = ["allocator-api2/std"]
