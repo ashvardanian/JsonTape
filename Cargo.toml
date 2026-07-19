@@ -12,7 +12,7 @@ categories = ["parser-implementations", "no-std"]
 path = "jsontape.rs"
 
 [dependencies]
-allocator-api2 = { version = "0.3", default-features = false, features = [
+allocator-api2 = { version = "0.4", default-features = false, features = [
     "alloc",
 ] }
 serde = { version = "1", default-features = false, optional = true }
