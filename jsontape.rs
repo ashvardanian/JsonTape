@@ -3146,6 +3146,59 @@ impl<A: Allocator> Json<A> {
         }
     }
 
+    /// This container's preserved comments, or an empty slice for a scalar or an
+    /// uncommented container.
+    fn container_trivia(&self) -> &[AnchoredComment<A>] {
+        match self {
+            Json::Array(body) => trivia_comments(&body.trivia),
+            Json::Object(body) => trivia_comments(&body.trivia),
+            _ => &[],
+        }
+    }
+
+    /// Whether this container carries any preserved comments. Only populated when
+    /// parsed with [`ParseOptions::preserve_comments`]; always `false` otherwise
+    /// and for scalars and the zero-copy [`JsonView`].
+    pub fn has_comments(&self) -> bool {
+        !self.container_trivia().is_empty()
+    }
+
+    /// The comments written on their own line before the element or entry at
+    /// `index`, in source order. Empty when there are none.
+    ///
+    /// Each [`Comment`] is verbatim source text, not an escaped JSON string.
+    /// Mutating the container with [`as_array_mut`](Json::as_array_mut),
+    /// [`as_object_mut`](Json::as_object_mut), or the deref-mut `Vec` can shift
+    /// element positions while comment anchors stay put, so comments may then
+    /// attach to a neighbor; this never affects values, only comment placement.
+    pub fn leading_comments(&self, index: usize) -> impl Iterator<Item = &Comment<A>> {
+        let anchor = u32::try_from(index).unwrap_or(u32::MAX);
+        self.container_trivia()
+            .iter()
+            .filter(move |entry| entry.anchor == anchor && entry.slot == CommentSlot::Leading)
+            .map(|entry| &entry.comment)
+    }
+
+    /// The comments written on the same line after the element or entry at
+    /// `index`, in source order. Empty when there are none.
+    pub fn trailing_comments(&self, index: usize) -> impl Iterator<Item = &Comment<A>> {
+        let anchor = u32::try_from(index).unwrap_or(u32::MAX);
+        self.container_trivia()
+            .iter()
+            .filter(move |entry| entry.anchor == anchor && entry.slot == CommentSlot::Trailing)
+            .map(|entry| &entry.comment)
+    }
+
+    /// The comments after the last element and before the closing bracket, in
+    /// source order. Empty when there are none.
+    pub fn tail_comments(&self) -> impl Iterator<Item = &Comment<A>> {
+        let tail = u32::try_from(self.len()).unwrap_or(u32::MAX);
+        self.container_trivia()
+            .iter()
+            .filter(move |entry| entry.anchor == tail)
+            .map(|entry| &entry.comment)
+    }
+
     fn write_layout<W: fmt::Write>(
         &self,
         writer: &mut W,
@@ -5655,6 +5708,32 @@ mod tests {
             discarded.to_string_with(FormatOptions::pretty().with_comments(true)),
             "{\n  \"a\": 1\n}",
         );
+    }
+
+    #[test]
+    fn comment_accessors_read_placement() {
+        let options = ParseOptions::json5().preserve_comments(true);
+        let document =
+            parse_with(b"[\n // lead\n 1, // trail\n 2\n // tail\n]", &options).unwrap();
+
+        assert!(document.has_comments());
+        let lead: Vec<_> = document.leading_comments(0).collect();
+        assert_eq!(lead.len(), 1);
+        assert_eq!(lead[0].style(), CommentStyle::Line);
+        assert_eq!(lead[0].text(), " lead");
+
+        let trail: Vec<_> = document.trailing_comments(0).collect();
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail[0].text(), " trail");
+
+        assert_eq!(document.trailing_comments(1).count(), 0);
+        let tail: Vec<_> = document.tail_comments().collect();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].text(), " tail");
+
+        // A scalar and an uncommented parse report nothing.
+        assert!(!Json::from(1u64).has_comments());
+        assert!(!parse(b"[1,2]").unwrap().has_comments());
     }
 
     #[test]
