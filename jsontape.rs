@@ -38,7 +38,6 @@ extern crate alloc;
 
 use core::cmp::Ordering;
 use core::fmt;
-use core::fmt::Write as _;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
@@ -266,6 +265,10 @@ fn escaped_equals(source: &[u8], span: Span, expected: &str) -> bool {
         Some(content) => content,
         None => return false,
     };
+    // Fast path: an unescaped key compares byte-for-byte with no decoding.
+    if !content.contains(&b'\\') {
+        return content == expected.as_bytes();
+    }
     let mut decoded = UnescapeBytes::new(content);
     let mut wanted = expected.as_bytes().iter();
     loop {
@@ -670,6 +673,17 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 /// String values and object keys are stored as [`Span`]s, so nothing is copied;
 /// resolve them against the same `source` you parsed. Numbers keep their width,
 /// so large integers survive past the 2^53 float boundary.
+///
+/// # Layout and allocators
+///
+/// Each array and object owns its own [`Vec`], so parsing with the default
+/// global allocator scatters those nodes across the heap. Parse with
+/// [`view_in`] and a bump or slab allocator (any [`allocator_api2::alloc::Allocator`],
+/// for example a `bumpalo::Bump`) to pack the whole document into one contiguous
+/// region that frees in O(1) when the arena is dropped — the closest this design
+/// gets to a flat tape. Note the caveat: the per-node `Vec`s still grow by
+/// doubling, so an arena keeps some slack and dead reallocation remnants; it is
+/// arena-flat and cheap to allocate and free, not a compact simdjson-style tape.
 #[derive(Debug, Clone)]
 pub enum JsonView<A: Allocator = Global> {
     Null,
@@ -1162,9 +1176,16 @@ impl<A: Allocator> Json<A> {
         }
         let mut current = self;
         for raw_token in pointer.split('/').skip(1) {
-            let token = raw_token.replace("~1", "/").replace("~0", "~");
+            // Only allocate to unescape when a `~` is actually present.
+            let decoded;
+            let token: &str = if raw_token.contains('~') {
+                decoded = raw_token.replace("~1", "/").replace("~0", "~");
+                &decoded
+            } else {
+                raw_token
+            };
             current = match current {
-                Json::Object(_) => current.get(token.as_str())?,
+                Json::Object(_) => current.get(token)?,
                 Json::Array(_) => {
                     // RFC 6901: an array index is `0` or `[1-9][0-9]*`; reject
                     // leading zeros, which `usize::from_str` would accept.
@@ -1272,6 +1293,17 @@ impl<A: Allocator> JsonView<A> {
         source: &[u8],
         allocator: B,
     ) -> Result<Json<B>, JsonError> {
+        self.to_json_ref(source, &allocator)
+    }
+
+    /// Shared recursion for [`to_json_in`](JsonView::to_json_in) that borrows the
+    /// allocator, cloning it only where a `Vec` or `JsonString` must own one
+    /// rather than once per traversal step.
+    fn to_json_ref<B: Allocator + Clone>(
+        &self,
+        source: &[u8],
+        allocator: &B,
+    ) -> Result<Json<B>, JsonError> {
         match self {
             JsonView::Null => Ok(Json::Null),
             JsonView::Boolean(value) => Ok(Json::Boolean(*value)),
@@ -1279,12 +1311,14 @@ impl<A: Allocator> JsonView<A> {
             JsonView::Unsigned(value) => Ok(Json::Unsigned(*value)),
             JsonView::Float(value) => Ok(Json::Float(*value)),
             JsonView::String(span) => Ok(Json::String(JsonString::from_span(
-                source, *span, allocator,
+                source,
+                *span,
+                allocator.clone(),
             )?)),
             JsonView::Array(items) => {
                 let mut owned = Vec::new_in(allocator.clone());
                 for item in items {
-                    let converted = item.to_json_in(source, allocator.clone())?;
+                    let converted = item.to_json_ref(source, allocator)?;
                     owned.try_reserve(1).map_err(|_| JsonError::Allocation)?;
                     owned.push(converted);
                 }
@@ -1294,7 +1328,7 @@ impl<A: Allocator> JsonView<A> {
                 let mut owned = Vec::new_in(allocator.clone());
                 for (key_span, value) in entries {
                     let key = JsonString::from_span(source, *key_span, allocator.clone())?;
-                    let converted = value.to_json_in(source, allocator.clone())?;
+                    let converted = value.to_json_ref(source, allocator)?;
                     owned.try_reserve(1).map_err(|_| JsonError::Allocation)?;
                     owned.push((key, converted));
                 }
@@ -1328,18 +1362,32 @@ fn write_indent<W: fmt::Write>(writer: &mut W, indent: usize, depth: usize) -> f
 /// Writes `text` as a quoted JSON string, escaping what the grammar requires.
 fn write_escaped_str<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
     writer.write_char('"')?;
-    for character in text.chars() {
-        match character {
-            '"' => writer.write_str("\\\"")?,
-            '\\' => writer.write_str("\\\\")?,
-            '\n' => writer.write_str("\\n")?,
-            '\r' => writer.write_str("\\r")?,
-            '\t' => writer.write_str("\\t")?,
-            '\u{08}' => writer.write_str("\\b")?,
-            '\u{0C}' => writer.write_str("\\f")?,
-            control if (control as u32) < 0x20 => write!(writer, "\\u{:04x}", control as u32)?,
-            other => writer.write_char(other)?,
+    let bytes = text.as_bytes();
+    let mut run_start = 0;
+    // Every byte needing an escape is ASCII, and multi-byte UTF-8 bytes are all
+    // >= 0x80, so we can bulk-copy the clean runs between escapes and only break
+    // out to write the escape itself.
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte >= 0x20 && byte != b'"' && byte != b'\\' {
+            continue;
         }
+        if run_start < index {
+            writer.write_str(&text[run_start..index])?;
+        }
+        match byte {
+            b'"' => writer.write_str("\\\"")?,
+            b'\\' => writer.write_str("\\\\")?,
+            b'\n' => writer.write_str("\\n")?,
+            b'\r' => writer.write_str("\\r")?,
+            b'\t' => writer.write_str("\\t")?,
+            0x08 => writer.write_str("\\b")?,
+            0x0C => writer.write_str("\\f")?,
+            other => write!(writer, "\\u{:04x}", other)?,
+        }
+        run_start = index + 1;
+    }
+    if run_start < bytes.len() {
+        writer.write_str(&text[run_start..])?;
     }
     writer.write_char('"')
 }
@@ -1352,20 +1400,33 @@ fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) ->
     writer.write_char('"')
 }
 
-/// Writes a finite JSON number. Non-finite floats become `null`, and integral
-/// floats keep a trailing `.0` so their type survives a round trip.
+/// Whether a finite `f64` has no fractional part, computed without the
+/// std-only `f64::fract`/`trunc` so it works under `no_std`.
+fn is_integral(value: f64) -> bool {
+    // Clear the sign bit for the magnitude; `to_bits`/`from_bits` are `core`.
+    let magnitude = f64::from_bits(value.to_bits() & 0x7fff_ffff_ffff_ffff);
+    if magnitude >= 4_503_599_627_370_496.0 {
+        // At or above 2^52 every representable `f64` is already an integer.
+        true
+    } else {
+        // Otherwise the value fits in `i64`, so a round trip is exact.
+        value == (value as i64) as f64
+    }
+}
+
+/// Writes a finite JSON number straight to `writer`. Non-finite floats become
+/// `null`, and integral floats keep a trailing `.0` so their type survives a
+/// round trip. `f64`'s formatter never uses exponent notation, so writing
+/// directly and appending `.0` when integral needs no intermediate buffer.
 fn write_number<W: fmt::Write>(writer: &mut W, value: f64) -> fmt::Result {
     if !value.is_finite() {
         return writer.write_str("null");
     }
-    // `f64`'s formatter never uses exponent notation, so the absence of a `.`
-    // means the value printed as an integer and needs a `.0` to stay a float.
-    let mut buffer = String::new();
-    write!(buffer, "{value}")?;
-    if !buffer.as_bytes().contains(&b'.') {
-        buffer.push_str(".0");
+    write!(writer, "{value}")?;
+    if is_integral(value) {
+        writer.write_str(".0")?;
     }
-    writer.write_str(&buffer)
+    Ok(())
 }
 
 impl<A: Allocator> Json<A> {
@@ -2148,6 +2209,19 @@ mod tests {
         assert_eq!(Json::from(2.5f64).to_string(), "2.5");
         assert_eq!(Json::from(f64::INFINITY).to_string(), "null");
         assert_eq!(Json::from(f64::NAN).to_string(), "null");
+        // Large integral floats (above 2^52) still get a `.0`, via bit-math.
+        assert_eq!(Json::from(1e16).to_string(), "10000000000000000.0");
+        assert_eq!(Json::from(-0.0f64).to_string(), "-0.0");
+        assert_eq!(Json::from(0.5f64).to_string(), "0.5");
+    }
+
+    #[test]
+    fn serialize_escapes_control_chars_in_runs() {
+        // The run-based escaper still emits \u00xx for bare control characters
+        // while bulk-copying the clean spans around them.
+        let mut object = Json::object_in(Global);
+        object.insert("k", Json::from("a\u{1}b\u{1f}c"));
+        assert_eq!(object.to_string(), r#"{"k":"a\u0001b\u001fc"}"#);
     }
 
     #[test]
