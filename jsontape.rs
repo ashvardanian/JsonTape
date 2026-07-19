@@ -93,12 +93,27 @@ use alloc::borrow::Cow;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     /// Byte offset of the span's start within the source.
-    pub start: usize,
+    start: usize,
     /// Length of the span in bytes.
-    pub len: usize,
+    len: usize,
 }
 
 impl Span {
+    /// Byte offset of this span's start within its source.
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    /// Length of this span in bytes.
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    /// Whether this span covers no bytes.
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
     /// Resolves against the source the document was parsed from. Returns `None`
     /// if the span is out of bounds or not valid UTF-8. Escape sequences are
     /// returned verbatim, not decoded; use [`unescape_into`] to decode them.
@@ -156,6 +171,8 @@ pub enum SyntaxKind {
     DuplicateKey,
     /// A `/* ... */` block comment was never closed.
     UnterminatedComment,
+    /// A configured parser resource limit was exceeded.
+    ResourceLimitExceeded,
 }
 
 impl SyntaxKind {
@@ -174,6 +191,7 @@ impl SyntaxKind {
             SyntaxKind::DepthExceeded => "nesting too deep",
             SyntaxKind::DuplicateKey => "duplicate object key",
             SyntaxKind::UnterminatedComment => "unterminated comment",
+            SyntaxKind::ResourceLimitExceeded => "parser resource limit exceeded",
         }
     }
 }
@@ -239,6 +257,40 @@ impl serde::ser::StdError for JsonError {}
 /// Default nesting limit, guarding against stack exhaustion on adversarial input.
 const MAX_DEPTH: u32 = 128;
 
+/// Optional resource limits for parsing untrusted documents. Limits other than
+/// nesting depth are disabled by default, so valid in-memory JSON remains
+/// accepted unless an application opts into a bounded profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParseLimits {
+    /// Maximum number of values, including containers. `None` disables it.
+    pub max_nodes: Option<usize>,
+    /// Maximum entries in any one array or object. `None` disables it.
+    pub max_container_entries: Option<usize>,
+    /// Maximum raw bytes between a string's quotes. `None` disables it.
+    pub max_string_bytes: Option<usize>,
+    /// Maximum raw bytes in one comment. `None` disables it.
+    pub max_comment_bytes: Option<usize>,
+}
+
+impl ParseLimits {
+    /// No size limits beyond [`ParseOptions::max_depth`]. This is the default.
+    pub const fn unlimited() -> Self {
+        Self {
+            max_nodes: None,
+            max_container_entries: None,
+            max_string_bytes: None,
+            max_comment_bytes: None,
+        }
+    }
+}
+
+impl Default for ParseLimits {
+    fn default() -> Self {
+        Self::unlimited()
+    }
+}
+
 /// How to handle repeated keys within a single object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -264,6 +316,8 @@ pub enum DuplicateKeys {
 pub struct ParseOptions {
     /// The maximum container nesting depth. Defaults to 128.
     pub max_depth: u32,
+    /// Optional limits for otherwise-valid documents. Disabled by default.
+    pub limits: ParseLimits,
     /// How repeated object keys are handled. Defaults to [`DuplicateKeys::LastWins`].
     pub duplicate_keys: DuplicateKeys,
     /// Accept `// ...` line comments as whitespace.
@@ -307,6 +361,7 @@ impl ParseOptions {
     pub const fn strict() -> Self {
         ParseOptions {
             max_depth: MAX_DEPTH,
+            limits: ParseLimits::unlimited(),
             duplicate_keys: DuplicateKeys::LastWins,
             allow_line_comments: false,
             allow_block_comments: false,
@@ -366,6 +421,12 @@ impl ParseOptions {
         self
     }
 
+    /// Sets optional resource limits for otherwise-valid documents.
+    pub fn limits(mut self, limits: ParseLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     /// Sets the duplicate-key policy.
     pub fn duplicate_keys(mut self, policy: DuplicateKeys) -> Self {
         self.duplicate_keys = policy;
@@ -402,6 +463,21 @@ fn hex_value(byte: u8) -> Option<u16> {
         _ => None,
     }
 }
+
+/// Private byte-search seam for scanner hot paths. The scalar implementation is
+/// deliberately simple today; a future `speed` feature can replace this one
+/// implementation with StringZilla without leaking that dependency into parser
+/// control flow or public APIs.
+struct PortableSearch;
+
+impl PortableSearch {
+    #[inline]
+    fn find_any2(bytes: &[u8], first: u8, second: u8) -> Option<usize> {
+        bytes.iter().position(|&byte| byte == first || byte == second)
+    }
+}
+
+type ActiveSearch = PortableSearch;
 
 /// Decodes an RFC 6901 reference token, unescaping `~1` to `/` and `~0` to `~`.
 /// Allocates only when a `~` is present; the order matters so `~01` becomes `~1`.
@@ -598,6 +674,7 @@ pub fn unescape_into<A: Allocator>(
         offset: span.start,
         kind: SyntaxKind::InvalidString,
     })?;
+    validate_string_body(content, span.start)?;
     // Decoding only collapses escapes, so the escaped length is an upper bound —
     // reserve once and push without a per-byte check.
     output
@@ -621,6 +698,36 @@ pub fn unescape_into<A: Allocator>(
     Ok(())
 }
 
+/// Validates UTF-8 and raw control bytes before the byte-oriented escape
+/// decoder runs. Parser-produced spans have already passed these checks, but
+/// this public function also accepts caller-provided spans.
+fn validate_string_body(content: &[u8], offset: usize) -> Result<(), JsonError> {
+    if core::str::from_utf8(content).is_err() {
+        return Err(JsonError::Syntax { offset, kind: SyntaxKind::InvalidUtf8 });
+    }
+    let mut index = 0;
+    while let Some(&byte) = content.get(index) {
+        if byte == b'\\' {
+            let Some(&selector) = content.get(index + 1) else {
+                break;
+            };
+            index += 2;
+            // JSON5 permits a CR LF line continuation as one escape.
+            if selector == b'\r' && content.get(index) == Some(&b'\n') {
+                index += 1;
+            }
+        } else if byte < 0x20 {
+            return Err(JsonError::Syntax {
+                offset: offset + index,
+                kind: SyntaxKind::ControlCharacter,
+            });
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Compares a still-escaped JSON string `span` against a decoded `expected`
 /// string, decoding the span on the fly. Allocation-free.
 fn escaped_equals(source: &[u8], span: Span, expected: &str) -> bool {
@@ -637,7 +744,7 @@ fn escaped_equals(source: &[u8], span: Span, expected: &str) -> bool {
     loop {
         match (decoded.next(), wanted.next()) {
             (Some(left), Some(&right)) if left == right => continue,
-            (None, None) => return true,
+            (None, None) => return !decoded.malformed,
             _ => return false,
         }
     }
@@ -657,6 +764,7 @@ fn escaped_compare(source: &[u8], span: Span, other: &str) -> Ordering {
             },
             (Some(_), None) => return Ordering::Greater,
             (None, Some(_)) => return Ordering::Less,
+            (None, None) if decoded.malformed => return content.cmp(other.as_bytes()),
             (None, None) => return Ordering::Equal,
         }
     }
@@ -665,8 +773,10 @@ fn escaped_compare(source: &[u8], span: Span, other: &str) -> Ordering {
 /// Orders two still-escaped JSON string spans by their decoded byte sequences,
 /// decoding both on the fly. Allocation-free; used to sort object keys.
 fn escaped_span_compare(source: &[u8], left: Span, right: Span) -> Ordering {
-    let mut left_decoded = UnescapeBytes::new(left.bytes(source).unwrap_or(&[]));
-    let mut right_decoded = UnescapeBytes::new(right.bytes(source).unwrap_or(&[]));
+    let left_content = left.bytes(source).unwrap_or(&[]);
+    let right_content = right.bytes(source).unwrap_or(&[]);
+    let mut left_decoded = UnescapeBytes::new(left_content);
+    let mut right_decoded = UnescapeBytes::new(right_content);
     loop {
         match (left_decoded.next(), right_decoded.next()) {
             (Some(left_byte), Some(right_byte)) => match left_byte.cmp(&right_byte) {
@@ -675,6 +785,9 @@ fn escaped_span_compare(source: &[u8], left: Span, right: Span) -> Ordering {
             },
             (Some(_), None) => return Ordering::Greater,
             (None, Some(_)) => return Ordering::Less,
+            (None, None) if left_decoded.malformed || right_decoded.malformed => {
+                return left_content.cmp(right_content)
+            }
             (None, None) => return Ordering::Equal,
         }
     }
@@ -876,14 +989,22 @@ fn write_escaped_body<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result 
 /// it holds no literal `"` and every backslash opens an escape that is also valid
 /// in strict JSON. A JSON5 single-quoted body or an extended escape fails this.
 fn span_is_strict_json_body(content: &[u8]) -> bool {
+    if core::str::from_utf8(content).is_err() {
+        return false;
+    }
     let mut index = 0;
     while index < content.len() {
         match content[index] {
             b'"' => return false,
             b'\\' => match content.get(index + 1) {
-                Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u') => index += 2,
+                Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => index += 2,
+                Some(b'u')
+                    if content.get(index + 2..index + 6).is_some_and(|digits| {
+                        digits.iter().all(|&byte| hex_value(byte).is_some())
+                    }) => index += 6,
                 _ => return false,
             },
+            byte if byte < 0x20 => return false,
             _ => index += 1,
         }
     }
@@ -1071,6 +1192,7 @@ struct Parser<'a, A: Allocator + Clone, B: DomBuilder<A>> {
     source: &'a [u8],
     position: usize,
     depth: u32,
+    nodes: usize,
     allocator: A,
     options: ParseOptions,
     // Comments scanned but not yet bound to a container slot, and whether a
@@ -1087,6 +1209,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             source,
             position: 0,
             depth: 0,
+            nodes: 0,
             pending: Vec::new_in(allocator.clone()),
             broke: false,
             allocator,
@@ -1111,12 +1234,30 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         })
     }
 
+    fn check_limit(&self, value: usize, limit: Option<usize>) -> Result<(), JsonError> {
+        if limit.is_some_and(|limit| value > limit) {
+            return self.fault_kind(SyntaxKind::ResourceLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn reserve_node(&mut self) -> Result<(), JsonError> {
+        self.nodes = self.nodes.checked_add(1).ok_or(JsonError::Syntax {
+            offset: self.position,
+            kind: SyntaxKind::ResourceLimitExceeded,
+        })?;
+        self.check_limit(self.nodes, self.options.limits.max_nodes)
+    }
+
     fn peek(&self) -> Option<u8> {
         self.source.get(self.position).copied()
     }
 
     fn peek_at(&self, offset: usize) -> Option<u8> {
-        self.source.get(self.position + offset).copied()
+        self.position
+            .checked_add(offset)
+            .and_then(|position| self.source.get(position))
+            .copied()
     }
 
     /// Skips insignificant whitespace, and — when the matching options are
@@ -1136,9 +1277,9 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     Some(b'/') if self.options.allow_line_comments => {
                         let text_start = self.position + 2;
                         self.position += 2;
-                        while !matches!(self.peek(), None | Some(b'\n' | b'\r')) {
-                            self.position += 1;
-                        }
+                        let remaining = &self.source[self.position..];
+                        self.position += ActiveSearch::find_any2(remaining, b'\n', b'\r')
+                            .unwrap_or(remaining.len());
                         self.record_comment(text_start, self.position, CommentStyle::Line)?;
                     }
                     Some(b'*') if self.options.allow_block_comments => {
@@ -1178,6 +1319,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         end: usize,
         style: CommentStyle,
     ) -> Result<(), JsonError> {
+        self.check_limit(
+            end.saturating_sub(start),
+            self.options.limits.max_comment_bytes,
+        )?;
         if !self.collecting_comments() {
             return Ok(());
         }
@@ -1248,6 +1393,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 
     fn value(&mut self) -> Result<B::Value, JsonError> {
         self.skip_trivia()?;
+        self.reserve_node()?;
         match self.peek() {
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
@@ -1272,7 +1418,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     }
 
     fn expect_literal(&mut self, literal: &[u8]) -> Result<(), JsonError> {
-        let end = self.position + literal.len();
+        let end = match self.position.checked_add(literal.len()) {
+            Some(end) => end,
+            None => return self.fault(),
+        };
         if self.source.get(self.position..end) == Some(literal) {
             self.position = end;
             Ok(())
@@ -1525,6 +1674,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         start,
                         len: self.position - start,
                     };
+                    self.check_limit(span.len, self.options.limits.max_string_bytes)?;
                     self.position += 1;
                     return Ok(span);
                 }
@@ -1777,6 +1927,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     }
 
     fn try_push<T>(&self, items: &mut Vec<T, A>, item: T) -> Result<(), JsonError> {
+        self.check_limit(
+            items.len().saturating_add(1),
+            self.options.limits.max_container_entries,
+        )?;
         items.try_reserve(1).map_err(|_| JsonError::Allocation)?;
         items.push(item);
         Ok(())
@@ -1828,22 +1982,22 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         let count = entries.len();
 
         // Sort a permutation of positions by decoded key, so equal keys are adjacent.
-        let mut order: Vec<u32, A> = Vec::new_in(self.allocator.clone());
+        let mut order: Vec<usize, A> = Vec::new_in(self.allocator.clone());
         order.try_reserve(count).map_err(|_| JsonError::Allocation)?;
-        for position in 0..count as u32 {
+        for position in 0..count {
             order.push(position);
         }
         order.sort_unstable_by(|&a, &b| {
-            B::key_compare(self.source, &entries[a as usize].0, &entries[b as usize].0)
+            B::key_compare(self.source, &entries[a].0, &entries[b].0)
         });
 
         // Decide each position's fate: kept positions take their own value unless a
         // later duplicate overrides it (`LastWins`); others are removed.
         let mut removed: Vec<bool, A> = Vec::new_in(self.allocator.clone());
-        let mut value_from: Vec<u32, A> = Vec::new_in(self.allocator.clone());
+        let mut value_from: Vec<usize, A> = Vec::new_in(self.allocator.clone());
         removed.try_reserve(count).map_err(|_| JsonError::Allocation)?;
         value_from.try_reserve(count).map_err(|_| JsonError::Allocation)?;
-        for position in 0..count as u32 {
+        for position in 0..count {
             removed.push(false);
             value_from.push(position);
         }
@@ -1854,8 +2008,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             while run_end < count
                 && B::key_compare(
                     self.source,
-                    &entries[order[run_end] as usize].0,
-                    &entries[order[run_start] as usize].0,
+                    &entries[order[run_end]].0,
+                    &entries[order[run_start]].0,
                 ) == Ordering::Equal
             {
                 run_end += 1;
@@ -1866,7 +2020,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 }
                 // `sort_unstable` doesn't preserve input order within a run, so scan
                 // for the first and last original positions of this key.
-                let mut first = u32::MAX;
+                let mut first = usize::MAX;
                 let mut last = 0;
                 for slot in run_start..run_end {
                     let position = order[slot];
@@ -1876,11 +2030,11 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 for slot in run_start..run_end {
                     let position = order[slot];
                     if position != first {
-                        removed[position as usize] = true;
+                        removed[position] = true;
                     }
                 }
                 if self.options.duplicate_keys == DuplicateKeys::LastWins {
-                    value_from[first as usize] = last;
+                    value_from[first] = last;
                 }
             }
             run_start = run_end;
@@ -1897,7 +2051,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             if removed[position] {
                 continue;
             }
-            let source = value_from[position] as usize;
+            let source = value_from[position];
             let entry = if source == position {
                 slots[position].take().unwrap()
             } else {
@@ -3892,6 +4046,37 @@ impl<A: Allocator> JsonView<A> {
     }
 }
 
+/// A zero-copy [`JsonView`] permanently paired with the source it was parsed
+/// from. Prefer this type when exposing a view beyond the immediate parse site:
+/// its navigation and serialization APIs cannot accidentally receive a
+/// mismatched source slice.
+pub struct BoundJsonView<'src, A: Allocator = Global> {
+    source: &'src [u8],
+    document: JsonView<A>,
+}
+
+impl<'src, A: Allocator> BoundJsonView<'src, A> {
+    /// Returns the root cursor, carrying this document's original source.
+    pub fn root(&self) -> Resolved<'_, A> {
+        self.document.bind(self.source)
+    }
+
+    /// Navigates from the root by object key or array index.
+    pub fn get<K: ResolveKey<A>>(&self, key: K) -> Resolved<'_, A> {
+        self.root().get(key)
+    }
+
+    /// Writes compact JSON without accepting a separate source argument.
+    pub fn write_json<W: fmt::Write>(&self, writer: &mut W) -> fmt::Result {
+        self.root().write_json(writer)
+    }
+
+    /// Returns the source bytes retained by this view.
+    pub fn source(&self) -> &'src [u8] {
+        self.source
+    }
+}
+
 
 /// Parses `source` into an immutable [`JsonView`] allocated in `allocator`,
 /// under `options`. Spans in the result are offsets into `source`.
@@ -3930,6 +4115,33 @@ pub fn view_with(source: &[u8], options: &ParseOptions) -> Result<JsonView<Globa
 /// if the document cannot be allocated.
 pub fn view(source: &[u8]) -> Result<JsonView<Global>, JsonError> {
     view_in(source, Global)
+}
+
+/// Parses a source-bound, zero-copy document with `allocator` under `options`.
+pub fn view_in_bound_with<'src, A: Allocator + Clone>(
+    source: &'src [u8],
+    allocator: A,
+    options: &ParseOptions,
+) -> Result<BoundJsonView<'src, A>, JsonError> {
+    Ok(BoundJsonView {
+        source,
+        document: view_in_with(source, allocator, options)?,
+    })
+}
+
+/// Parses a source-bound, zero-copy document with `allocator`.
+pub fn view_in_bound<'src, A: Allocator + Clone>(
+    source: &'src [u8],
+    allocator: A,
+) -> Result<BoundJsonView<'src, A>, JsonError> {
+    view_in_bound_with(source, allocator, &ParseOptions::default())
+}
+
+/// Parses a source-bound, zero-copy document on the global heap. Unlike
+/// [`view`], the returned value retains its source reference and therefore
+/// cannot be navigated or serialized with a mismatched byte slice.
+pub fn view_bound<'src>(source: &'src [u8]) -> Result<BoundJsonView<'src, Global>, JsonError> {
+    view_in_bound(source, Global)
 }
 
 /// Parses `source` into an owned, mutable [`Json`] allocated in `allocator`,
@@ -5221,10 +5433,73 @@ mod tests {
         assert!(unescape_into(b"\\u12", Span { start: 0, len: 4 }, &mut output).is_err());
         let mut output = Vec::new();
         assert!(unescape_into(b"\\uDE00", Span { start: 0, len: 6 }, &mut output).is_err());
+        // Public spans may be hand-built, so raw controls and invalid UTF-8 are
+        // rejected before the fast copy path can expose malformed string bodies.
+        let mut output = Vec::new();
+        assert!(matches!(
+            unescape_into(b"a\nb", Span { start: 0, len: 3 }, &mut output),
+            Err(JsonError::Syntax { kind: SyntaxKind::ControlCharacter, .. })
+        ));
+        let mut output = Vec::new();
+        assert!(matches!(
+            unescape_into(b"\xff", Span { start: 0, len: 1 }, &mut output),
+            Err(JsonError::Syntax { kind: SyntaxKind::InvalidUtf8, .. })
+        ));
         // A well-formed span still decodes cleanly.
         let mut output = Vec::new();
         unescape_into(b"a\\nb", Span { start: 0, len: 4 }, &mut output).unwrap();
         assert_eq!(output.as_slice(), b"a\nb");
+    }
+
+    #[test]
+    fn manually_constructed_view_spans_still_serialize_as_json() {
+        for source in [b"a\nb".as_slice(), b"\\u12", b"\xff"] {
+            let document = JsonView::<Global>::String(Span { start: 0, len: source.len() });
+            assert!(parse(document.to_json_string(source).as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn malformed_spans_do_not_match_decoded_key_prefixes() {
+        let source = b"key\\";
+        let span = Span { start: 0, len: source.len() };
+        assert!(!escaped_equals(source, span, "key"));
+        assert_ne!(escaped_compare(source, span, "key"), Ordering::Equal);
+    }
+
+    #[test]
+    fn parse_limits_bound_valid_documents() {
+        let node_limited = ParseOptions::strict().limits(ParseLimits {
+            max_nodes: Some(3),
+            ..ParseLimits::unlimited()
+        });
+        assert!(matches!(
+            parse_with(b"[1,2,3]", &node_limited),
+            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+        ));
+        let entry_limited = ParseOptions::strict().limits(ParseLimits {
+            max_container_entries: Some(2),
+            ..ParseLimits::unlimited()
+        });
+        assert!(matches!(
+            parse_with(b"[1,2,3]", &entry_limited),
+            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+        ));
+        let string_limited = ParseOptions::strict().limits(ParseLimits {
+            max_string_bytes: Some(2),
+            ..ParseLimits::unlimited()
+        });
+        assert!(matches!(
+            parse_with(b"\"abc\"", &string_limited),
+            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+        ));
+        let comments = ParseOptions::json5()
+            .preserve_comments(true)
+            .limits(ParseLimits { max_comment_bytes: Some(2), ..ParseLimits::unlimited() });
+        assert!(matches!(
+            parse_with(b"/* long */ 1", &comments),
+            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+        ));
     }
 
     #[test]
@@ -5259,6 +5534,13 @@ mod tests {
         assert_eq!(root.get("a").to_string(), r#"{"b":[10,20]}"#);
         assert_eq!(root.entries().count(), 2);
         assert_eq!(root.get("a").get("b").elements().count(), 2);
+    }
+
+    #[test]
+    fn bound_view_carries_its_source() {
+        let document = view_bound(br#"{"a":{"b":[10,20]}}"#).unwrap();
+        assert_eq!(document.get("a").get("b").get(1).as_u64(), Some(20));
+        assert_eq!(document.root().to_string(), r#"{"a":{"b":[10,20]}}"#);
     }
 
     /// A distinct allocator type that just forwards to the global heap, used to

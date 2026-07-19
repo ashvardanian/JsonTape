@@ -81,6 +81,11 @@ assert_eq!(document.to_string(), r#"{"name":"tape","ratio":0.5,"mask":255}"#);
 
 `ParseOptions` also sets the nesting limit and the duplicate-key policy — last-wins by default, or first-wins, reject, or keep-all.
 
+For untrusted inputs, `ParseLimits` can additionally cap values, entries per
+container, string bytes, and comment bytes.
+These limits are opt-in; the
+default accepts any in-memory valid document subject to the nesting limit.
+
 ### Comment-Preserving Round Trip
 
 With `preserve_comments`, the owned tree keeps comments and can write them back.
