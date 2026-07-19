@@ -535,18 +535,68 @@ fn escaped_span_compare(source: &[u8], left: Span, right: Span) -> Ordering {
     }
 }
 
-/// Whether to write compact JSON or indent it for readability.
-#[derive(Clone, Copy)]
-enum Layout {
-    Compact,
-    Pretty { indent: usize },
+/// Indentation style for pretty-printing: a fixed number of spaces per nesting
+/// level, or a single tab per level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Indent {
+    /// This many spaces per nesting level.
+    Spaces(u16),
+    /// One tab character per nesting level.
+    Tabs,
 }
 
-/// Writes a newline followed by `indent * depth` spaces.
-fn write_indent<W: fmt::Write>(writer: &mut W, indent: usize, depth: usize) -> fmt::Result {
+/// Controls how a document is rendered back to JSON text.
+///
+/// `indent` of `None` writes compact JSON with no insignificant whitespace;
+/// `Some(indent)` expands each container one element per line at the given
+/// indentation. Construct one with [`FormatOptions::compact`] or
+/// [`FormatOptions::pretty`] and pass it to `to_string_with` / `write_json_with`.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct FormatOptions {
+    /// Indentation per nesting level, or `None` for compact output.
+    pub indent: Option<Indent>,
+}
+
+impl FormatOptions {
+    /// Compact output: no newlines and no spaces around `,` or `:`.
+    pub const fn compact() -> Self {
+        Self { indent: None }
+    }
+
+    /// Indented output at two spaces per nesting level.
+    pub const fn pretty() -> Self {
+        Self { indent: Some(Indent::Spaces(2)) }
+    }
+
+    /// Sets the indentation, returning the updated options.
+    pub const fn with_indent(mut self, indent: Indent) -> Self {
+        self.indent = Some(indent);
+        self
+    }
+}
+
+impl Default for FormatOptions {
+    fn default() -> Self {
+        Self::compact()
+    }
+}
+
+/// Writes a newline followed by one `indent` step per level of `depth`.
+fn write_indent<W: fmt::Write>(writer: &mut W, indent: Indent, depth: usize) -> fmt::Result {
     writer.write_char('\n')?;
-    for _ in 0..(indent * depth) {
-        writer.write_char(' ')?;
+    match indent {
+        Indent::Spaces(width) => {
+            for _ in 0..(width as usize * depth) {
+                writer.write_char(' ')?;
+            }
+        }
+        Indent::Tabs => {
+            for _ in 0..depth {
+                writer.write_char('\t')?;
+            }
+        }
     }
     Ok(())
 }
@@ -574,7 +624,7 @@ fn write_escaped_str<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
             b'\t' => writer.write_str("\\t")?,
             0x08 => writer.write_str("\\b")?,
             0x0C => writer.write_str("\\f")?,
-            other => write!(writer, "\\u{:04x}", other)?,
+            other => write!(writer, "\\u{other:04x}")?,
         }
         run_start = index + 1;
     }
@@ -2169,7 +2219,12 @@ impl<A: Allocator> Json<A> {
         }
     }
 
-    fn write_layout<W: fmt::Write>(&self, writer: &mut W, layout: Layout, depth: usize) -> fmt::Result {
+    fn write_layout<W: fmt::Write>(
+        &self,
+        writer: &mut W,
+        options: FormatOptions,
+        depth: usize,
+    ) -> fmt::Result {
         match self {
             Json::Null => writer.write_str("null"),
             Json::Boolean(value) => writer.write_str(if *value { "true" } else { "false" }),
@@ -2188,12 +2243,12 @@ impl<A: Allocator> Json<A> {
                     if index > 0 {
                         writer.write_char(',')?;
                     }
-                    if let Layout::Pretty { indent } = layout {
+                    if let Some(indent) = options.indent {
                         write_indent(writer, indent, depth + 1)?;
                     }
-                    item.write_layout(writer, layout, depth + 1)?;
+                    item.write_layout(writer, options, depth + 1)?;
                 }
-                if let Layout::Pretty { indent } = layout {
+                if let Some(indent) = options.indent {
                     write_indent(writer, indent, depth)?;
                 }
                 writer.write_char(']')
@@ -2207,17 +2262,14 @@ impl<A: Allocator> Json<A> {
                     if index > 0 {
                         writer.write_char(',')?;
                     }
-                    if let Layout::Pretty { indent } = layout {
+                    if let Some(indent) = options.indent {
                         write_indent(writer, indent, depth + 1)?;
                     }
                     write_escaped_str(writer, key.as_str())?;
-                    writer.write_str(match layout {
-                        Layout::Compact => ":",
-                        Layout::Pretty { .. } => ": ",
-                    })?;
-                    value.write_layout(writer, layout, depth + 1)?;
+                    writer.write_str(if options.indent.is_some() { ": " } else { ":" })?;
+                    value.write_layout(writer, options, depth + 1)?;
                 }
-                if let Layout::Pretty { indent } = layout {
+                if let Some(indent) = options.indent {
                     write_indent(writer, indent, depth)?;
                 }
                 writer.write_char('}')
@@ -2227,12 +2279,22 @@ impl<A: Allocator> Json<A> {
 
     /// Writes this value as compact JSON.
     pub fn write_json<W: fmt::Write>(&self, writer: &mut W) -> fmt::Result {
-        self.write_layout(writer, Layout::Compact, 0)
+        self.write_layout(writer, FormatOptions::compact(), 0)
     }
 
     /// Writes this value as JSON indented by `indent` spaces per level.
     pub fn write_json_pretty<W: fmt::Write>(&self, writer: &mut W, indent: usize) -> fmt::Result {
-        self.write_layout(writer, Layout::Pretty { indent }, 0)
+        let options = FormatOptions::compact().with_indent(Indent::Spaces(indent as u16));
+        self.write_layout(writer, options, 0)
+    }
+
+    /// Writes this value with the given [`FormatOptions`].
+    pub fn write_json_with<W: fmt::Write>(
+        &self,
+        writer: &mut W,
+        options: FormatOptions,
+    ) -> fmt::Result {
+        self.write_layout(writer, options, 0)
     }
 
     /// Renders this value as JSON indented by `indent` spaces per level.
@@ -2241,11 +2303,18 @@ impl<A: Allocator> Json<A> {
         let _ = self.write_json_pretty(&mut output, indent);
         output
     }
+
+    /// Renders this value with the given [`FormatOptions`].
+    pub fn to_string_with(&self, options: FormatOptions) -> String {
+        let mut output = String::new();
+        let _ = self.write_json_with(&mut output, options);
+        output
+    }
 }
 
 impl<A: Allocator> fmt::Display for Json<A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.write_layout(formatter, Layout::Compact, 0)
+        self.write_layout(formatter, FormatOptions::compact(), 0)
     }
 }
 
@@ -2368,7 +2437,7 @@ impl<A: Allocator> JsonView<A> {
         &self,
         source: &[u8],
         writer: &mut W,
-        layout: Layout,
+        options: FormatOptions,
         depth: usize,
     ) -> fmt::Result {
         match self {
@@ -2389,12 +2458,12 @@ impl<A: Allocator> JsonView<A> {
                     if index > 0 {
                         writer.write_char(',')?;
                     }
-                    if let Layout::Pretty { indent } = layout {
+                    if let Some(indent) = options.indent {
                         write_indent(writer, indent, depth + 1)?;
                     }
-                    item.write_layout(source, writer, layout, depth + 1)?;
+                    item.write_layout(source, writer, options, depth + 1)?;
                 }
-                if let Layout::Pretty { indent } = layout {
+                if let Some(indent) = options.indent {
                     write_indent(writer, indent, depth)?;
                 }
                 writer.write_char(']')
@@ -2408,17 +2477,14 @@ impl<A: Allocator> JsonView<A> {
                     if index > 0 {
                         writer.write_char(',')?;
                     }
-                    if let Layout::Pretty { indent } = layout {
+                    if let Some(indent) = options.indent {
                         write_indent(writer, indent, depth + 1)?;
                     }
                     write_raw_string(writer, source, *key)?;
-                    writer.write_str(match layout {
-                        Layout::Compact => ":",
-                        Layout::Pretty { .. } => ": ",
-                    })?;
-                    value.write_layout(source, writer, layout, depth + 1)?;
+                    writer.write_str(if options.indent.is_some() { ": " } else { ":" })?;
+                    value.write_layout(source, writer, options, depth + 1)?;
                 }
-                if let Layout::Pretty { indent } = layout {
+                if let Some(indent) = options.indent {
                     write_indent(writer, indent, depth)?;
                 }
                 writer.write_char('}')
@@ -2428,7 +2494,7 @@ impl<A: Allocator> JsonView<A> {
 
     /// Writes this view as compact JSON, resolving spans against `source`.
     pub fn write_json<W: fmt::Write>(&self, source: &[u8], writer: &mut W) -> fmt::Result {
-        self.write_layout(source, writer, Layout::Compact, 0)
+        self.write_layout(source, writer, FormatOptions::compact(), 0)
     }
 
     /// Writes this view as JSON indented by `indent` spaces per level.
@@ -2438,7 +2504,18 @@ impl<A: Allocator> JsonView<A> {
         writer: &mut W,
         indent: usize,
     ) -> fmt::Result {
-        self.write_layout(source, writer, Layout::Pretty { indent }, 0)
+        let options = FormatOptions::compact().with_indent(Indent::Spaces(indent as u16));
+        self.write_layout(source, writer, options, 0)
+    }
+
+    /// Writes this view with the given [`FormatOptions`], resolving spans against `source`.
+    pub fn write_json_with<W: fmt::Write>(
+        &self,
+        source: &[u8],
+        writer: &mut W,
+        options: FormatOptions,
+    ) -> fmt::Result {
+        self.write_layout(source, writer, options, 0)
     }
 
     /// Renders this view as compact JSON.
@@ -2452,6 +2529,13 @@ impl<A: Allocator> JsonView<A> {
     pub fn to_json_string_pretty(&self, source: &[u8], indent: usize) -> String {
         let mut output = String::new();
         let _ = self.write_json_pretty(source, &mut output, indent);
+        output
+    }
+
+    /// Renders this view with the given [`FormatOptions`].
+    pub fn to_json_string_with(&self, source: &[u8], options: FormatOptions) -> String {
+        let mut output = String::new();
+        let _ = self.write_json_with(source, &mut output, options);
         output
     }
 }
@@ -3710,6 +3794,14 @@ mod tests {
         let document = parse(br#"{"a":[1,2],"b":{}}"#).unwrap();
         let expected = "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": {}\n}";
         assert_eq!(document.to_string_pretty(2), expected);
+
+        // FormatOptions::pretty is two-space indentation, identical to the legacy path.
+        assert_eq!(document.to_string_with(FormatOptions::pretty()), expected);
+        // Compact FormatOptions matches Display byte for byte.
+        assert_eq!(document.to_string_with(FormatOptions::compact()), document.to_string());
+        // Tabs indent one tab per level instead of spaces.
+        let tabbed = document.to_string_with(FormatOptions::pretty().with_indent(Indent::Tabs));
+        assert_eq!(tabbed, "{\n\t\"a\": [\n\t\t1,\n\t\t2\n\t],\n\t\"b\": {}\n}");
     }
 
     #[test]
@@ -4034,7 +4126,7 @@ mod tests {
         // serialize to a lossy "null"; instead it is kept as its exact lexeme.
         for source in [b"1e400".as_slice(), b"-1e400", b"1e309", b"1e-400"] {
             let document = parse(source).unwrap();
-            assert!(matches!(document, Json::BigNumber(_)), "{:?}", document);
+            assert!(matches!(document, Json::BigNumber(_)), "{document:?}");
             let text = core::str::from_utf8(source).unwrap();
             assert_eq!(document.as_number_str(), Some(text));
             assert_eq!(document.to_string(), text);
