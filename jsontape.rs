@@ -903,7 +903,7 @@ fn write_indent<W: fmt::Write>(writer: &mut W, indent: Indent, depth: usize) -> 
     writer.write_char('\n')?;
     match indent {
         Indent::Spaces(width) => {
-            for _ in 0..(width as usize * depth) {
+            for _ in 0..(width as usize).saturating_mul(depth) {
                 writer.write_char(' ')?;
             }
         }
@@ -919,7 +919,7 @@ fn write_indent<W: fmt::Write>(writer: &mut W, indent: Indent, depth: usize) -> 
 /// Column reached by an indent of `depth` levels; a tab counts as one column.
 fn indent_cols(indent: Indent, depth: usize) -> usize {
     match indent {
-        Indent::Spaces(width) => width as usize * depth,
+        Indent::Spaces(width) => (width as usize).saturating_mul(depth),
         Indent::Tabs => depth,
     }
 }
@@ -5360,6 +5360,10 @@ mod tests {
         // after the opening `{` and newline is still an indent space, not a quote.
         let clamped = parse(br#"{"a":1}"#).unwrap().to_string_pretty(65_536);
         assert_eq!(clamped.as_bytes().get(2), Some(&b' '));
+        assert_eq!(
+            indent_cols(Indent::Spaces(u16::MAX), usize::MAX),
+            usize::MAX
+        );
     }
 
     #[test]
