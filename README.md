@@ -53,6 +53,16 @@ assert_eq!(document.get(source, "metric").and_then(|v| v.as_str(source)), Some("
 assert_eq!(document.get(source, "nodes").and_then(|v| v.as_u64()), Some(20_000_000));
 ```
 
+For a source-bound view that cannot accidentally be resolved against different
+bytes, use `view_bound` and navigate without passing the source again:
+
+```rust
+use jsontape::view_bound;
+
+let document = view_bound(br#"{ "a": [10, 20] }"#).unwrap();
+assert_eq!(document.get("a").get(1).as_u64(), Some(20));
+```
+
 ### Strict by Default, JSON5 by Opt-In
 
 The default is strict RFC 8259.

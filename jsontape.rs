@@ -37,11 +37,11 @@
 //! strings and navigates by key or index with no `source` argument:
 //!
 //! ```rust
-//! use jsontape::view;
+//! use jsontape::view_bound;
 //!
 //! let source = br#"{ "a": { "b": [10, 20] } }"#;
-//! let document = view(source).unwrap();
-//! assert_eq!(document.bind(source).get("a").get("b").get(1).as_u64(), Some(20));
+//! let document = view_bound(source).unwrap();
+//! assert_eq!(document.get("a").get("b").get(1).as_u64(), Some(20));
 //! ```
 //!
 //! # Beyond parsing
