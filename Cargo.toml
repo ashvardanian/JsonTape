@@ -15,7 +15,13 @@ path = "jsontape.rs"
 allocator-api2 = { version = "0.3", default-features = false, features = [
     "alloc",
 ] }
+serde = { version = "1", default-features = false, optional = true }
+
+[dev-dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = "1"
 
 [features]
 default = ["std"]
-std = ["allocator-api2/std"]
+std = ["allocator-api2/std", "serde?/std"]
+serde = ["dep:serde", "serde/alloc"]
