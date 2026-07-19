@@ -464,6 +464,16 @@ fn hex_value(byte: u8) -> Option<u16> {
     }
 }
 
+/// Reads four hexadecimal digits at `start`, without advancing a cursor.
+fn hex4_at(bytes: &[u8], start: usize) -> Option<u16> {
+    let digits = bytes.get(start..start.checked_add(4)?)?;
+    let mut value = 0;
+    for &byte in digits {
+        value = value * 16 + hex_value(byte)?;
+    }
+    Some(value)
+}
+
 /// Private byte-search seam for scanner hot paths. The scalar implementation is
 /// deliberately simple today; a future `speed` feature can replace this one
 /// implementation with StringZilla without leaking that dependency into parser
@@ -1003,10 +1013,43 @@ fn span_is_strict_json_body(content: &[u8]) -> bool {
             b'"' => return false,
             b'\\' => match content.get(index + 1) {
                 Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => index += 2,
-                Some(b'u')
-                    if content.get(index + 2..index + 6).is_some_and(|digits| {
-                        digits.iter().all(|&byte| hex_value(byte).is_some())
-                    }) => index += 6,
+                Some(b'u') => {
+                    let Some(digits_start) = index.checked_add(2) else {
+                        return false;
+                    };
+                    let Some(high) = hex4_at(content, digits_start) else {
+                        return false;
+                    };
+                    if (0xD800..=0xDBFF).contains(&high) {
+                        let Some(low_escape_start) = index.checked_add(6) else {
+                            return false;
+                        };
+                        let Some(low_digits_start) = index.checked_add(8) else {
+                            return false;
+                        };
+                        let Some(low) = content
+                            .get(low_escape_start..)
+                            .filter(|suffix| suffix.starts_with(b"\\u"))
+                            .and_then(|_| hex4_at(content, low_digits_start))
+                        else {
+                            return false;
+                        };
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return false;
+                        }
+                        let Some(next) = index.checked_add(12) else {
+                            return false;
+                        };
+                        index = next;
+                    } else if (0xDC00..=0xDFFF).contains(&high) {
+                        return false;
+                    } else {
+                        let Some(next) = index.checked_add(6) else {
+                            return false;
+                        };
+                        index = next;
+                    }
+                }
                 _ => return false,
             },
             byte if byte < 0x20 => return false,
@@ -5488,7 +5531,7 @@ mod tests {
 
     #[test]
     fn manually_constructed_view_spans_still_serialize_as_json() {
-        for source in [b"a\nb".as_slice(), b"\\u12", b"\xff"] {
+        for source in [b"a\nb".as_slice(), b"\\u12", b"\\uD800", b"\xff"] {
             let document = JsonView::<Global>::String(Span { start: 0, len: source.len() });
             assert!(parse(document.to_json_string(source).as_bytes()).is_ok());
         }
