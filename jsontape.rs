@@ -2390,6 +2390,36 @@ pub fn parse_in_with<A: Allocator + Clone>(
 
 /// Parses `source` into an owned, mutable [`Json`] allocated in `allocator`,
 /// decoding every string's escapes. The result borrows nothing from `source`.
+///
+/// The `allocator` is any [`allocator_api2::alloc::Allocator`], so the whole
+/// document can be packed into one region — a bump or slab arena — that frees in
+/// O(1) when dropped. Here a custom allocator simply tallies the bytes handed
+/// out; swap in a bump-arena allocator to get the packed, drop-once layout
+/// described on [`JsonView`].
+///
+/// ```
+/// use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
+/// use core::cell::Cell;
+/// use core::ptr::NonNull;
+///
+/// struct Counting {
+///     bytes: Cell<usize>,
+/// }
+/// unsafe impl Allocator for &Counting {
+///     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+///         self.bytes.set(self.bytes.get() + layout.size());
+///         Global.allocate(layout)
+///     }
+///     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+///         unsafe { Global.deallocate(ptr, layout) }
+///     }
+/// }
+///
+/// let counter = Counting { bytes: Cell::new(0) };
+/// let document = jsontape::parse_in(br#"{ "nodes": [1, 2, 3] }"#, &counter).unwrap();
+/// assert_eq!(document["nodes"][2].as_u64(), Some(3));
+/// assert!(counter.bytes.get() > 0);
+/// ```
 pub fn parse_in<A: Allocator + Clone>(
     source: &[u8],
     allocator: A,

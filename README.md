@@ -55,15 +55,26 @@ assert_eq!(document.get(source, "nodes").and_then(|v| v.as_u64()), Some(20_000_0
 
 - __Strict numbers.__
   Leading zeros, bare `.5` and `1.`, malformed exponents, and `+`-prefixed values are rejected.
-  Integers keep their width as `i64` or `u64` and only fall back to `f64` when they overflow 64 bits, so values past the 2^53 float boundary survive.
+  Integers keep their width as `i64` or `u64`, and an integer too wide for 64 bits is preserved as its exact decimal text rather than rounded into an `f64`.
 - __Strict strings.__
   Unescaped control characters, invalid `\u` escapes, and lone surrogates are rejected; surrogate pairs are combined.
   Both paths validate UTF-8 and escapes at parse time; `JsonView` then keeps the raw spans while `Json` stores the decoded strings.
+- __Rich errors.__
+  A syntax fault carries a byte offset and a category, and `JsonError::location(source)` resolves it to a line and column on demand.
+- __Configurable.__
+  `ParseOptions` sets the nesting limit and the duplicate-key policy (last-wins by default, or first-wins, reject, keep-all), passed to the `*_with` parsers.
 - __Fallible parsing.__
-  Parsing untrusted input uses fallible allocation and returns `JsonError` rather than aborting.
-  Build-from-code mutators allocate infallibly, like the standard collections.
-- __Bounded recursion.__
-  Nesting is capped to guard against stack exhaustion on adversarial input.
+  Parsing untrusted input uses fallible allocation and returns `JsonError` rather than aborting; build-from-code mutators allocate infallibly, like the standard collections.
+- __Optional serde.__
+  Enable the `serde` feature for `Serialize`/`Deserialize`, plus `to_value`/`from_value` that convert any type to and from a document without a text round trip.
+
+## Allocators
+
+Every container allocates through the `allocator` you pass to `parse_in` or `view_in`, any [`allocator_api2`] allocator.
+With the default global heap each array and object is a separate allocation scattered across the heap.
+Pass a bump or slab arena instead and the whole document is packed into one contiguous region that frees in O(1) when the arena is dropped — parse a large payload, read it, and reclaim it all at once.
+This is the closest the pointer-tree design gets to a flat tape; the per-node `Vec`s still grow by doubling, so an arena keeps some slack, but allocation and teardown are cheap and fragmentation-free.
+Bring any arena crate that implements `allocator_api2::Allocator` version 0.3; see the [`parse_in`](https://docs.rs/jsontape/latest/jsontape/fn.parse_in.html) docs for a worked custom-allocator example.
 
 ## License
 
