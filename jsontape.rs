@@ -1989,6 +1989,206 @@ impl FromIterator<(String, Json<Global>)> for Json<Global> {
     }
 }
 
+impl<A: Allocator> core::ops::Index<usize> for JsonView<A> {
+    type Output = JsonView<A>;
+    fn index(&self, index: usize) -> &JsonView<A> {
+        match self {
+            JsonView::Array(items) => items.get(index).unwrap_or(&JsonView::Null),
+            _ => &JsonView::Null,
+        }
+    }
+}
+
+impl<A: Allocator> JsonView<A> {
+    /// Pairs this view node with its `source`, yielding a [`Resolved`] cursor
+    /// whose reads and lookups need no further `source` argument.
+    pub fn bind<'s>(&'s self, source: &'s [u8]) -> Resolved<'s, A> {
+        Resolved { source, node: self }
+    }
+}
+
+/// A key or index that resolves a child of a [`Resolved`] cursor: a `&str`
+/// object key (escape-aware) or a `usize` array position.
+pub trait ResolveKey<A: Allocator> {
+    #[doc(hidden)]
+    fn find<'s>(&self, source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>>;
+}
+
+impl<A: Allocator> ResolveKey<A> for usize {
+    fn find<'s>(&self, _source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>> {
+        match node {
+            JsonView::Array(items) => items.get(*self),
+            _ => None,
+        }
+    }
+}
+
+impl<A: Allocator> ResolveKey<A> for &str {
+    fn find<'s>(&self, source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>> {
+        node.get(source, self)
+    }
+}
+
+/// A [`JsonView`] node paired with the `source` it was parsed from, so string
+/// values resolve and keyed navigation work without threading `source` through
+/// every call. `Copy`, so it chains freely: `view.bind(src).get("a").get(0)`.
+pub struct Resolved<'s, A: Allocator = Global> {
+    source: &'s [u8],
+    node: &'s JsonView<A>,
+}
+
+// Both fields are references, so the cursor is `Copy` for any allocator; the
+// derive would wrongly require `A: Copy`.
+impl<'s, A: Allocator> Clone for Resolved<'s, A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'s, A: Allocator> Copy for Resolved<'s, A> {}
+
+impl<'s, A: Allocator> Resolved<'s, A> {
+    /// The underlying view node.
+    pub fn view(self) -> &'s JsonView<A> {
+        self.node
+    }
+
+    pub fn as_bool(self) -> Option<bool> {
+        self.node.as_bool()
+    }
+    pub fn as_i64(self) -> Option<i64> {
+        self.node.as_i64()
+    }
+    pub fn as_u64(self) -> Option<u64> {
+        self.node.as_u64()
+    }
+    pub fn as_f64(self) -> Option<f64> {
+        self.node.as_f64()
+    }
+
+    /// The string value, resolved against `source` (still escaped).
+    pub fn as_str(self) -> Option<&'s str> {
+        self.node.as_str(self.source)
+    }
+
+    pub fn is_null(self) -> bool {
+        self.node.is_null()
+    }
+    pub fn is_boolean(self) -> bool {
+        self.node.is_boolean()
+    }
+    pub fn is_number(self) -> bool {
+        self.node.is_number()
+    }
+    pub fn is_string(self) -> bool {
+        self.node.is_string()
+    }
+    pub fn is_array(self) -> bool {
+        self.node.is_array()
+    }
+    pub fn is_object(self) -> bool {
+        self.node.is_object()
+    }
+
+    /// The number of array elements or object entries; `0` for scalars.
+    pub fn len(self) -> usize {
+        self.node.len()
+    }
+    /// Whether an array or object has no elements. Always `false` for scalars.
+    pub fn is_empty(self) -> bool {
+        self.node.is_empty()
+    }
+
+    /// Navigates to a child by `&str` key or `usize` index, returning a
+    /// `Null`-backed cursor on a miss so lookups chain without `?`.
+    pub fn get<K: ResolveKey<A>>(self, key: K) -> Resolved<'s, A> {
+        Resolved {
+            source: self.source,
+            node: key.find(self.source, self.node).unwrap_or(&JsonView::Null),
+        }
+    }
+
+    /// Like [`get`](Resolved::get) but distinguishes a miss with `None`.
+    pub fn try_get<K: ResolveKey<A>>(self, key: K) -> Option<Resolved<'s, A>> {
+        key.find(self.source, self.node).map(|node| Resolved {
+            source: self.source,
+            node,
+        })
+    }
+
+    /// Iterates an object's entries as `(key, value cursor)`.
+    pub fn entries(self) -> impl Iterator<Item = (&'s str, Resolved<'s, A>)> {
+        let source = self.source;
+        let slice: &'s [(Span, JsonView<A>)] = match self.node {
+            JsonView::Object(entries) => entries,
+            _ => &[],
+        };
+        slice
+            .iter()
+            .filter_map(move |(span, value)| span.resolve(source).map(|key| (key, Resolved { source, node: value })))
+    }
+
+    /// Iterates an array's elements as cursors.
+    pub fn elements(self) -> impl Iterator<Item = Resolved<'s, A>> {
+        let source = self.source;
+        let slice: &'s [JsonView<A>] = match self.node {
+            JsonView::Array(items) => items,
+            _ => &[],
+        };
+        slice.iter().map(move |node| Resolved { source, node })
+    }
+
+    /// Resolves an RFC 6901 JSON Pointer, returning a `Null`-backed cursor on a
+    /// miss.
+    pub fn pointer(self, pointer: &str) -> Resolved<'s, A> {
+        self.try_pointer(pointer).unwrap_or(Resolved {
+            source: self.source,
+            node: &JsonView::Null,
+        })
+    }
+
+    /// Like [`pointer`](Resolved::pointer) but distinguishes a miss with `None`.
+    pub fn try_pointer(self, pointer: &str) -> Option<Resolved<'s, A>> {
+        if pointer.is_empty() {
+            return Some(self);
+        }
+        if !pointer.starts_with('/') {
+            return None;
+        }
+        let mut current = self;
+        for raw_token in pointer.split('/').skip(1) {
+            let decoded;
+            let token: &str = if raw_token.contains('~') {
+                decoded = raw_token.replace("~1", "/").replace("~0", "~");
+                &decoded
+            } else {
+                raw_token
+            };
+            current = match current.node {
+                JsonView::Object(_) => current.try_get(token)?,
+                JsonView::Array(_) => {
+                    if token.len() > 1 && token.starts_with('0') {
+                        return None;
+                    }
+                    current.try_get(token.parse::<usize>().ok()?)?
+                }
+                _ => return None,
+            };
+        }
+        Some(current)
+    }
+
+    /// Writes this node as compact JSON, no `source` argument needed.
+    pub fn write_json<W: fmt::Write>(self, writer: &mut W) -> fmt::Result {
+        self.node.write_json(self.source, writer)
+    }
+}
+
+impl<'s, A: Allocator> fmt::Display for Resolved<'s, A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.node.write_json(self.source, formatter)
+    }
+}
+
 /// Parses `source` into an immutable [`JsonView`] allocated in `allocator`.
 /// Spans in the result are offsets into `source`, so keep `source` alive.
 pub fn view_in<A: Allocator + Clone>(
@@ -2501,6 +2701,30 @@ mod tests {
         assert_eq!(key.len(), 8);
         assert!(key.starts_with("greet"));
         assert_eq!(key.to_string(), "greeting");
+    }
+
+    #[test]
+    fn view_indexing_and_cursor() {
+        let source = br#"{"a":{"b":[10,20]},"s":"hi"}"#;
+        let document = view(source).unwrap();
+
+        // Array indexing on a bare JsonView is source-free; a miss yields Null.
+        let inner = document.get(source, "a").unwrap().get(source, "b").unwrap();
+        assert_eq!(inner[1].as_u64(), Some(20));
+        assert!(inner[99].is_null());
+
+        // The bound cursor navigates and reads strings without a source argument.
+        let root = document.bind(source);
+        assert_eq!(root.get("a").get("b").get(0).as_u64(), Some(10));
+        assert_eq!(root.get("s").as_str(), Some("hi"));
+        assert!(root.get("missing").get("x").is_null());
+        assert_eq!(root.pointer("/a/b/1").as_u64(), Some(20));
+        assert!(root.try_get("nope").is_none());
+
+        // Display serializes through the cursor, no source needed.
+        assert_eq!(root.get("a").to_string(), r#"{"b":[10,20]}"#);
+        assert_eq!(root.entries().count(), 2);
+        assert_eq!(root.get("a").get("b").elements().count(), 2);
     }
 
     /// A distinct allocator type that just forwards to the global heap, used to
