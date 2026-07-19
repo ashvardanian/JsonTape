@@ -273,6 +273,9 @@ pub struct ParseOptions {
     pub allow_trailing_commas: bool,
     /// Accept unquoted ASCII identifier object keys.
     pub allow_unquoted_keys: bool,
+    /// Accept single-quoted strings and the JSON5 string escape set: `\'`, `\v`,
+    /// `\0`, `\xHH`, and backslash-newline line continuations.
+    pub allow_single_quotes: bool,
     /// Accept `0x`-prefixed hexadecimal integers.
     pub allow_hex_numbers: bool,
     /// Accept a leading `+` sign on numbers.
@@ -301,6 +304,7 @@ impl ParseOptions {
             allow_block_comments: false,
             allow_trailing_commas: false,
             allow_unquoted_keys: false,
+            allow_single_quotes: false,
             allow_hex_numbers: false,
             allow_leading_plus: false,
             allow_leading_decimal: false,
@@ -328,6 +332,7 @@ impl ParseOptions {
             allow_block_comments: true,
             allow_trailing_commas: true,
             allow_unquoted_keys: true,
+            allow_single_quotes: true,
             allow_hex_numbers: true,
             allow_leading_plus: true,
             allow_leading_decimal: true,
@@ -418,6 +423,17 @@ impl<'a> UnescapeBytes<'a> {
         Some(value)
     }
 
+    /// Reads two hex digits for a `\xHH` escape, advancing past them.
+    fn read_hex2(&mut self) -> Option<u8> {
+        let mut value = 0u8;
+        for _ in 0..2 {
+            let digit = hex_value(*self.content.get(self.index)?)? as u8;
+            value = value * 16 + digit;
+            self.index += 1;
+        }
+        Some(value)
+    }
+
     /// Encodes `character` into the pending buffer and returns its first byte.
     fn emit_character(&mut self, character: char) -> Option<u8> {
         let mut buffer = [0u8; 4];
@@ -465,6 +481,25 @@ impl<'a> Iterator for UnescapeBytes<'a> {
             b'n' => Some(b'\n'),
             b'r' => Some(b'\r'),
             b't' => Some(b'\t'),
+            // JSON5 escape superset. A strict-scanned span never contains these,
+            // so decoding them unconditionally is harmless and lets a re-decoded
+            // `JsonView` span need no parse-mode context.
+            b'\'' => Some(b'\''),
+            b'v' => Some(0x0B),
+            b'0' => Some(0x00),
+            b'x' => match self.read_hex2() {
+                // A `\xHH` byte is a Latin-1 code point, U+0000..=U+00FF.
+                Some(byte) => self.emit_character(char::from(byte)),
+                None => self.fail(),
+            },
+            // A backslash-newline line continuation yields no byte; resume scanning.
+            b'\n' => self.next(),
+            b'\r' => {
+                if self.content.get(self.index) == Some(&b'\n') {
+                    self.index += 1; // a CR LF pair is one line terminator
+                }
+                self.next()
+            }
             b'u' => {
                 let high = match self.read_hex4() {
                     Some(high) => high,
@@ -733,6 +768,12 @@ fn raw_string_width(source: &[u8], span: Span) -> usize {
 /// Writes `text` as a quoted JSON string, escaping what the grammar requires.
 fn write_escaped_str<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
     writer.write_char('"')?;
+    write_escaped_body(writer, text)?;
+    writer.write_char('"')
+}
+
+/// Writes the escaped body of a JSON string — everything between the quotes.
+fn write_escaped_body<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
     let bytes = text.as_bytes();
     let mut run_start = 0;
     // Every byte needing an escape is ASCII, and multi-byte UTF-8 bytes are all
@@ -760,14 +801,51 @@ fn write_escaped_str<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
     if run_start < bytes.len() {
         writer.write_str(&text[run_start..])?;
     }
-    writer.write_char('"')
+    Ok(())
 }
 
-/// Writes a quoted JSON string straight from a raw source span. The span's bytes
-/// are already valid, escaped JSON string content, so no re-escaping is needed.
+/// Whether a raw string span can be re-emitted verbatim inside double quotes:
+/// it holds no literal `"` and every backslash opens an escape that is also valid
+/// in strict JSON. A JSON5 single-quoted body or an extended escape fails this.
+fn span_is_strict_json_body(content: &[u8]) -> bool {
+    let mut index = 0;
+    while index < content.len() {
+        match content[index] {
+            b'"' => return false,
+            b'\\' => match content.get(index + 1) {
+                Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u') => index += 2,
+                _ => return false,
+            },
+            _ => index += 1,
+        }
+    }
+    true
+}
+
+/// Writes a quoted JSON string from a raw source span. When the span is already
+/// valid strict JSON body it is copied verbatim; a JSON5 span with single-quote
+/// content or extended escapes is decoded and re-escaped into strict JSON.
 fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) -> fmt::Result {
+    let content = span.bytes(source).unwrap_or(&[]);
+    if span_is_strict_json_body(content) {
+        writer.write_char('"')?;
+        writer.write_str(core::str::from_utf8(content).unwrap_or(""))?;
+        return writer.write_char('"');
+    }
+    // Decode the JSON5 body one byte at a time, reassembling whole UTF-8
+    // characters, and re-escape each into a strict JSON string.
     writer.write_char('"')?;
-    writer.write_str(span.resolve(source).unwrap_or(""))?;
+    let mut decoder = UnescapeBytes::new(content);
+    let mut buffer = [0u8; 4];
+    let mut filled = 0;
+    for byte in decoder.by_ref() {
+        buffer[filled] = byte;
+        filled += 1;
+        if let Ok(text) = core::str::from_utf8(&buffer[..filled]) {
+            write_escaped_body(writer, text)?;
+            filled = 0;
+        }
+    }
     writer.write_char('"')
 }
 
@@ -928,7 +1006,11 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
             Some(b'"') => {
-                let span = self.scan_string()?;
+                let span = self.scan_string(b'"')?;
+                B::string(self.source, span, &self.allocator)
+            }
+            Some(b'\'') if self.options.allow_single_quotes => {
+                let span = self.scan_string(b'\'')?;
                 B::string(self.source, span, &self.allocator)
             }
             Some(b't') => self.expect_literal(b"true").map(|_| B::boolean(true)),
@@ -1159,9 +1241,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(Scalar::Integer(signed as i64))
     }
 
-    /// Scans a string, validating escapes and rejecting raw control characters,
-    /// and returns the raw span between the quotes, still escaped.
-    fn scan_string(&mut self) -> Result<Span, JsonError> {
+    /// Scans a string opened by `delimiter` (a double or, under JSON5, single
+    /// quote), validating escapes and rejecting raw control characters, and
+    /// returns the raw span between the quotes, still escaped.
+    fn scan_string(&mut self, delimiter: u8) -> Result<Span, JsonError> {
         self.position += 1; // opening quote
         let start = self.position;
         // Track non-ASCII so a pure-ASCII body (the common case) skips the second
@@ -1170,7 +1253,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         loop {
             match self.peek() {
                 None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
-                Some(b'"') => {
+                Some(byte) if byte == delimiter => {
                     // RFC 8259 §8.1: the text must be valid UTF-8. Escape bytes are
                     // all ASCII, so validating the body only when it holds non-ASCII
                     // bytes catches every ill-formed literal byte.
@@ -1204,11 +1287,41 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
     }
 
-    /// Validates one escape sequence, positioned just past the backslash.
+    /// Validates one escape sequence, positioned just past the backslash. The
+    /// JSON5 extensions — `\'`, `\v`, `\0`, `\xHH`, and backslash-newline line
+    /// continuations — are accepted only when single quotes are enabled.
     fn scan_escape(&mut self) -> Result<(), JsonError> {
         match self.peek() {
             Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
                 self.position += 1;
+                Ok(())
+            }
+            Some(b'\'' | b'v') if self.options.allow_single_quotes => {
+                self.position += 1;
+                Ok(())
+            }
+            Some(b'0') if self.options.allow_single_quotes => {
+                self.position += 1;
+                // `\0` is the null character, but `\0` before a digit is not a
+                // valid JSON5 escape.
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return self.fault_kind(SyntaxKind::InvalidEscape);
+                }
+                Ok(())
+            }
+            Some(b'x') if self.options.allow_single_quotes => {
+                self.position += 1;
+                self.scan_hex2()
+            }
+            Some(b'\n') if self.options.allow_single_quotes => {
+                self.position += 1;
+                Ok(())
+            }
+            Some(b'\r') if self.options.allow_single_quotes => {
+                self.position += 1;
+                if self.peek() == Some(b'\n') {
+                    self.position += 1; // a CR LF pair continues one line
+                }
                 Ok(())
             }
             Some(b'u') => {
@@ -1252,6 +1365,17 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
         }
         Ok(value)
+    }
+
+    /// Validates a `\xHH` escape's two hex digits, positioned on the first digit.
+    fn scan_hex2(&mut self) -> Result<(), JsonError> {
+        for _ in 0..2 {
+            match self.peek().and_then(hex_value) {
+                Some(_) => self.position += 1,
+                None => return self.fault_kind(SyntaxKind::InvalidEscape),
+            }
+        }
+        Ok(())
     }
 
     fn array(&mut self) -> Result<B::Value, JsonError> {
@@ -1331,7 +1455,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         loop {
             self.skip_trivia()?;
             let key_span = match self.peek() {
-                Some(b'"') => self.scan_string()?,
+                Some(b'"') => self.scan_string(b'"')?,
+                Some(b'\'') if self.options.allow_single_quotes => self.scan_string(b'\'')?,
                 Some(byte)
                     if self.options.allow_unquoted_keys
                         && (byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$') =>
@@ -4795,6 +4920,77 @@ mod tests {
         let source = br#"{ a: 0x10, b: [1, 2,], }"#;
         let view = view_with(source, &ParseOptions::json5()).unwrap();
         assert_eq!(view.to_json_string(source), r#"{"a":16,"b":[1,2]}"#);
+    }
+
+    #[test]
+    fn json5_single_quotes_and_escapes() {
+        let options = ParseOptions::json5();
+
+        // A single-quoted value re-serializes as a strict double-quoted string.
+        let document = parse_with(b"'hello'", &options).unwrap();
+        assert_eq!(document.as_str(), Some("hello"));
+        assert_eq!(document.to_string(), r#""hello""#);
+
+        // A literal double quote inside single quotes gets escaped on the way out.
+        let document = parse_with(br#"'say "hi"'"#, &options).unwrap();
+        assert_eq!(document.as_str(), Some(r#"say "hi""#));
+        assert_eq!(document.to_string(), r#""say \"hi\"""#);
+
+        // The `\'` escape decodes to an apostrophe, which needs none on output.
+        let document = parse_with(br"'it\'s'", &options).unwrap();
+        assert_eq!(document.as_str(), Some("it's"));
+        assert_eq!(document.to_string(), r#""it's""#);
+
+        // A `\xHH` hex escape is a Latin-1 code point.
+        let document = parse_with(br"'\xe9'", &options).unwrap();
+        assert_eq!(document.as_str(), Some("é"));
+        assert_eq!(document.to_string(), "\"é\"");
+
+        // `\v` and `\0` decode to control characters, re-escaped as `\uXXXX`.
+        let document = parse_with(br"'\v\0'", &options).unwrap();
+        assert_eq!(document.as_str(), Some("\u{0b}\u{0}"));
+        assert_eq!(document.to_string(), r#""\u000b\u0000""#);
+
+        // A backslash-newline line continuation joins the two halves.
+        let document = parse_with(b"'a\\\nb'", &options).unwrap();
+        assert_eq!(document.as_str(), Some("ab"));
+
+        // Single-quoted object keys are supported and normalize to quoted keys.
+        let document = parse_with(br"{ 'k': 1 }", &options).unwrap();
+        assert_eq!(document.to_string(), r#"{"k":1}"#);
+    }
+
+    #[test]
+    fn json5_view_reescapes_single_quoted_content() {
+        let options = ParseOptions::json5();
+
+        // The view keeps raw spans, so serialization must re-escape a `\'`
+        // and a literal `"` into a valid strict JSON string.
+        let source = br"'a\'b'";
+        let view = view_with(source, &options).unwrap();
+        assert_eq!(view.to_json_string(source), r#""a'b""#);
+
+        let source = br#"'x"y'"#;
+        let view = view_with(source, &options).unwrap();
+        assert_eq!(view.to_json_string(source), r#""x\"y""#);
+
+        // A hex escape resolves through the view's on-demand decoder too.
+        let source = br"{ k: '\xe9' }";
+        let view = view_with(source, &options).unwrap();
+        assert_eq!(view.to_json_string(source), "{\"k\":\"é\"}");
+    }
+
+    #[test]
+    fn strict_rejects_json5_strings() {
+        // Single quotes and every extended escape are strict-mode errors.
+        assert!(parse(b"'x'").is_err());
+        assert!(parse(br#""\xe9""#).is_err());
+        assert!(parse(br#""\v""#).is_err());
+        assert!(parse(br#""\'""#).is_err());
+        // `\0` before a digit is not a valid escape even under JSON5.
+        assert!(parse_with(br"'\05'", &ParseOptions::json5()).is_err());
+        // An unterminated single-quoted string faults, not loops.
+        assert!(parse_with(b"'open", &ParseOptions::json5()).is_err());
     }
 }
 
