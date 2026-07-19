@@ -461,78 +461,84 @@ impl<'a> Iterator for UnescapeBytes<'a> {
             self.pending_position += 1;
             return Some(byte);
         }
-        let byte = *self.content.get(self.index)?;
-        if byte != b'\\' {
-            self.index += 1;
-            return Some(byte);
-        }
-        // Consume the backslash and its escape selector.
-        self.index += 1;
-        let selector = match self.content.get(self.index) {
-            Some(&selector) => selector,
-            None => return self.fail(),
-        };
-        self.index += 1;
-        match selector {
-            b'"' => Some(b'"'),
-            b'\\' => Some(b'\\'),
-            b'/' => Some(b'/'),
-            b'b' => Some(0x08),
-            b'f' => Some(0x0C),
-            b'n' => Some(b'\n'),
-            b'r' => Some(b'\r'),
-            b't' => Some(b'\t'),
-            // JSON5 escape superset. A strict-scanned span never contains these,
-            // so decoding them unconditionally is harmless and lets a re-decoded
-            // `JsonView` span need no parse-mode context.
-            b'\'' => Some(b'\''),
-            b'v' => Some(0x0B),
-            b'0' => Some(0x00),
-            b'x' => match self.read_hex2() {
-                // A `\xHH` byte is a Latin-1 code point, U+0000..=U+00FF.
-                Some(byte) => self.emit_character(char::from(byte)),
-                None => self.fail(),
-            },
-            // A backslash-newline line continuation yields no byte; resume scanning.
-            b'\n' => self.next(),
-            b'\r' => {
-                if self.content.get(self.index) == Some(&b'\n') {
-                    self.index += 1; // a CR LF pair is one line terminator
-                }
-                self.next()
+        // Looping rather than recursing on line continuations keeps a long run
+        // of `\`-newline pairs from overflowing the stack.
+        loop {
+            let byte = *self.content.get(self.index)?;
+            if byte != b'\\' {
+                self.index += 1;
+                return Some(byte);
             }
-            b'u' => {
-                let high = match self.read_hex4() {
-                    Some(high) => high,
-                    None => return self.fail(),
-                };
-                let code_point = if (0xD800..=0xDBFF).contains(&high) {
-                    // A high surrogate must be followed by `\u` and a low one.
-                    if self.content.get(self.index) != Some(&b'\\')
-                        || self.content.get(self.index + 1) != Some(&b'u')
-                    {
-                        return self.fail();
+            // Consume the backslash and its escape selector.
+            self.index += 1;
+            let selector = match self.content.get(self.index) {
+                Some(&selector) => selector,
+                None => return self.fail(),
+            };
+            self.index += 1;
+            let decoded = match selector {
+                b'"' => Some(b'"'),
+                b'\\' => Some(b'\\'),
+                b'/' => Some(b'/'),
+                b'b' => Some(0x08),
+                b'f' => Some(0x0C),
+                b'n' => Some(b'\n'),
+                b'r' => Some(b'\r'),
+                b't' => Some(b'\t'),
+                // JSON5 escape superset. A strict-scanned span never contains these,
+                // so decoding them unconditionally is harmless and lets a re-decoded
+                // `JsonView` span need no parse-mode context.
+                b'\'' => Some(b'\''),
+                b'v' => Some(0x0B),
+                b'0' => Some(0x00),
+                b'x' => match self.read_hex2() {
+                    // A `\xHH` byte is a Latin-1 code point, U+0000..=U+00FF.
+                    Some(byte) => self.emit_character(char::from(byte)),
+                    None => self.fail(),
+                },
+                // A backslash-newline line continuation yields no byte; loop on to
+                // the next byte instead of recursing.
+                b'\n' => continue,
+                b'\r' => {
+                    if self.content.get(self.index) == Some(&b'\n') {
+                        self.index += 1; // a CR LF pair is one line terminator
                     }
-                    self.index += 2; // skip the "\u" of the low surrogate
-                    let low = match self.read_hex4() {
-                        Some(low) => low,
+                    continue;
+                }
+                b'u' => {
+                    let high = match self.read_hex4() {
+                        Some(high) => high,
                         None => return self.fail(),
                     };
-                    if !(0xDC00..=0xDFFF).contains(&low) {
-                        return self.fail();
+                    let code_point = if (0xD800..=0xDBFF).contains(&high) {
+                        // A high surrogate must be followed by `\u` and a low one.
+                        if self.content.get(self.index) != Some(&b'\\')
+                            || self.content.get(self.index + 1) != Some(&b'u')
+                        {
+                            return self.fail();
+                        }
+                        self.index += 2; // skip the "\u" of the low surrogate
+                        let low = match self.read_hex4() {
+                            Some(low) => low,
+                            None => return self.fail(),
+                        };
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return self.fail();
+                        }
+                        0x10000 + (((high - 0xD800) as u32) << 10) + (low - 0xDC00) as u32
+                    } else if (0xDC00..=0xDFFF).contains(&high) {
+                        return self.fail(); // lone low surrogate
+                    } else {
+                        high as u32
+                    };
+                    match char::from_u32(code_point) {
+                        Some(character) => self.emit_character(character),
+                        None => self.fail(),
                     }
-                    0x10000 + (((high - 0xD800) as u32) << 10) + (low - 0xDC00) as u32
-                } else if (0xDC00..=0xDFFF).contains(&high) {
-                    return self.fail(); // lone low surrogate
-                } else {
-                    high as u32
-                };
-                match char::from_u32(code_point) {
-                    Some(character) => self.emit_character(character),
-                    None => self.fail(),
                 }
-            }
-            _ => self.fail(),
+                _ => self.fail(),
+            };
+            return decoded;
         }
     }
 }
@@ -844,6 +850,11 @@ fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) ->
         filled += 1;
         if let Ok(text) = core::str::from_utf8(&buffer[..filled]) {
             write_escaped_body(writer, text)?;
+            filled = 0;
+        } else if filled == 4 {
+            // Four bytes that still do not form a character mean a malformed span
+            // (a parser-produced span never gets here); drop them so the index
+            // stays in bounds rather than panicking.
             filled = 0;
         }
     }
@@ -1190,19 +1201,28 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     }
 
     /// Builds a [`Scalar::Big`] span from `start` to the cursor, keeping the
-    /// exact lexeme. A leading `+` is dropped and a leading decimal point is
-    /// rejected so the preserved text is always valid strict JSON to re-emit.
+    /// exact lexeme. The preserved text is re-emitted verbatim, so it must
+    /// already be valid strict JSON: a leading `+` is dropped, and any decimal
+    /// point not sitting between two digits — a leading `.5`, a trailing `5.`,
+    /// or a `5.e6` before an exponent — is rejected. JSON5 forms reach this
+    /// path only in the f64-overflow range, so rejecting them is a rare corner.
     fn big_number(&self, start: usize) -> Result<Scalar, JsonError> {
         let mut low = start;
         if self.source.get(low) == Some(&b'+') {
             low += 1;
         }
-        let after_sign = if self.source.get(low) == Some(&b'-') { low + 1 } else { low };
-        if self.source.get(after_sign) == Some(&b'.') {
-            return Err(JsonError::Syntax {
-                offset: start,
-                kind: SyntaxKind::InvalidNumber,
-            });
+        let lexeme = &self.source[low..self.position];
+        for (offset, &byte) in lexeme.iter().enumerate() {
+            if byte == b'.' {
+                let before_ok = offset > 0 && lexeme[offset - 1].is_ascii_digit();
+                let after_ok = matches!(lexeme.get(offset + 1), Some(next) if next.is_ascii_digit());
+                if !before_ok || !after_ok {
+                    return Err(JsonError::Syntax {
+                        offset: start,
+                        kind: SyntaxKind::InvalidNumber,
+                    });
+                }
+            }
         }
         Ok(Scalar::Big(Span {
             start: low,
@@ -5203,6 +5223,42 @@ mod tests {
         assert!(parse_with(br"'\05'", &ParseOptions::json5()).is_err());
         // An unterminated single-quoted string faults, not loops.
         assert!(parse_with(b"'open", &ParseOptions::json5()).is_err());
+    }
+
+    #[test]
+    fn json5_big_number_stays_valid_json() {
+        let options = ParseOptions::json5();
+
+        // An extended decimal-point number outside f64 range cannot be preserved
+        // as valid strict JSON, so it is rejected rather than emitting `5.` etc.
+        let mut trailing_dot = String::from("1");
+        for _ in 0..320 {
+            trailing_dot.push('1');
+        }
+        trailing_dot.push('.'); // a 321-digit integer with a trailing dot, > 1e309
+        assert!(parse_with(trailing_dot.as_bytes(), &options).is_err());
+        assert!(parse_with(b"5.e-400", &options).is_err());
+        assert!(parse_with(b".5e400", &options).is_err());
+
+        // A well-formed decimal beyond f64 range is still preserved losslessly,
+        // and re-serializes as valid strict JSON.
+        let document = parse_with(b"1.5e400", &options).unwrap();
+        assert!(matches!(document, Json::BigNumber(_)));
+        assert_eq!(document.to_string(), "1.5e400");
+        assert_eq!(parse(document.to_string().as_bytes()).unwrap(), document);
+    }
+
+    #[test]
+    fn json5_line_continuations_do_not_overflow() {
+        // A long run of backslash-newline continuations must decode iteratively,
+        // never recursively, so it cannot overflow the stack.
+        let mut source = String::from("'");
+        for _ in 0..500_000 {
+            source.push_str("\\\n");
+        }
+        source.push_str("x'");
+        let document = parse_with(source.as_bytes(), &ParseOptions::json5()).unwrap();
+        assert_eq!(document.as_str(), Some("x"));
     }
 }
 
