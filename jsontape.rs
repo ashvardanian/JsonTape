@@ -453,9 +453,18 @@ pub fn unescape_into<A: Allocator>(
         offset: span.start,
         kind: SyntaxKind::InvalidString,
     })?;
+    // Decoding only collapses escapes, so the escaped length is an upper bound —
+    // reserve once and push without a per-byte check.
+    output
+        .try_reserve(content.len())
+        .map_err(|_| JsonError::Allocation)?;
+    // Fast path: an escape-free string is copied verbatim.
+    if !content.contains(&b'\\') {
+        output.extend_from_slice(content);
+        return Ok(());
+    }
     let mut decoder = UnescapeBytes::new(content);
     for byte in decoder.by_ref() {
-        output.try_reserve(1).map_err(|_| JsonError::Allocation)?;
         output.push(byte);
     }
     if decoder.malformed {
@@ -839,19 +848,24 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     fn scan_string(&mut self) -> Result<Span, JsonError> {
         self.position += 1; // opening quote
         let start = self.position;
+        // Track non-ASCII so a pure-ASCII body (the common case) skips the second
+        // UTF-8 validation pass — ASCII is always valid UTF-8.
+        let mut has_non_ascii = false;
         loop {
             match self.peek() {
                 None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
                 Some(b'"') => {
-                    // RFC 8259 §8.1: the text must be valid UTF-8. Escape bytes
-                    // are all ASCII, so validating the whole body catches every
-                    // ill-formed literal byte in one pass.
-                    let content = &self.source[start..self.position];
-                    if let Err(error) = core::str::from_utf8(content) {
-                        return Err(JsonError::Syntax {
-                            offset: start + error.valid_up_to(),
-                            kind: SyntaxKind::InvalidUtf8,
-                        });
+                    // RFC 8259 §8.1: the text must be valid UTF-8. Escape bytes are
+                    // all ASCII, so validating the body only when it holds non-ASCII
+                    // bytes catches every ill-formed literal byte.
+                    if has_non_ascii {
+                        let content = &self.source[start..self.position];
+                        if let Err(error) = core::str::from_utf8(content) {
+                            return Err(JsonError::Syntax {
+                                offset: start + error.valid_up_to(),
+                                kind: SyntaxKind::InvalidUtf8,
+                            });
+                        }
                     }
                     let span = Span {
                         start,
@@ -866,7 +880,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 }
                 // RFC 8259 forbids unescaped control characters in strings.
                 Some(byte) if byte < 0x20 => return self.fault_kind(SyntaxKind::ControlCharacter),
-                Some(_) => self.position += 1,
+                Some(byte) => {
+                    has_non_ascii |= byte >= 0x80;
+                    self.position += 1;
+                }
             }
         }
     }
@@ -2692,15 +2709,13 @@ mod serde_impls {
         }
     }
 
-    /// Decodes a still-escaped view span into a `String` for serde, mapping any
-    /// fault to the serializer's error type.
-    fn decode_for_serde<E: serde::ser::Error>(source: &[u8], span: Span) -> Result<String, E> {
+    /// Decodes a still-escaped view span into a fresh byte buffer for serde,
+    /// mapping any fault to the serializer's error type. The caller borrows a
+    /// `&str` from it, so there is no second allocation or copy.
+    fn decode_for_serde<E: serde::ser::Error>(source: &[u8], span: Span) -> Result<Vec<u8, Global>, E> {
         let mut buffer: Vec<u8, Global> = Vec::new_in(Global);
         unescape_into(source, span, &mut buffer).map_err(E::custom)?;
-        let decoded = core::str::from_utf8(&buffer).map_err(E::custom)?;
-        let mut owned = String::new();
-        owned.push_str(decoded);
-        Ok(owned)
+        Ok(buffer)
     }
 
     impl<'s, A: Allocator> serde::Serialize for Resolved<'s, A> {
@@ -2718,7 +2733,10 @@ mod serde_impls {
                 // The span is still escaped, so decode it before handing serde a
                 // plain string it would otherwise escape a second time.
                 JsonView::String(span) => {
-                    serializer.serialize_str(&decode_for_serde::<S::Error>(self.source, *span)?)
+                    let buffer = decode_for_serde::<S::Error>(self.source, *span)?;
+                    let decoded =
+                        core::str::from_utf8(&buffer).map_err(serde::ser::Error::custom)?;
+                    serializer.serialize_str(decoded)
                 }
                 JsonView::Array(items) => {
                     let mut sequence = serializer.serialize_seq(Some(items.len()))?;
@@ -2733,9 +2751,11 @@ mod serde_impls {
                 JsonView::Object(entries) => {
                     let mut map = serializer.serialize_map(Some(entries.len()))?;
                     for (key_span, value) in entries {
-                        let key = decode_for_serde::<S::Error>(self.source, *key_span)?;
+                        let buffer = decode_for_serde::<S::Error>(self.source, *key_span)?;
+                        let key =
+                            core::str::from_utf8(&buffer).map_err(serde::ser::Error::custom)?;
                         map.serialize_entry(
-                            &key,
+                            key,
                             &Resolved {
                                 source: self.source,
                                 node: value,
