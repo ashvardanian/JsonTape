@@ -656,10 +656,20 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         let text = core::str::from_utf8(token).map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })?;
 
         if is_float {
-            return text
+            let value = text
                 .parse::<f64>()
-                .map(Scalar::Float)
-                .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber });
+                .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })?;
+            // A finite, faithfully-represented value keeps its `f64` lane. One
+            // that overflowed to infinity, or a nonzero magnitude that
+            // underflowed to zero, would lose data — preserve its exact lexeme.
+            let underflowed_to_zero = value == 0.0 && token.iter().any(|&byte| (b'1'..=b'9').contains(&byte));
+            if value.is_finite() && !underflowed_to_zero {
+                return Ok(Scalar::Float(value));
+            }
+            return Ok(Scalar::Big(Span {
+                start,
+                len: self.position - start,
+            }));
         }
         if token[0] == b'-' {
             if let Ok(value) = text.parse::<i64>() {
@@ -2482,9 +2492,11 @@ fn serialize_big_number<S: serde::Serializer>(lexeme: &str, serializer: S) -> Re
         serializer.serialize_i128(value)
     } else if let Ok(value) = lexeme.parse::<u128>() {
         serializer.serialize_u128(value)
-    } else if let Ok(value) = lexeme.parse::<f64>() {
+    } else if let Some(value) = lexeme.parse::<f64>().ok().filter(|value| value.is_finite()) {
         serializer.serialize_f64(value)
     } else {
+        // Over/underflowed the `f64` range: emit the exact text as a string
+        // rather than a lossy `null`.
         serializer.serialize_str(lexeme)
     }
 }
@@ -3756,6 +3768,27 @@ mod tests {
         assert!(matches!(parse(b"42").unwrap(), Json::Unsigned(42)));
         assert!(matches!(parse(b"-42").unwrap(), Json::Integer(-42)));
     }
+
+    #[test]
+    fn exponent_overflow_is_preserved_not_lost() {
+        // A finite float keeps its lane.
+        assert!(matches!(parse(b"2.5e3").unwrap(), Json::Float(_)));
+
+        // A value that overflows or underflows f64 would become inf/0 and then
+        // serialize to a lossy "null"; instead it is kept as its exact lexeme.
+        for source in [b"1e400".as_slice(), b"-1e400", b"1e309", b"1e-400"] {
+            let document = parse(source).unwrap();
+            assert!(matches!(document, Json::BigNumber(_)), "{:?}", document);
+            let text = core::str::from_utf8(source).unwrap();
+            assert_eq!(document.as_number_str(), Some(text));
+            assert_eq!(document.to_string(), text);
+            // Round-trips through the parser without loss.
+            assert_eq!(parse(document.to_string().as_bytes()).unwrap(), document);
+        }
+
+        // A user-built non-finite float is still serialized as null (unchanged).
+        assert_eq!(Json::from(f64::INFINITY).to_string(), "null");
+    }
 }
 
 #[cfg(all(test, feature = "serde"))]
@@ -3863,5 +3896,12 @@ mod serde_tests {
             serde_json::to_string(&document).unwrap(),
             "123456789012345678901234567890"
         );
+    }
+
+    #[test]
+    fn overflowing_number_serializes_without_data_loss() {
+        // Wider than f64: emitted as a string, never a lossy null.
+        let document = parse(b"1e400").unwrap();
+        assert_eq!(serde_json::to_string(&document).unwrap(), r#""1e400""#);
     }
 }
