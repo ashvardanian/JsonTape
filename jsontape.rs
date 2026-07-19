@@ -29,6 +29,41 @@
 //! assert_eq!(document["peers"][0].as_u64(), Some(1));
 //! assert!(document["absent"].is_null());
 //! ```
+//!
+//! # Reading a view without threading `source`
+//!
+//! A [`JsonView`] resolves its spans against the `source` you parsed. Bind the
+//! two together with [`JsonView::bind`] to get a [`Resolved`] cursor that reads
+//! strings and navigates by key or index with no `source` argument:
+//!
+//! ```rust
+//! use jsontape::view;
+//!
+//! let source = br#"{ "a": { "b": [10, 20] } }"#;
+//! let document = view(source).unwrap();
+//! assert_eq!(document.bind(source).get("a").get("b").get(1).as_u64(), Some(20));
+//! ```
+//!
+//! # Beyond parsing
+//!
+//! * __Serialize__ any document back to compact or pretty JSON with `to_string` /
+//!   [`Json::to_string_pretty`], or [`JsonView::to_json_string`].
+//! * __Navigate__ with [`Json::get`], the `[]` operator, or an RFC 6901
+//!   [`Json::pointer`].
+//! * __Preserve numbers__ losslessly: an integer wider than 64 bits, or a value
+//!   outside the `f64` range, is kept as its exact text ([`Json::as_number_str`]).
+//! * __Configure__ the nesting limit and duplicate-key policy through
+//!   [`ParseOptions`] and the `*_with` parsers.
+//! * __Diagnose__ failures with a categorized [`JsonError`]; resolve a fault to a
+//!   line and column with [`JsonError::location`].
+//!
+//! # Cargo features
+//!
+//! * `std` (default) — enables the [`std::error::Error`] impl; without it the
+//!   crate is `no_std` (still requiring `alloc`).
+//! * `serde` — `serde::Serialize`/`serde::Deserialize` for the document types
+//!   plus `to_value`/`from_value` for converting to and from any serde type
+//!   without a text round trip.
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -56,7 +91,9 @@ use alloc::borrow::Cow;
 /// object keys are stored this way, undecoded, so parsing copies nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
+    /// Byte offset of the span's start within the source.
     pub start: usize,
+    /// Length of the span in bytes.
     pub len: usize,
 }
 
@@ -141,8 +178,11 @@ impl SyntaxKind {
 /// column counts bytes since the last newline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {
+    /// Byte offset of the fault within the source.
     pub offset: usize,
+    /// 1-based line number.
     pub line: usize,
+    /// 1-based column, counted in bytes since the last newline.
     pub column: usize,
 }
 
@@ -559,7 +599,7 @@ fn is_integral(value: f64) -> bool {
     // Clear the sign bit for the magnitude; `to_bits`/`from_bits` are `core`.
     let magnitude = f64::from_bits(value.to_bits() & 0x7fff_ffff_ffff_ffff);
     if magnitude >= 4_503_599_627_370_496.0 {
-        // At or above 2^52 every representable `f64` is already an integer.
+        // At or above `2^52` every representable `f64` is already an integer.
         true
     } else {
         // Otherwise the value fits in `i64`, so a round trip is exact.
@@ -1127,7 +1167,7 @@ impl<A: Allocator + Clone> KeyIndex<A> {
 /// An immutable JSON document that borrows its text from the parsed source.
 /// String values and object keys are stored as [`Span`]s, so nothing is copied;
 /// resolve them against the same `source` you parsed. Numbers keep their width,
-/// so large integers survive past the 2^53 float boundary.
+/// so large integers survive past the `2^53` float boundary.
 ///
 /// # Layout and allocators
 ///
@@ -1135,22 +1175,31 @@ impl<A: Allocator + Clone> KeyIndex<A> {
 /// global allocator scatters those nodes across the heap. Parse with
 /// [`view_in`] and a bump or slab allocator (any [`allocator_api2::alloc::Allocator`],
 /// for example a `bumpalo::Bump`) to pack the whole document into one contiguous
-/// region that frees in O(1) when the arena is dropped — the closest this design
+/// region that frees in `O(1)` when the arena is dropped — the closest this design
 /// gets to a flat tape. Note the caveat: the per-node `Vec`s still grow by
 /// doubling, so an arena keeps some slack and dead reallocation remnants; it is
 /// arena-flat and cheap to allocate and free, not a compact simdjson-style tape.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum JsonView<A: Allocator = Global> {
+    /// The `null` literal.
     Null,
+    /// A `true` or `false` literal.
     Boolean(bool),
+    /// A signed integer that fit `i64`.
     Integer(i64),
+    /// A non-negative integer that fit `u64`.
     Unsigned(u64),
+    /// A number with a fraction or exponent, held as `f64`.
     Float(f64),
+    /// A string, as its still-escaped span into the source.
     String(Span),
-    /// An integer wider than 64 bits, kept as its raw source span.
+    /// A number too wide for a 64-bit lane or the `f64` range, kept as its raw
+    /// source span so no precision is lost.
     BigNumber(Span),
+    /// An array of values.
     Array(Vec<JsonView<A>, A>),
+    /// An object, as `(key span, value)` pairs in source order.
     Object(Vec<(Span, JsonView<A>), A>),
 }
 
@@ -1223,6 +1272,10 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
+    /// The number as an `f64`, or `None`. A bare view cannot resolve a
+    /// [`BigNumber`](JsonView::BigNumber) without `source`, so that variant
+    /// returns `None` here; read it through [`bind`](JsonView::bind) or
+    /// [`as_number_str`](JsonView::as_number_str) instead.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             JsonView::Float(value) => Some(*value),
@@ -1240,7 +1293,7 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
-    /// Resolves a string value against its source, without decoding escapes.
+    /// The string value, resolved against `source` and still escaped, or `None`.
     pub fn as_str<'s>(&self, source: &'s [u8]) -> Option<&'s str> {
         match self {
             JsonView::String(span) => span.resolve(source),
@@ -1663,7 +1716,7 @@ impl<A: Allocator> Ord for JsonString<A> {
 
 /// An owned, mutable JSON document. Unlike [`JsonView`], strings are decoded at
 /// parse time, so [`Json::as_str`] needs no source and the tree can be
-/// edited freely. Numbers keep their width past the 2^53 float boundary.
+/// edited freely. Numbers keep their width past the `2^53` float boundary.
 ///
 /// The parser fills a `Json` with fallible allocation, but the build-from-code
 /// mutators — [`Json::push`], [`Json::insert`], and the `*_in` constructors —
@@ -1672,16 +1725,25 @@ impl<A: Allocator> Ord for JsonString<A> {
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum Json<A: Allocator = Global> {
+    /// The `null` literal, and the [`Default`].
     #[default]
     Null,
+    /// A `true` or `false` literal.
     Boolean(bool),
+    /// A signed integer that fit `i64`.
     Integer(i64),
+    /// A non-negative integer that fit `u64`.
     Unsigned(u64),
+    /// A number with a fraction or exponent, held as `f64`.
     Float(f64),
+    /// A string, decoded into the document's allocator.
     String(JsonString<A>),
-    /// An integer wider than 64 bits, kept as its exact decimal text.
+    /// A number too wide for a 64-bit lane or the `f64` range, kept as its exact
+    /// decimal text so no precision is lost.
     BigNumber(JsonString<A>),
+    /// An array of values.
     Array(Vec<Json<A>, A>),
+    /// An object, as `(key, value)` pairs in insertion order.
     Object(Vec<(JsonString<A>, Json<A>), A>),
 }
 
@@ -2515,6 +2577,11 @@ pub fn view_in_with<A: Allocator + Clone>(
 
 /// Parses `source` into an immutable [`JsonView`] allocated in `allocator`.
 /// Spans in the result are offsets into `source`, so keep `source` alive.
+///
+/// # Errors
+///
+/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
+/// if the document cannot be allocated.
 pub fn view_in<A: Allocator + Clone>(
     source: &[u8],
     allocator: A,
@@ -2528,6 +2595,11 @@ pub fn view_with(source: &[u8], options: &ParseOptions) -> Result<JsonView<Globa
 }
 
 /// Parses `source` into an immutable [`JsonView`] on the global heap.
+///
+/// # Errors
+///
+/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
+/// if the document cannot be allocated.
 pub fn view(source: &[u8]) -> Result<JsonView<Global>, JsonError> {
     view_in(source, Global)
 }
@@ -2547,7 +2619,7 @@ pub fn parse_in_with<A: Allocator + Clone>(
 ///
 /// The `allocator` is any [`allocator_api2::alloc::Allocator`], so the whole
 /// document can be packed into one region — a bump or slab arena — that frees in
-/// O(1) when dropped. Here a custom allocator simply tallies the bytes handed
+/// `O(1)` when dropped. Here a custom allocator simply tallies the bytes handed
 /// out; swap in a bump-arena allocator to get the packed, drop-once layout
 /// described on [`JsonView`].
 ///
@@ -2574,6 +2646,11 @@ pub fn parse_in_with<A: Allocator + Clone>(
 /// assert_eq!(document["nodes"][2].as_u64(), Some(3));
 /// assert!(counter.bytes.get() > 0);
 /// ```
+///
+/// # Errors
+///
+/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
+/// if the document cannot be allocated.
 pub fn parse_in<A: Allocator + Clone>(
     source: &[u8],
     allocator: A,
@@ -2587,6 +2664,11 @@ pub fn parse_with(source: &[u8], options: &ParseOptions) -> Result<Json<Global>,
 }
 
 /// Parses `source` into an owned, mutable [`Json`] on the global heap.
+///
+/// # Errors
+///
+/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
+/// if the document cannot be allocated.
 pub fn parse(source: &[u8]) -> Result<Json<Global>, JsonError> {
     parse_in(source, Global)
 }
@@ -2781,12 +2863,22 @@ mod serde_impls {
 
     /// Serializes any `T: Serialize` into an owned [`Json`] on the global heap,
     /// without going through a text representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever error `T`'s [`Serialize`](serde::Serialize) impl reports,
+    /// as a [`JsonError::Message`].
     pub fn to_value<T: serde::Serialize + ?Sized>(value: &T) -> Result<Json<Global>, JsonError> {
         value.serialize(JsonSerializer)
     }
 
     /// Deserializes any `T: Deserialize` directly from a borrowed [`Json`]. Strings
     /// are borrowed from the document, so `&str` fields need no copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`JsonError::Message`] if the document does not match `T`'s
+    /// shape.
     pub fn from_value<'de, T, A>(value: &'de Json<A>) -> Result<T, JsonError>
     where
         T: serde::Deserialize<'de>,
@@ -3305,7 +3397,7 @@ mod tests {
         assert_eq!(view(b"0").unwrap().as_u64(), Some(0));
         assert_eq!(view(b"-0").unwrap().as_i64(), Some(0));
         assert_eq!(view(b"-123").unwrap().as_i64(), Some(-123));
-        // Beyond the 2^53 float boundary but within u64.
+        // Beyond the `2^53` float boundary but within u64.
         assert_eq!(
             view(b"20000000000000001").unwrap().as_u64(),
             Some(20_000_000_000_000_001)
@@ -3614,7 +3706,7 @@ mod tests {
         assert_eq!(Json::from(2.5f64).to_string(), "2.5");
         assert_eq!(Json::from(f64::INFINITY).to_string(), "null");
         assert_eq!(Json::from(f64::NAN).to_string(), "null");
-        // Large integral floats (above 2^52) still get a `.0`, via bit-math.
+        // Large integral floats (above `2^52`) still get a `.0`, via bit-math.
         assert_eq!(Json::from(1e16).to_string(), "10000000000000000.0");
         assert_eq!(Json::from(-0.0f64).to_string(), "-0.0");
         assert_eq!(Json::from(0.5f64).to_string(), "0.5");
