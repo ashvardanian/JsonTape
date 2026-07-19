@@ -47,6 +47,11 @@ use allocator_api2::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
+#[cfg(feature = "std")]
+use std::borrow::Cow;
+#[cfg(not(feature = "std"))]
+use alloc::borrow::Cow;
+
 /// A span into the source bytes: a byte offset and a length. String values and
 /// object keys are stored this way, undecoded, so parsing copies nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +262,24 @@ fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// Decodes an RFC 6901 reference token, unescaping `~1` to `/` and `~0` to `~`.
+/// Allocates only when a `~` is present; the order matters so `~01` becomes `~1`.
+fn decode_pointer_token(raw: &str) -> Cow<'_, str> {
+    if raw.contains('~') {
+        Cow::Owned(raw.replace("~1", "/").replace("~0", "~"))
+    } else {
+        Cow::Borrowed(raw)
+    }
+}
+
+/// Parses an RFC 6901 array index: `0` or a digit run with no leading zero.
+fn pointer_array_index(token: &str) -> Option<usize> {
+    if token.len() > 1 && token.starts_with('0') {
+        return None;
+    }
+    token.parse::<usize>().ok()
 }
 
 /// Decodes the bytes of a JSON string span, yielding the resulting UTF-8 bytes
@@ -1570,24 +1593,10 @@ impl<A: Allocator> Json<A> {
         }
         let mut current = self;
         for raw_token in pointer.split('/').skip(1) {
-            // Only allocate to unescape when a `~` is actually present.
-            let decoded;
-            let token: &str = if raw_token.contains('~') {
-                decoded = raw_token.replace("~1", "/").replace("~0", "~");
-                &decoded
-            } else {
-                raw_token
-            };
+            let token = decode_pointer_token(raw_token);
             current = match current {
-                Json::Object(_) => current.get(token)?,
-                Json::Array(_) => {
-                    // RFC 6901: an array index is `0` or `[1-9][0-9]*`; reject
-                    // leading zeros, which `usize::from_str` would accept.
-                    if token.len() > 1 && token.starts_with('0') {
-                        return None;
-                    }
-                    current.get(token.parse::<usize>().ok()?)?
-                }
+                Json::Object(_) => current.get(token.as_ref())?,
+                Json::Array(_) => current.get(pointer_array_index(token.as_ref())?)?,
                 _ => return None,
             };
         }
@@ -2469,21 +2478,10 @@ impl<'s, A: Allocator> Resolved<'s, A> {
         }
         let mut current = self;
         for raw_token in pointer.split('/').skip(1) {
-            let decoded;
-            let token: &str = if raw_token.contains('~') {
-                decoded = raw_token.replace("~1", "/").replace("~0", "~");
-                &decoded
-            } else {
-                raw_token
-            };
+            let token = decode_pointer_token(raw_token);
             current = match current.node {
-                JsonView::Object(_) => current.try_get(token)?,
-                JsonView::Array(_) => {
-                    if token.len() > 1 && token.starts_with('0') {
-                        return None;
-                    }
-                    current.try_get(token.parse::<usize>().ok()?)?
-                }
+                JsonView::Object(_) => current.try_get(token.as_ref())?,
+                JsonView::Array(_) => current.try_get(pointer_array_index(token.as_ref())?)?,
                 _ => return None,
             };
         }
@@ -2591,723 +2589,692 @@ pub fn parse(source: &[u8]) -> Result<Json<Global>, JsonError> {
 }
 
 #[cfg(feature = "serde")]
-impl<A: Allocator> serde::Serialize for JsonString<A> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
+mod serde_impls {
+    use super::*;
 
-#[cfg(feature = "serde")]
-impl<A: Allocator> serde::Serialize for Json<A> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::{SerializeMap, SerializeSeq};
-        match self {
-            Json::Null => serializer.serialize_unit(),
-            Json::Boolean(value) => serializer.serialize_bool(*value),
-            Json::Integer(value) => serializer.serialize_i64(*value),
-            Json::Unsigned(value) => serializer.serialize_u64(*value),
-            Json::Float(value) => serializer.serialize_f64(*value),
-            Json::BigNumber(number) => serialize_big_number(number.as_str(), serializer),
-            Json::String(value) => serializer.serialize_str(value.as_str()),
-            Json::Array(items) => {
-                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    sequence.serialize_element(item)?;
+    impl<A: Allocator> serde::Serialize for JsonString<A> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(self.as_str())
+        }
+    }
+
+    impl<A: Allocator> serde::Serialize for Json<A> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::{SerializeMap, SerializeSeq};
+            match self {
+                Json::Null => serializer.serialize_unit(),
+                Json::Boolean(value) => serializer.serialize_bool(*value),
+                Json::Integer(value) => serializer.serialize_i64(*value),
+                Json::Unsigned(value) => serializer.serialize_u64(*value),
+                Json::Float(value) => serializer.serialize_f64(*value),
+                Json::BigNumber(number) => serialize_big_number(number.as_str(), serializer),
+                Json::String(value) => serializer.serialize_str(value.as_str()),
+                Json::Array(items) => {
+                    let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                    for item in items {
+                        sequence.serialize_element(item)?;
+                    }
+                    sequence.end()
                 }
-                sequence.end()
-            }
-            Json::Object(entries) => {
-                let mut map = serializer.serialize_map(Some(entries.len()))?;
-                for (key, value) in entries {
-                    map.serialize_entry(key.as_str(), value)?;
+                Json::Object(entries) => {
+                    let mut map = serializer.serialize_map(Some(entries.len()))?;
+                    for (key, value) in entries {
+                        map.serialize_entry(key.as_str(), value)?;
+                    }
+                    map.end()
                 }
-                map.end()
             }
         }
     }
-}
 
-/// Serializes a big-number lexeme, preferring an exact 128-bit integer and
-/// falling back to `f64` (then a string) for anything wider.
-#[cfg(feature = "serde")]
-fn serialize_big_number<S: serde::Serializer>(lexeme: &str, serializer: S) -> Result<S::Ok, S::Error> {
-    if let Ok(value) = lexeme.parse::<i128>() {
-        serializer.serialize_i128(value)
-    } else if let Ok(value) = lexeme.parse::<u128>() {
-        serializer.serialize_u128(value)
-    } else if let Some(value) = lexeme.parse::<f64>().ok().filter(|value| value.is_finite()) {
-        serializer.serialize_f64(value)
-    } else {
-        // Over/underflowed the `f64` range: emit the exact text as a string
-        // rather than a lossy `null`.
-        serializer.serialize_str(lexeme)
+    /// Serializes a big-number lexeme, preferring an exact 128-bit integer and
+    /// falling back to `f64` (then a string) for anything wider.
+    fn serialize_big_number<S: serde::Serializer>(lexeme: &str, serializer: S) -> Result<S::Ok, S::Error> {
+        if let Ok(value) = lexeme.parse::<i128>() {
+            serializer.serialize_i128(value)
+        } else if let Ok(value) = lexeme.parse::<u128>() {
+            serializer.serialize_u128(value)
+        } else if let Some(value) = lexeme.parse::<f64>().ok().filter(|value| value.is_finite()) {
+            serializer.serialize_f64(value)
+        } else {
+            // Over/underflowed the `f64` range: emit the exact text as a string
+            // rather than a lossy `null`.
+            serializer.serialize_str(lexeme)
+        }
     }
-}
 
-/// Decodes a still-escaped view span into a `String` for serde, mapping any
-/// fault to the serializer's error type.
-#[cfg(feature = "serde")]
-fn decode_for_serde<E: serde::ser::Error>(source: &[u8], span: Span) -> Result<String, E> {
-    let mut buffer: Vec<u8, Global> = Vec::new_in(Global);
-    unescape_into(source, span, &mut buffer).map_err(E::custom)?;
-    let decoded = core::str::from_utf8(&buffer).map_err(E::custom)?;
-    let mut owned = String::new();
-    owned.push_str(decoded);
-    Ok(owned)
-}
+    /// Decodes a still-escaped view span into a `String` for serde, mapping any
+    /// fault to the serializer's error type.
+    fn decode_for_serde<E: serde::ser::Error>(source: &[u8], span: Span) -> Result<String, E> {
+        let mut buffer: Vec<u8, Global> = Vec::new_in(Global);
+        unescape_into(source, span, &mut buffer).map_err(E::custom)?;
+        let decoded = core::str::from_utf8(&buffer).map_err(E::custom)?;
+        let mut owned = String::new();
+        owned.push_str(decoded);
+        Ok(owned)
+    }
 
-#[cfg(feature = "serde")]
-impl<'s, A: Allocator> serde::Serialize for Resolved<'s, A> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::{SerializeMap, SerializeSeq};
-        match self.node {
-            JsonView::Null => serializer.serialize_unit(),
-            JsonView::Boolean(value) => serializer.serialize_bool(*value),
-            JsonView::Integer(value) => serializer.serialize_i64(*value),
-            JsonView::Unsigned(value) => serializer.serialize_u64(*value),
-            JsonView::Float(value) => serializer.serialize_f64(*value),
-            JsonView::BigNumber(span) => {
-                serialize_big_number(span.resolve(self.source).unwrap_or("0"), serializer)
-            }
-            // The span is still escaped, so decode it before handing serde a
-            // plain string it would otherwise escape a second time.
-            JsonView::String(span) => {
-                serializer.serialize_str(&decode_for_serde::<S::Error>(self.source, *span)?)
-            }
-            JsonView::Array(items) => {
-                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    sequence.serialize_element(&Resolved {
-                        source: self.source,
-                        node: item,
-                    })?;
+    impl<'s, A: Allocator> serde::Serialize for Resolved<'s, A> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::{SerializeMap, SerializeSeq};
+            match self.node {
+                JsonView::Null => serializer.serialize_unit(),
+                JsonView::Boolean(value) => serializer.serialize_bool(*value),
+                JsonView::Integer(value) => serializer.serialize_i64(*value),
+                JsonView::Unsigned(value) => serializer.serialize_u64(*value),
+                JsonView::Float(value) => serializer.serialize_f64(*value),
+                JsonView::BigNumber(span) => {
+                    serialize_big_number(span.resolve(self.source).unwrap_or("0"), serializer)
                 }
-                sequence.end()
-            }
-            JsonView::Object(entries) => {
-                let mut map = serializer.serialize_map(Some(entries.len()))?;
-                for (key_span, value) in entries {
-                    let key = decode_for_serde::<S::Error>(self.source, *key_span)?;
-                    map.serialize_entry(
-                        &key,
-                        &Resolved {
+                // The span is still escaped, so decode it before handing serde a
+                // plain string it would otherwise escape a second time.
+                JsonView::String(span) => {
+                    serializer.serialize_str(&decode_for_serde::<S::Error>(self.source, *span)?)
+                }
+                JsonView::Array(items) => {
+                    let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                    for item in items {
+                        sequence.serialize_element(&Resolved {
                             source: self.source,
-                            node: value,
-                        },
-                    )?;
+                            node: item,
+                        })?;
+                    }
+                    sequence.end()
                 }
-                map.end()
+                JsonView::Object(entries) => {
+                    let mut map = serializer.serialize_map(Some(entries.len()))?;
+                    for (key_span, value) in entries {
+                        let key = decode_for_serde::<S::Error>(self.source, *key_span)?;
+                        map.serialize_entry(
+                            &key,
+                            &Resolved {
+                                source: self.source,
+                                node: value,
+                            },
+                        )?;
+                    }
+                    map.end()
+                }
             }
         }
     }
-}
 
-#[cfg(feature = "serde")]
-struct JsonVisitor;
+    struct JsonVisitor;
 
-#[cfg(feature = "serde")]
-impl<'de> serde::de::Visitor<'de> for JsonVisitor {
-    type Value = Json<Global>;
+    impl<'de> serde::de::Visitor<'de> for JsonVisitor {
+        type Value = Json<Global>;
 
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("any valid JSON value")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Json<Global>, E> {
-        Ok(Json::Boolean(value))
-    }
-    fn visit_i64<E>(self, value: i64) -> Result<Json<Global>, E> {
-        Ok(Json::Integer(value))
-    }
-    fn visit_u64<E>(self, value: u64) -> Result<Json<Global>, E> {
-        Ok(Json::Unsigned(value))
-    }
-    fn visit_f64<E>(self, value: f64) -> Result<Json<Global>, E> {
-        Ok(Json::Float(value))
-    }
-    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Json<Global>, E> {
-        Ok(Json::String(JsonString::from_str_in(value, Global)))
-    }
-    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Json<Global>, E> {
-        Ok(Json::String(JsonString::from_str_in(&value, Global)))
-    }
-    fn visit_none<E>(self) -> Result<Json<Global>, E> {
-        Ok(Json::Null)
-    }
-    fn visit_unit<E>(self) -> Result<Json<Global>, E> {
-        Ok(Json::Null)
-    }
-    fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Json<Global>, D::Error> {
-        deserializer.deserialize_any(self)
-    }
-    fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<Json<Global>, S::Error> {
-        let mut items: Vec<Json<Global>, Global> = Vec::new_in(Global);
-        while let Some(element) = seq.next_element::<Json<Global>>()? {
-            items.push(element);
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("any valid JSON value")
         }
-        Ok(Json::Array(items))
-    }
-    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Json<Global>, M::Error> {
-        let mut entries: Vec<(JsonString<Global>, Json<Global>), Global> = Vec::new_in(Global);
-        while let Some((key, value)) = map.next_entry::<String, Json<Global>>()? {
-            entries.push((JsonString::from_str_in(&key, Global), value));
+
+        fn visit_bool<E>(self, value: bool) -> Result<Json<Global>, E> {
+            Ok(Json::Boolean(value))
         }
-        Ok(Json::Object(entries))
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for Json<Global> {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(JsonVisitor)
-    }
-}
-
-#[cfg(feature = "serde")]
-fn serde_message<E: fmt::Display>(message: E) -> JsonError {
-    use core::fmt::Write;
-    let mut buffer = String::new();
-    let _ = write!(buffer, "{message}");
-    JsonError::Message(buffer)
-}
-
-#[cfg(feature = "serde")]
-impl serde::ser::Error for JsonError {
-    fn custom<T: fmt::Display>(message: T) -> Self {
-        serde_message(message)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl serde::de::Error for JsonError {
-    fn custom<T: fmt::Display>(message: T) -> Self {
-        serde_message(message)
-    }
-}
-
-/// Serializes any `T: Serialize` into an owned [`Json`] on the global heap,
-/// without going through a text representation.
-#[cfg(feature = "serde")]
-pub fn to_value<T: serde::Serialize + ?Sized>(value: &T) -> Result<Json<Global>, JsonError> {
-    value.serialize(JsonSerializer)
-}
-
-/// Deserializes any `T: Deserialize` directly from a borrowed [`Json`]. Strings
-/// are borrowed from the document, so `&str` fields need no copy.
-#[cfg(feature = "serde")]
-pub fn from_value<'de, T, A>(value: &'de Json<A>) -> Result<T, JsonError>
-where
-    T: serde::Deserialize<'de>,
-    A: Allocator,
-{
-    T::deserialize(value)
-}
-
-#[cfg(feature = "serde")]
-fn single_entry_object(key: &str, value: Json<Global>) -> Json<Global> {
-    let mut entries: Vec<(JsonString<Global>, Json<Global>), Global> = Vec::new_in(Global);
-    entries.push((JsonString::from_str_in(key, Global), value));
-    Json::Object(entries)
-}
-
-#[cfg(feature = "serde")]
-fn json_to_key(json: Json<Global>) -> Result<JsonString<Global>, JsonError> {
-    use core::fmt::Write;
-    match json {
-        Json::String(string) => Ok(string),
-        Json::Integer(value) => {
-            let mut buffer = String::new();
-            let _ = write!(buffer, "{value}");
-            Ok(JsonString::from_str_in(&buffer, Global))
+        fn visit_i64<E>(self, value: i64) -> Result<Json<Global>, E> {
+            Ok(Json::Integer(value))
         }
-        Json::Unsigned(value) => {
-            let mut buffer = String::new();
-            let _ = write!(buffer, "{value}");
-            Ok(JsonString::from_str_in(&buffer, Global))
+        fn visit_u64<E>(self, value: u64) -> Result<Json<Global>, E> {
+            Ok(Json::Unsigned(value))
         }
-        Json::Boolean(value) => Ok(JsonString::from_str_in(if value { "true" } else { "false" }, Global)),
-        _ => Err(serde_message("map key must be a string")),
+        fn visit_f64<E>(self, value: f64) -> Result<Json<Global>, E> {
+            Ok(Json::Float(value))
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Json<Global>, E> {
+            Ok(Json::String(JsonString::from_str_in(value, Global)))
+        }
+        fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Json<Global>, E> {
+            Ok(Json::String(JsonString::from_str_in(&value, Global)))
+        }
+        fn visit_none<E>(self) -> Result<Json<Global>, E> {
+            Ok(Json::Null)
+        }
+        fn visit_unit<E>(self) -> Result<Json<Global>, E> {
+            Ok(Json::Null)
+        }
+        fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Json<Global>, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+        fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<Json<Global>, S::Error> {
+            let mut items: Vec<Json<Global>, Global> = Vec::new_in(Global);
+            while let Some(element) = seq.next_element::<Json<Global>>()? {
+                items.push(element);
+            }
+            Ok(Json::Array(items))
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Json<Global>, M::Error> {
+            let mut entries: Vec<(JsonString<Global>, Json<Global>), Global> = Vec::new_in(Global);
+            while let Some((key, value)) = map.next_entry::<String, Json<Global>>()? {
+                entries.push((JsonString::from_str_in(&key, Global), value));
+            }
+            Ok(Json::Object(entries))
+        }
     }
-}
 
-#[cfg(feature = "serde")]
-struct JsonSerializer;
+    impl<'de> serde::Deserialize<'de> for Json<Global> {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(JsonVisitor)
+        }
+    }
 
-#[cfg(feature = "serde")]
-impl serde::Serializer for JsonSerializer {
-    type Ok = Json<Global>;
-    type Error = JsonError;
-    type SerializeSeq = SerializeVec;
-    type SerializeTuple = SerializeVec;
-    type SerializeTupleStruct = SerializeVec;
-    type SerializeTupleVariant = SerializeTupleVariant;
-    type SerializeMap = SerializeObject;
-    type SerializeStruct = SerializeObject;
-    type SerializeStructVariant = SerializeStructVariant;
-
-    fn serialize_bool(self, value: bool) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Boolean(value))
-    }
-    fn serialize_i8(self, value: i8) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Integer(value as i64))
-    }
-    fn serialize_i16(self, value: i16) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Integer(value as i64))
-    }
-    fn serialize_i32(self, value: i32) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Integer(value as i64))
-    }
-    fn serialize_i64(self, value: i64) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Integer(value))
-    }
-    fn serialize_u8(self, value: u8) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Unsigned(value as u64))
-    }
-    fn serialize_u16(self, value: u16) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Unsigned(value as u64))
-    }
-    fn serialize_u32(self, value: u32) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Unsigned(value as u64))
-    }
-    fn serialize_u64(self, value: u64) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Unsigned(value))
-    }
-    fn serialize_f32(self, value: f32) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Float(value as f64))
-    }
-    fn serialize_f64(self, value: f64) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Float(value))
-    }
-    fn serialize_char(self, value: char) -> Result<Json<Global>, JsonError> {
+    fn serde_message<E: fmt::Display>(message: E) -> JsonError {
+        use core::fmt::Write;
         let mut buffer = String::new();
-        buffer.push(value);
-        Ok(Json::String(JsonString::from_str_in(&buffer, Global)))
+        let _ = write!(buffer, "{message}");
+        JsonError::Message(buffer)
     }
-    fn serialize_str(self, value: &str) -> Result<Json<Global>, JsonError> {
-        Ok(Json::String(JsonString::from_str_in(value, Global)))
-    }
-    fn serialize_bytes(self, value: &[u8]) -> Result<Json<Global>, JsonError> {
-        let mut items: Vec<Json<Global>, Global> = Vec::new_in(Global);
-        for &byte in value {
-            items.push(Json::Unsigned(byte as u64));
+
+    impl serde::ser::Error for JsonError {
+        fn custom<T: fmt::Display>(message: T) -> Self {
+            serde_message(message)
         }
-        Ok(Json::Array(items))
     }
-    fn serialize_none(self) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Null)
+
+    impl serde::de::Error for JsonError {
+        fn custom<T: fmt::Display>(message: T) -> Self {
+            serde_message(message)
+        }
     }
-    fn serialize_some<T: serde::Serialize + ?Sized>(self, value: &T) -> Result<Json<Global>, JsonError> {
-        value.serialize(self)
+
+    /// Serializes any `T: Serialize` into an owned [`Json`] on the global heap,
+    /// without going through a text representation.
+    pub fn to_value<T: serde::Serialize + ?Sized>(value: &T) -> Result<Json<Global>, JsonError> {
+        value.serialize(JsonSerializer)
     }
-    fn serialize_unit(self) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Null)
+
+    /// Deserializes any `T: Deserialize` directly from a borrowed [`Json`]. Strings
+    /// are borrowed from the document, so `&str` fields need no copy.
+    pub fn from_value<'de, T, A>(value: &'de Json<A>) -> Result<T, JsonError>
+    where
+        T: serde::Deserialize<'de>,
+        A: Allocator,
+    {
+        T::deserialize(value)
     }
-    fn serialize_unit_struct(self, _name: &'static str) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Null)
+
+    fn single_entry_object(key: &str, value: Json<Global>) -> Json<Global> {
+        let mut entries: Vec<(JsonString<Global>, Json<Global>), Global> = Vec::new_in(Global);
+        entries.push((JsonString::from_str_in(key, Global), value));
+        Json::Object(entries)
     }
-    fn serialize_unit_variant(
-        self,
-        _name: &'static str,
-        _index: u32,
+
+    fn json_to_key(json: Json<Global>) -> Result<JsonString<Global>, JsonError> {
+        use core::fmt::Write;
+        match json {
+            Json::String(string) => Ok(string),
+            Json::Integer(value) => {
+                let mut buffer = String::new();
+                let _ = write!(buffer, "{value}");
+                Ok(JsonString::from_str_in(&buffer, Global))
+            }
+            Json::Unsigned(value) => {
+                let mut buffer = String::new();
+                let _ = write!(buffer, "{value}");
+                Ok(JsonString::from_str_in(&buffer, Global))
+            }
+            Json::Boolean(value) => Ok(JsonString::from_str_in(if value { "true" } else { "false" }, Global)),
+            _ => Err(serde_message("map key must be a string")),
+        }
+    }
+
+    struct JsonSerializer;
+
+    impl serde::Serializer for JsonSerializer {
+        type Ok = Json<Global>;
+        type Error = JsonError;
+        type SerializeSeq = SerializeVec;
+        type SerializeTuple = SerializeVec;
+        type SerializeTupleStruct = SerializeVec;
+        type SerializeTupleVariant = SerializeTupleVariant;
+        type SerializeMap = SerializeObject;
+        type SerializeStruct = SerializeObject;
+        type SerializeStructVariant = SerializeStructVariant;
+
+        fn serialize_bool(self, value: bool) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Boolean(value))
+        }
+        fn serialize_i8(self, value: i8) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Integer(value as i64))
+        }
+        fn serialize_i16(self, value: i16) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Integer(value as i64))
+        }
+        fn serialize_i32(self, value: i32) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Integer(value as i64))
+        }
+        fn serialize_i64(self, value: i64) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Integer(value))
+        }
+        fn serialize_u8(self, value: u8) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Unsigned(value as u64))
+        }
+        fn serialize_u16(self, value: u16) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Unsigned(value as u64))
+        }
+        fn serialize_u32(self, value: u32) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Unsigned(value as u64))
+        }
+        fn serialize_u64(self, value: u64) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Unsigned(value))
+        }
+        fn serialize_f32(self, value: f32) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Float(value as f64))
+        }
+        fn serialize_f64(self, value: f64) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Float(value))
+        }
+        fn serialize_char(self, value: char) -> Result<Json<Global>, JsonError> {
+            let mut buffer = String::new();
+            buffer.push(value);
+            Ok(Json::String(JsonString::from_str_in(&buffer, Global)))
+        }
+        fn serialize_str(self, value: &str) -> Result<Json<Global>, JsonError> {
+            Ok(Json::String(JsonString::from_str_in(value, Global)))
+        }
+        fn serialize_bytes(self, value: &[u8]) -> Result<Json<Global>, JsonError> {
+            let mut items: Vec<Json<Global>, Global> = Vec::new_in(Global);
+            for &byte in value {
+                items.push(Json::Unsigned(byte as u64));
+            }
+            Ok(Json::Array(items))
+        }
+        fn serialize_none(self) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Null)
+        }
+        fn serialize_some<T: serde::Serialize + ?Sized>(self, value: &T) -> Result<Json<Global>, JsonError> {
+            value.serialize(self)
+        }
+        fn serialize_unit(self) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Null)
+        }
+        fn serialize_unit_struct(self, _name: &'static str) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Null)
+        }
+        fn serialize_unit_variant(
+            self,
+            _name: &'static str,
+            _index: u32,
+            variant: &'static str,
+        ) -> Result<Json<Global>, JsonError> {
+            Ok(Json::String(JsonString::from_str_in(variant, Global)))
+        }
+        fn serialize_newtype_struct<T: serde::Serialize + ?Sized>(
+            self,
+            _name: &'static str,
+            value: &T,
+        ) -> Result<Json<Global>, JsonError> {
+            value.serialize(self)
+        }
+        fn serialize_newtype_variant<T: serde::Serialize + ?Sized>(
+            self,
+            _name: &'static str,
+            _index: u32,
+            variant: &'static str,
+            value: &T,
+        ) -> Result<Json<Global>, JsonError> {
+            Ok(single_entry_object(variant, value.serialize(JsonSerializer)?))
+        }
+        fn serialize_seq(self, _len: Option<usize>) -> Result<SerializeVec, JsonError> {
+            Ok(SerializeVec {
+                items: Vec::new_in(Global),
+            })
+        }
+        fn serialize_tuple(self, len: usize) -> Result<SerializeVec, JsonError> {
+            self.serialize_seq(Some(len))
+        }
+        fn serialize_tuple_struct(
+            self,
+            _name: &'static str,
+            len: usize,
+        ) -> Result<SerializeVec, JsonError> {
+            self.serialize_seq(Some(len))
+        }
+        fn serialize_tuple_variant(
+            self,
+            _name: &'static str,
+            _index: u32,
+            variant: &'static str,
+            _len: usize,
+        ) -> Result<SerializeTupleVariant, JsonError> {
+            Ok(SerializeTupleVariant {
+                variant,
+                items: Vec::new_in(Global),
+            })
+        }
+        fn serialize_map(self, _len: Option<usize>) -> Result<SerializeObject, JsonError> {
+            Ok(SerializeObject {
+                entries: Vec::new_in(Global),
+                pending_key: None,
+            })
+        }
+        fn serialize_struct(
+            self,
+            _name: &'static str,
+            len: usize,
+        ) -> Result<SerializeObject, JsonError> {
+            self.serialize_map(Some(len))
+        }
+        fn serialize_struct_variant(
+            self,
+            _name: &'static str,
+            _index: u32,
+            variant: &'static str,
+            _len: usize,
+        ) -> Result<SerializeStructVariant, JsonError> {
+            Ok(SerializeStructVariant {
+                variant,
+                entries: Vec::new_in(Global),
+            })
+        }
+    }
+
+    struct SerializeVec {
+        items: Vec<Json<Global>, Global>,
+    }
+
+    impl serde::ser::SerializeSeq for SerializeVec {
+        type Ok = Json<Global>;
+        type Error = JsonError;
+        fn serialize_element<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
+            self.items.push(value.serialize(JsonSerializer)?);
+            Ok(())
+        }
+        fn end(self) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Array(self.items))
+        }
+    }
+
+    impl serde::ser::SerializeTuple for SerializeVec {
+        type Ok = Json<Global>;
+        type Error = JsonError;
+        fn serialize_element<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
+            serde::ser::SerializeSeq::serialize_element(self, value)
+        }
+        fn end(self) -> Result<Json<Global>, JsonError> {
+            serde::ser::SerializeSeq::end(self)
+        }
+    }
+
+    impl serde::ser::SerializeTupleStruct for SerializeVec {
+        type Ok = Json<Global>;
+        type Error = JsonError;
+        fn serialize_field<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
+            serde::ser::SerializeSeq::serialize_element(self, value)
+        }
+        fn end(self) -> Result<Json<Global>, JsonError> {
+            serde::ser::SerializeSeq::end(self)
+        }
+    }
+
+    struct SerializeTupleVariant {
         variant: &'static str,
-    ) -> Result<Json<Global>, JsonError> {
-        Ok(Json::String(JsonString::from_str_in(variant, Global)))
+        items: Vec<Json<Global>, Global>,
     }
-    fn serialize_newtype_struct<T: serde::Serialize + ?Sized>(
-        self,
-        _name: &'static str,
-        value: &T,
-    ) -> Result<Json<Global>, JsonError> {
-        value.serialize(self)
+
+    impl serde::ser::SerializeTupleVariant for SerializeTupleVariant {
+        type Ok = Json<Global>;
+        type Error = JsonError;
+        fn serialize_field<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
+            self.items.push(value.serialize(JsonSerializer)?);
+            Ok(())
+        }
+        fn end(self) -> Result<Json<Global>, JsonError> {
+            Ok(single_entry_object(self.variant, Json::Array(self.items)))
+        }
     }
-    fn serialize_newtype_variant<T: serde::Serialize + ?Sized>(
-        self,
-        _name: &'static str,
-        _index: u32,
+
+    struct SerializeObject {
+        entries: Vec<(JsonString<Global>, Json<Global>), Global>,
+        pending_key: Option<JsonString<Global>>,
+    }
+
+    impl serde::ser::SerializeMap for SerializeObject {
+        type Ok = Json<Global>;
+        type Error = JsonError;
+        fn serialize_key<T: serde::Serialize + ?Sized>(&mut self, key: &T) -> Result<(), JsonError> {
+            self.pending_key = Some(json_to_key(key.serialize(JsonSerializer)?)?);
+            Ok(())
+        }
+        fn serialize_value<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
+            let key = self
+                .pending_key
+                .take()
+                .unwrap_or_else(|| JsonString::from_str_in("", Global));
+            self.entries.push((key, value.serialize(JsonSerializer)?));
+            Ok(())
+        }
+        fn end(self) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Object(self.entries))
+        }
+    }
+
+    impl serde::ser::SerializeStruct for SerializeObject {
+        type Ok = Json<Global>;
+        type Error = JsonError;
+        fn serialize_field<T: serde::Serialize + ?Sized>(
+            &mut self,
+            key: &'static str,
+            value: &T,
+        ) -> Result<(), JsonError> {
+            self.entries
+                .push((JsonString::from_str_in(key, Global), value.serialize(JsonSerializer)?));
+            Ok(())
+        }
+        fn end(self) -> Result<Json<Global>, JsonError> {
+            Ok(Json::Object(self.entries))
+        }
+    }
+
+    struct SerializeStructVariant {
         variant: &'static str,
-        value: &T,
-    ) -> Result<Json<Global>, JsonError> {
-        Ok(single_entry_object(variant, value.serialize(JsonSerializer)?))
+        entries: Vec<(JsonString<Global>, Json<Global>), Global>,
     }
-    fn serialize_seq(self, _len: Option<usize>) -> Result<SerializeVec, JsonError> {
-        Ok(SerializeVec {
-            items: Vec::new_in(Global),
-        })
-    }
-    fn serialize_tuple(self, len: usize) -> Result<SerializeVec, JsonError> {
-        self.serialize_seq(Some(len))
-    }
-    fn serialize_tuple_struct(
-        self,
-        _name: &'static str,
-        len: usize,
-    ) -> Result<SerializeVec, JsonError> {
-        self.serialize_seq(Some(len))
-    }
-    fn serialize_tuple_variant(
-        self,
-        _name: &'static str,
-        _index: u32,
-        variant: &'static str,
-        _len: usize,
-    ) -> Result<SerializeTupleVariant, JsonError> {
-        Ok(SerializeTupleVariant {
-            variant,
-            items: Vec::new_in(Global),
-        })
-    }
-    fn serialize_map(self, _len: Option<usize>) -> Result<SerializeObject, JsonError> {
-        Ok(SerializeObject {
-            entries: Vec::new_in(Global),
-            pending_key: None,
-        })
-    }
-    fn serialize_struct(
-        self,
-        _name: &'static str,
-        len: usize,
-    ) -> Result<SerializeObject, JsonError> {
-        self.serialize_map(Some(len))
-    }
-    fn serialize_struct_variant(
-        self,
-        _name: &'static str,
-        _index: u32,
-        variant: &'static str,
-        _len: usize,
-    ) -> Result<SerializeStructVariant, JsonError> {
-        Ok(SerializeStructVariant {
-            variant,
-            entries: Vec::new_in(Global),
-        })
-    }
-}
 
-#[cfg(feature = "serde")]
-struct SerializeVec {
-    items: Vec<Json<Global>, Global>,
-}
+    impl serde::ser::SerializeStructVariant for SerializeStructVariant {
+        type Ok = Json<Global>;
+        type Error = JsonError;
+        fn serialize_field<T: serde::Serialize + ?Sized>(
+            &mut self,
+            key: &'static str,
+            value: &T,
+        ) -> Result<(), JsonError> {
+            self.entries
+                .push((JsonString::from_str_in(key, Global), value.serialize(JsonSerializer)?));
+            Ok(())
+        }
+        fn end(self) -> Result<Json<Global>, JsonError> {
+            Ok(single_entry_object(self.variant, Json::Object(self.entries)))
+        }
+    }
 
-#[cfg(feature = "serde")]
-impl serde::ser::SerializeSeq for SerializeVec {
-    type Ok = Json<Global>;
-    type Error = JsonError;
-    fn serialize_element<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
-        self.items.push(value.serialize(JsonSerializer)?);
-        Ok(())
-    }
-    fn end(self) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Array(self.items))
-    }
-}
-
-#[cfg(feature = "serde")]
-impl serde::ser::SerializeTuple for SerializeVec {
-    type Ok = Json<Global>;
-    type Error = JsonError;
-    fn serialize_element<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
-        serde::ser::SerializeSeq::serialize_element(self, value)
-    }
-    fn end(self) -> Result<Json<Global>, JsonError> {
-        serde::ser::SerializeSeq::end(self)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl serde::ser::SerializeTupleStruct for SerializeVec {
-    type Ok = Json<Global>;
-    type Error = JsonError;
-    fn serialize_field<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
-        serde::ser::SerializeSeq::serialize_element(self, value)
-    }
-    fn end(self) -> Result<Json<Global>, JsonError> {
-        serde::ser::SerializeSeq::end(self)
-    }
-}
-
-#[cfg(feature = "serde")]
-struct SerializeTupleVariant {
-    variant: &'static str,
-    items: Vec<Json<Global>, Global>,
-}
-
-#[cfg(feature = "serde")]
-impl serde::ser::SerializeTupleVariant for SerializeTupleVariant {
-    type Ok = Json<Global>;
-    type Error = JsonError;
-    fn serialize_field<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
-        self.items.push(value.serialize(JsonSerializer)?);
-        Ok(())
-    }
-    fn end(self) -> Result<Json<Global>, JsonError> {
-        Ok(single_entry_object(self.variant, Json::Array(self.items)))
-    }
-}
-
-#[cfg(feature = "serde")]
-struct SerializeObject {
-    entries: Vec<(JsonString<Global>, Json<Global>), Global>,
-    pending_key: Option<JsonString<Global>>,
-}
-
-#[cfg(feature = "serde")]
-impl serde::ser::SerializeMap for SerializeObject {
-    type Ok = Json<Global>;
-    type Error = JsonError;
-    fn serialize_key<T: serde::Serialize + ?Sized>(&mut self, key: &T) -> Result<(), JsonError> {
-        self.pending_key = Some(json_to_key(key.serialize(JsonSerializer)?)?);
-        Ok(())
-    }
-    fn serialize_value<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), JsonError> {
-        let key = self
-            .pending_key
-            .take()
-            .unwrap_or_else(|| JsonString::from_str_in("", Global));
-        self.entries.push((key, value.serialize(JsonSerializer)?));
-        Ok(())
-    }
-    fn end(self) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Object(self.entries))
-    }
-}
-
-#[cfg(feature = "serde")]
-impl serde::ser::SerializeStruct for SerializeObject {
-    type Ok = Json<Global>;
-    type Error = JsonError;
-    fn serialize_field<T: serde::Serialize + ?Sized>(
-        &mut self,
-        key: &'static str,
-        value: &T,
-    ) -> Result<(), JsonError> {
-        self.entries
-            .push((JsonString::from_str_in(key, Global), value.serialize(JsonSerializer)?));
-        Ok(())
-    }
-    fn end(self) -> Result<Json<Global>, JsonError> {
-        Ok(Json::Object(self.entries))
-    }
-}
-
-#[cfg(feature = "serde")]
-struct SerializeStructVariant {
-    variant: &'static str,
-    entries: Vec<(JsonString<Global>, Json<Global>), Global>,
-}
-
-#[cfg(feature = "serde")]
-impl serde::ser::SerializeStructVariant for SerializeStructVariant {
-    type Ok = Json<Global>;
-    type Error = JsonError;
-    fn serialize_field<T: serde::Serialize + ?Sized>(
-        &mut self,
-        key: &'static str,
-        value: &T,
-    ) -> Result<(), JsonError> {
-        self.entries
-            .push((JsonString::from_str_in(key, Global), value.serialize(JsonSerializer)?));
-        Ok(())
-    }
-    fn end(self) -> Result<Json<Global>, JsonError> {
-        Ok(single_entry_object(self.variant, Json::Object(self.entries)))
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de, A: Allocator> serde::Deserializer<'de> for &'de Json<A> {
-    type Error = JsonError;
-    fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, JsonError> {
-        match self {
-            Json::Null => visitor.visit_unit(),
-            Json::Boolean(value) => visitor.visit_bool(*value),
-            Json::Integer(value) => visitor.visit_i64(*value),
-            Json::Unsigned(value) => visitor.visit_u64(*value),
-            Json::Float(value) => visitor.visit_f64(*value),
-            Json::BigNumber(number) => {
-                let lexeme = number.as_str();
-                if let Ok(value) = lexeme.parse::<i128>() {
-                    visitor.visit_i128(value)
-                } else if let Ok(value) = lexeme.parse::<u128>() {
-                    visitor.visit_u128(value)
-                } else {
-                    visitor.visit_borrowed_str(lexeme)
+    impl<'de, A: Allocator> serde::Deserializer<'de> for &'de Json<A> {
+        type Error = JsonError;
+        fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, JsonError> {
+            match self {
+                Json::Null => visitor.visit_unit(),
+                Json::Boolean(value) => visitor.visit_bool(*value),
+                Json::Integer(value) => visitor.visit_i64(*value),
+                Json::Unsigned(value) => visitor.visit_u64(*value),
+                Json::Float(value) => visitor.visit_f64(*value),
+                Json::BigNumber(number) => {
+                    let lexeme = number.as_str();
+                    if let Ok(value) = lexeme.parse::<i128>() {
+                        visitor.visit_i128(value)
+                    } else if let Ok(value) = lexeme.parse::<u128>() {
+                        visitor.visit_u128(value)
+                    } else {
+                        visitor.visit_borrowed_str(lexeme)
+                    }
                 }
+                Json::String(value) => visitor.visit_borrowed_str(value.as_str()),
+                Json::Array(items) => visitor.visit_seq(SeqAccess { iter: items.iter() }),
+                Json::Object(entries) => visitor.visit_map(MapAccess {
+                    iter: entries.iter(),
+                    value: None,
+                }),
             }
-            Json::String(value) => visitor.visit_borrowed_str(value.as_str()),
-            Json::Array(items) => visitor.visit_seq(SeqAccess { iter: items.iter() }),
-            Json::Object(entries) => visitor.visit_map(MapAccess {
-                iter: entries.iter(),
-                value: None,
-            }),
         }
-    }
-    fn deserialize_option<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, JsonError> {
-        match self {
-            Json::Null => visitor.visit_none(),
-            _ => visitor.visit_some(self),
-        }
-    }
-    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value, JsonError> {
-        visitor.visit_newtype_struct(self)
-    }
-    fn deserialize_enum<V: serde::de::Visitor<'de>>(
-        self,
-        _name: &'static str,
-        _variants: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, JsonError> {
-        visitor.visit_enum(EnumAccess { value: self })
-    }
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf unit unit_struct seq tuple tuple_struct map struct
-        identifier ignored_any
-    }
-}
-
-#[cfg(feature = "serde")]
-struct SeqAccess<'de, A: Allocator> {
-    iter: core::slice::Iter<'de, Json<A>>,
-}
-
-#[cfg(feature = "serde")]
-impl<'de, A: Allocator> serde::de::SeqAccess<'de> for SeqAccess<'de, A> {
-    type Error = JsonError;
-    fn next_element_seed<T: serde::de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: T,
-    ) -> Result<Option<T::Value>, JsonError> {
-        match self.iter.next() {
-            Some(value) => seed.deserialize(value).map(Some),
-            None => Ok(None),
-        }
-    }
-}
-
-#[cfg(feature = "serde")]
-struct MapAccess<'de, A: Allocator> {
-    iter: core::slice::Iter<'de, (JsonString<A>, Json<A>)>,
-    value: Option<&'de Json<A>>,
-}
-
-#[cfg(feature = "serde")]
-impl<'de, A: Allocator> serde::de::MapAccess<'de> for MapAccess<'de, A> {
-    type Error = JsonError;
-    fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: K,
-    ) -> Result<Option<K::Value>, JsonError> {
-        match self.iter.next() {
-            Some((key, value)) => {
-                self.value = Some(value);
-                seed.deserialize(KeyDeserializer { key: key.as_str() }).map(Some)
+        fn deserialize_option<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, JsonError> {
+            match self {
+                Json::Null => visitor.visit_none(),
+                _ => visitor.visit_some(self),
             }
-            None => Ok(None),
+        }
+        fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            visitor: V,
+        ) -> Result<V::Value, JsonError> {
+            visitor.visit_newtype_struct(self)
+        }
+        fn deserialize_enum<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            _variants: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, JsonError> {
+            visitor.visit_enum(EnumAccess { value: self })
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf unit unit_struct seq tuple tuple_struct map struct
+            identifier ignored_any
         }
     }
-    fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: V,
-    ) -> Result<V::Value, JsonError> {
-        let value = self
-            .value
-            .take()
-            .ok_or_else(|| serde_message("map value missing"))?;
-        seed.deserialize(value)
+
+    struct SeqAccess<'de, A: Allocator> {
+        iter: core::slice::Iter<'de, Json<A>>,
     }
-}
 
-#[cfg(feature = "serde")]
-struct KeyDeserializer<'de> {
-    key: &'de str,
-}
-
-#[cfg(feature = "serde")]
-impl<'de> serde::Deserializer<'de> for KeyDeserializer<'de> {
-    type Error = JsonError;
-    fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, JsonError> {
-        visitor.visit_borrowed_str(self.key)
-    }
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf option unit unit_struct newtype_struct seq tuple
-        tuple_struct map struct enum identifier ignored_any
-    }
-}
-
-#[cfg(feature = "serde")]
-struct EnumAccess<'de, A: Allocator> {
-    value: &'de Json<A>,
-}
-
-#[cfg(feature = "serde")]
-impl<'de, A: Allocator> serde::de::EnumAccess<'de> for EnumAccess<'de, A> {
-    type Error = JsonError;
-    type Variant = VariantAccess<'de, A>;
-    fn variant_seed<V: serde::de::DeserializeSeed<'de>>(
-        self,
-        seed: V,
-    ) -> Result<(V::Value, Self::Variant), JsonError> {
-        match self.value {
-            Json::String(name) => {
-                let variant = seed.deserialize(KeyDeserializer { key: name.as_str() })?;
-                Ok((variant, VariantAccess { value: None }))
+    impl<'de, A: Allocator> serde::de::SeqAccess<'de> for SeqAccess<'de, A> {
+        type Error = JsonError;
+        fn next_element_seed<T: serde::de::DeserializeSeed<'de>>(
+            &mut self,
+            seed: T,
+        ) -> Result<Option<T::Value>, JsonError> {
+            match self.iter.next() {
+                Some(value) => seed.deserialize(value).map(Some),
+                None => Ok(None),
             }
-            Json::Object(entries) if entries.len() == 1 => {
-                let (name, payload) = &entries[0];
-                let variant = seed.deserialize(KeyDeserializer { key: name.as_str() })?;
-                Ok((variant, VariantAccess { value: Some(payload) }))
+        }
+    }
+
+    struct MapAccess<'de, A: Allocator> {
+        iter: core::slice::Iter<'de, (JsonString<A>, Json<A>)>,
+        value: Option<&'de Json<A>>,
+    }
+
+    impl<'de, A: Allocator> serde::de::MapAccess<'de> for MapAccess<'de, A> {
+        type Error = JsonError;
+        fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+            &mut self,
+            seed: K,
+        ) -> Result<Option<K::Value>, JsonError> {
+            match self.iter.next() {
+                Some((key, value)) => {
+                    self.value = Some(value);
+                    seed.deserialize(KeyDeserializer { key: key.as_str() }).map(Some)
+                }
+                None => Ok(None),
             }
-            _ => Err(serde_message("invalid enum representation")),
+        }
+        fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+            &mut self,
+            seed: V,
+        ) -> Result<V::Value, JsonError> {
+            let value = self
+                .value
+                .take()
+                .ok_or_else(|| serde_message("map value missing"))?;
+            seed.deserialize(value)
+        }
+    }
+
+    struct KeyDeserializer<'de> {
+        key: &'de str,
+    }
+
+    impl<'de> serde::Deserializer<'de> for KeyDeserializer<'de> {
+        type Error = JsonError;
+        fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, JsonError> {
+            visitor.visit_borrowed_str(self.key)
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map struct enum identifier ignored_any
+        }
+    }
+
+    struct EnumAccess<'de, A: Allocator> {
+        value: &'de Json<A>,
+    }
+
+    impl<'de, A: Allocator> serde::de::EnumAccess<'de> for EnumAccess<'de, A> {
+        type Error = JsonError;
+        type Variant = VariantAccess<'de, A>;
+        fn variant_seed<V: serde::de::DeserializeSeed<'de>>(
+            self,
+            seed: V,
+        ) -> Result<(V::Value, Self::Variant), JsonError> {
+            match self.value {
+                Json::String(name) => {
+                    let variant = seed.deserialize(KeyDeserializer { key: name.as_str() })?;
+                    Ok((variant, VariantAccess { value: None }))
+                }
+                Json::Object(entries) if entries.len() == 1 => {
+                    let (name, payload) = &entries[0];
+                    let variant = seed.deserialize(KeyDeserializer { key: name.as_str() })?;
+                    Ok((variant, VariantAccess { value: Some(payload) }))
+                }
+                _ => Err(serde_message("invalid enum representation")),
+            }
+        }
+    }
+
+    struct VariantAccess<'de, A: Allocator> {
+        value: Option<&'de Json<A>>,
+    }
+
+    impl<'de, A: Allocator> serde::de::VariantAccess<'de> for VariantAccess<'de, A> {
+        type Error = JsonError;
+        fn unit_variant(self) -> Result<(), JsonError> {
+            Ok(())
+        }
+        fn newtype_variant_seed<T: serde::de::DeserializeSeed<'de>>(
+            self,
+            seed: T,
+        ) -> Result<T::Value, JsonError> {
+            match self.value {
+                Some(value) => seed.deserialize(value),
+                None => Err(serde_message("expected a newtype variant")),
+            }
+        }
+        fn tuple_variant<V: serde::de::Visitor<'de>>(
+            self,
+            _len: usize,
+            visitor: V,
+        ) -> Result<V::Value, JsonError> {
+            match self.value {
+                Some(value) => serde::Deserializer::deserialize_seq(value, visitor),
+                None => Err(serde_message("expected a tuple variant")),
+            }
+        }
+        fn struct_variant<V: serde::de::Visitor<'de>>(
+            self,
+            _fields: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, JsonError> {
+            match self.value {
+                Some(value) => serde::Deserializer::deserialize_map(value, visitor),
+                None => Err(serde_message("expected a struct variant")),
+            }
         }
     }
 }
 
 #[cfg(feature = "serde")]
-struct VariantAccess<'de, A: Allocator> {
-    value: Option<&'de Json<A>>,
-}
-
-#[cfg(feature = "serde")]
-impl<'de, A: Allocator> serde::de::VariantAccess<'de> for VariantAccess<'de, A> {
-    type Error = JsonError;
-    fn unit_variant(self) -> Result<(), JsonError> {
-        Ok(())
-    }
-    fn newtype_variant_seed<T: serde::de::DeserializeSeed<'de>>(
-        self,
-        seed: T,
-    ) -> Result<T::Value, JsonError> {
-        match self.value {
-            Some(value) => seed.deserialize(value),
-            None => Err(serde_message("expected a newtype variant")),
-        }
-    }
-    fn tuple_variant<V: serde::de::Visitor<'de>>(
-        self,
-        _len: usize,
-        visitor: V,
-    ) -> Result<V::Value, JsonError> {
-        match self.value {
-            Some(value) => serde::Deserializer::deserialize_seq(value, visitor),
-            None => Err(serde_message("expected a tuple variant")),
-        }
-    }
-    fn struct_variant<V: serde::de::Visitor<'de>>(
-        self,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, JsonError> {
-        match self.value {
-            Some(value) => serde::Deserializer::deserialize_map(value, visitor),
-            None => Err(serde_message("expected a struct variant")),
-        }
-    }
-}
+pub use serde_impls::{from_value, to_value};
 
 #[cfg(test)]
 mod tests {
