@@ -285,7 +285,9 @@ pub struct ParseOptions {
     pub allow_leading_decimal: bool,
     /// Accept a trailing decimal point, as in `5.`.
     pub allow_trailing_decimal: bool,
-    /// Accept `Infinity`, `-Infinity`, and `NaN` number literals.
+    /// Accept `Infinity`, `-Infinity`, and `NaN` number literals. They parse as
+    /// non-finite floats and serialize back to `null`, since strict JSON has no
+    /// literal for them — unlike big numbers, which round-trip losslessly.
     pub allow_infinity_nan: bool,
 }
 
@@ -654,6 +656,12 @@ pub enum Indent {
     Tabs,
 }
 
+/// Builds a spaces [`Indent`] from a `usize` count, clamping to `u16::MAX` rather
+/// than wrapping so an absurd width never silently becomes a tiny one.
+fn spaces_indent(count: usize) -> Indent {
+    Indent::Spaces(count.min(u16::MAX as usize) as u16)
+}
+
 /// Controls how a document is rendered back to JSON text.
 ///
 /// `indent` of `None` writes compact JSON with no insignificant whitespace;
@@ -664,6 +672,13 @@ pub enum Indent {
 /// [`FormatOptions::compact`], [`FormatOptions::pretty`], or
 /// [`FormatOptions::pretty_width`] and pass it to `to_string_with` /
 /// `write_json_with`.
+///
+/// The width budget is measured in Unicode scalar values, not rendered display
+/// columns, so a line of wide characters may occupy more visual width than
+/// `max_width`, and an [`Indent::Tabs`] level counts as one column. A line that
+/// ends in an inlined non-final element carries a trailing comma, so it can run
+/// one column past `max_width`. `max_width` has no effect when `indent` is
+/// `None`, since compact output has no lines to wrap.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct FormatOptions {
@@ -2960,9 +2975,9 @@ impl<A: Allocator> Json<A> {
     }
 
     /// Writes this value wrapping to `max_width` columns, starting at column
-    /// `col`; returns the column reached. A container that fits on the current
-    /// line is emitted inline with no per-child re-measurement, otherwise it is
-    /// expanded one element per line and each child is placed recursively.
+    /// `col`. A container that fits on the current line is emitted inline with no
+    /// per-child re-measurement, otherwise it is expanded one element per line and
+    /// each child is placed recursively at its own starting column.
     fn write_wrapped<W: fmt::Write>(
         &self,
         writer: &mut W,
@@ -2970,10 +2985,9 @@ impl<A: Allocator> Json<A> {
         max_width: usize,
         depth: usize,
         col: usize,
-    ) -> Result<usize, fmt::Error> {
-        if let Some(width) = self.inline_width(max_width.saturating_sub(col)) {
-            self.write_inline(writer)?;
-            return Ok(col + width);
+    ) -> fmt::Result {
+        if self.inline_width(max_width.saturating_sub(col)).is_some() {
+            return self.write_inline(writer);
         }
         match self {
             Json::Array(items) if !items.is_empty() => {
@@ -2987,8 +3001,7 @@ impl<A: Allocator> Json<A> {
                     item.write_wrapped(writer, indent, max_width, depth + 1, start)?;
                 }
                 write_indent(writer, indent, depth)?;
-                writer.write_char(']')?;
-                Ok(indent_cols(indent, depth) + 1)
+                writer.write_char(']')
             }
             Json::Object(entries) if !entries.is_empty() => {
                 writer.write_char('{')?;
@@ -3003,14 +3016,10 @@ impl<A: Allocator> Json<A> {
                     value.write_wrapped(writer, indent, max_width, depth + 1, start)?;
                 }
                 write_indent(writer, indent, depth)?;
-                writer.write_char('}')?;
-                Ok(indent_cols(indent, depth) + 1)
+                writer.write_char('}')
             }
             // A scalar or empty container wider than the budget still prints inline.
-            _ => {
-                self.write_inline(writer)?;
-                Ok(col + self.inline_width(usize::MAX).unwrap_or(0))
-            }
+            _ => self.write_inline(writer),
         }
     }
 
@@ -3021,7 +3030,7 @@ impl<A: Allocator> Json<A> {
 
     /// Writes this value as JSON indented by `indent` spaces per level.
     pub fn write_json_pretty<W: fmt::Write>(&self, writer: &mut W, indent: usize) -> fmt::Result {
-        let options = FormatOptions::compact().with_indent(Indent::Spaces(indent as u16));
+        let options = FormatOptions::compact().with_indent(spaces_indent(indent));
         self.write_layout(writer, options, 0)
     }
 
@@ -3033,7 +3042,7 @@ impl<A: Allocator> Json<A> {
     ) -> fmt::Result {
         match (options.indent, options.max_width) {
             (Some(indent), Some(max_width)) => {
-                self.write_wrapped(writer, indent, max_width, 0, 0).map(|_| ())
+                self.write_wrapped(writer, indent, max_width, 0, 0)
             }
             _ => self.write_layout(writer, options, 0),
         }
@@ -3287,10 +3296,9 @@ impl<A: Allocator> JsonView<A> {
         max_width: usize,
         depth: usize,
         col: usize,
-    ) -> Result<usize, fmt::Error> {
-        if let Some(width) = self.inline_width(source, max_width.saturating_sub(col)) {
-            self.write_inline(source, writer)?;
-            return Ok(col + width);
+    ) -> fmt::Result {
+        if self.inline_width(source, max_width.saturating_sub(col)).is_some() {
+            return self.write_inline(source, writer);
         }
         match self {
             JsonView::Array(items) if !items.is_empty() => {
@@ -3304,8 +3312,7 @@ impl<A: Allocator> JsonView<A> {
                     item.write_wrapped(source, writer, indent, max_width, depth + 1, start)?;
                 }
                 write_indent(writer, indent, depth)?;
-                writer.write_char(']')?;
-                Ok(indent_cols(indent, depth) + 1)
+                writer.write_char(']')
             }
             JsonView::Object(entries) if !entries.is_empty() => {
                 writer.write_char('{')?;
@@ -3320,13 +3327,9 @@ impl<A: Allocator> JsonView<A> {
                     value.write_wrapped(source, writer, indent, max_width, depth + 1, start)?;
                 }
                 write_indent(writer, indent, depth)?;
-                writer.write_char('}')?;
-                Ok(indent_cols(indent, depth) + 1)
+                writer.write_char('}')
             }
-            _ => {
-                self.write_inline(source, writer)?;
-                Ok(col + self.inline_width(source, usize::MAX).unwrap_or(0))
-            }
+            _ => self.write_inline(source, writer),
         }
     }
 
@@ -3342,7 +3345,7 @@ impl<A: Allocator> JsonView<A> {
         writer: &mut W,
         indent: usize,
     ) -> fmt::Result {
-        let options = FormatOptions::compact().with_indent(Indent::Spaces(indent as u16));
+        let options = FormatOptions::compact().with_indent(spaces_indent(indent));
         self.write_layout(source, writer, options, 0)
     }
 
@@ -3355,7 +3358,7 @@ impl<A: Allocator> JsonView<A> {
     ) -> fmt::Result {
         match (options.indent, options.max_width) {
             (Some(indent), Some(max_width)) => {
-                self.write_wrapped(source, writer, indent, max_width, 0, 0).map(|_| ())
+                self.write_wrapped(source, writer, indent, max_width, 0, 0)
             }
             _ => self.write_layout(source, writer, options, 0),
         }
@@ -4645,6 +4648,11 @@ mod tests {
         // Tabs indent one tab per level instead of spaces.
         let tabbed = document.to_string_with(FormatOptions::pretty().with_indent(Indent::Tabs));
         assert_eq!(tabbed, "{\n\t\"a\": [\n\t\t1,\n\t\t2\n\t],\n\t\"b\": {}\n}");
+
+        // A huge indent clamps to u16::MAX rather than wrapping to zero: the byte
+        // after the opening `{` and newline is still an indent space, not a quote.
+        let clamped = parse(br#"{"a":1}"#).unwrap().to_string_pretty(65_536);
+        assert_eq!(clamped.as_bytes().get(2), Some(&b' '));
     }
 
     #[test]
