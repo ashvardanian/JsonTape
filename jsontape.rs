@@ -334,7 +334,16 @@ impl ParseOptions {
     }
 
     /// The full set of lenient extensions this crate implements toward JSON5:
-    /// comments, trailing commas, unquoted keys, and the extended number forms.
+    /// comments, trailing commas, unquoted keys, single quotes, and the extended
+    /// number forms. Whatever lenient input goes in, strict JSON comes out.
+    ///
+    /// ```
+    /// use jsontape::{parse_with, ParseOptions};
+    ///
+    /// let document = parse_with(br#"{ name: 'tape', ratio: .5, mask: 0xFF }"#, &ParseOptions::json5()).unwrap();
+    /// assert_eq!(document["mask"].as_u64(), Some(255));
+    /// assert_eq!(document.to_string(), r#"{"name":"tape","ratio":0.5,"mask":255}"#);
+    /// ```
     pub const fn json5() -> Self {
         ParseOptions {
             allow_line_comments: true,
@@ -363,7 +372,21 @@ impl ParseOptions {
         self
     }
 
-    /// Enables comment preservation for the owned [`Json`] tree.
+    /// Enables comment preservation for the owned [`Json`] tree, so a JSON5
+    /// document round-trips its comments.
+    ///
+    /// ```
+    /// use jsontape::{parse_with, FormatOptions, ParseOptions};
+    ///
+    /// let source = b"{\n  // the service port\n  \"port\": 8080 // default\n}";
+    /// let options = ParseOptions::json5().preserve_comments(true);
+    /// let document = parse_with(source, &options).unwrap();
+    ///
+    /// assert_eq!(document.leading_comments(0).next().unwrap().text(), " the service port");
+    ///
+    /// let formatted = document.to_string_with(FormatOptions::pretty().with_comments(true));
+    /// assert_eq!(formatted.as_bytes(), source);
+    /// ```
     pub fn preserve_comments(mut self, preserve: bool) -> Self {
         self.preserve_comments = preserve;
         self
