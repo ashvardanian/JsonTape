@@ -47,6 +47,10 @@ jobs:
         run: cargo test
       - name: Test `no_std`
         run: cargo test --no-default-features
+      - name: Test `serde`
+        run: cargo test --features serde
+      - name: Test `serde` on `no_std`
+        run: cargo test --no-default-features --features serde
       - name: Test docs
         run: cargo test --doc
 
