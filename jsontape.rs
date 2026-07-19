@@ -289,6 +289,11 @@ pub struct ParseOptions {
     /// non-finite floats and serialize back to `null`, since strict JSON has no
     /// literal for them — unlike big numbers, which round-trip losslessly.
     pub allow_infinity_nan: bool,
+    /// Keep comments encountered while parsing, attaching them to the owned
+    /// [`Json`] tree for a round trip. Off by default and never set by a preset,
+    /// since it costs memory only when comments are present. Ignored by the
+    /// zero-copy [`JsonView`], which never carries comments.
+    pub preserve_comments: bool,
 }
 
 impl Default for ParseOptions {
@@ -313,6 +318,7 @@ impl ParseOptions {
             allow_leading_decimal: false,
             allow_trailing_decimal: false,
             allow_infinity_nan: false,
+            preserve_comments: false,
         }
     }
 
@@ -354,6 +360,12 @@ impl ParseOptions {
     /// Sets the duplicate-key policy.
     pub fn duplicate_keys(mut self, policy: DuplicateKeys) -> Self {
         self.duplicate_keys = policy;
+        self
+    }
+
+    /// Enables comment preservation for the owned [`Json`] tree.
+    pub fn preserve_comments(mut self, preserve: bool) -> Self {
+        self.preserve_comments = preserve;
         self
     }
 }
@@ -686,23 +698,26 @@ pub struct FormatOptions {
     pub indent: Option<Indent>,
     /// Column budget for width-based wrapping, or `None` to always expand.
     pub max_width: Option<usize>,
+    /// Emit comments preserved on the owned [`Json`] tree. Forces expansion and
+    /// is ignored by the zero-copy [`JsonView`], which carries no comments.
+    pub comments: bool,
 }
 
 impl FormatOptions {
     /// Compact output: no newlines and no spaces around `,` or `:`.
     pub const fn compact() -> Self {
-        Self { indent: None, max_width: None }
+        Self { indent: None, max_width: None, comments: false }
     }
 
     /// Indented output at two spaces per nesting level, always expanded.
     pub const fn pretty() -> Self {
-        Self { indent: Some(Indent::Spaces(2)), max_width: None }
+        Self { indent: Some(Indent::Spaces(2)), max_width: None, comments: false }
     }
 
     /// Two-space indentation that keeps a container on one line while it fits
     /// within `columns`, wrapping to one element per line only when it does not.
     pub const fn pretty_width(columns: usize) -> Self {
-        Self { indent: Some(Indent::Spaces(2)), max_width: Some(columns) }
+        Self { indent: Some(Indent::Spaces(2)), max_width: Some(columns), comments: false }
     }
 
     /// Sets the indentation, returning the updated options.
@@ -714,6 +729,14 @@ impl FormatOptions {
     /// Sets the wrapping column budget, returning the updated options.
     pub const fn with_max_width(mut self, columns: usize) -> Self {
         self.max_width = Some(columns);
+        self
+    }
+
+    /// Enables emitting preserved comments, returning the updated options. A
+    /// container carrying comments is always expanded, so this pairs with an
+    /// indent; with none set it defaults to two spaces.
+    pub const fn with_comments(mut self, comments: bool) -> Self {
+        self.comments = comments;
         self
     }
 }
@@ -876,6 +899,84 @@ fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) ->
     writer.write_char('"')
 }
 
+/// The comment list of a container body, empty when there is no trivia.
+fn trivia_comments<A: Allocator>(
+    trivia: &Option<Box<TriviaBlock<A>, A>>,
+) -> &[AnchoredComment<A>] {
+    match trivia {
+        Some(block) => &block.comments,
+        None => &[],
+    }
+}
+
+/// Writes one comment wrapped in its style's delimiters, its text verbatim.
+fn write_comment<W: fmt::Write, A: Allocator>(writer: &mut W, comment: &Comment<A>) -> fmt::Result {
+    let (open, close) = comment.style.delimiters();
+    writer.write_str(open)?;
+    writer.write_str(comment.text.as_str())?;
+    if !close.is_empty() {
+        writer.write_str(close)?;
+    }
+    Ok(())
+}
+
+/// Emits the leading comments anchored to `anchor`, each on its own indented
+/// line, and returns the advanced cursor.
+fn write_leading_comments<W: fmt::Write, A: Allocator>(
+    writer: &mut W,
+    comments: &[AnchoredComment<A>],
+    mut cursor: usize,
+    anchor: u32,
+    indent: Indent,
+    depth: usize,
+) -> Result<usize, fmt::Error> {
+    while cursor < comments.len()
+        && comments[cursor].anchor == anchor
+        && comments[cursor].slot == CommentSlot::Leading
+    {
+        write_indent(writer, indent, depth)?;
+        write_comment(writer, &comments[cursor].comment)?;
+        cursor += 1;
+    }
+    Ok(cursor)
+}
+
+/// Emits the trailing comments anchored to `anchor`, each after a space on the
+/// current line, and returns the advanced cursor.
+fn write_trailing_comments<W: fmt::Write, A: Allocator>(
+    writer: &mut W,
+    comments: &[AnchoredComment<A>],
+    mut cursor: usize,
+    anchor: u32,
+) -> Result<usize, fmt::Error> {
+    while cursor < comments.len()
+        && comments[cursor].anchor == anchor
+        && comments[cursor].slot == CommentSlot::Trailing
+    {
+        writer.write_char(' ')?;
+        write_comment(writer, &comments[cursor].comment)?;
+        cursor += 1;
+    }
+    Ok(cursor)
+}
+
+/// Emits any comments left after the last element — the tail before the closer —
+/// each on its own indented line, and returns the advanced cursor.
+fn write_tail_comments<W: fmt::Write, A: Allocator>(
+    writer: &mut W,
+    comments: &[AnchoredComment<A>],
+    mut cursor: usize,
+    indent: Indent,
+    depth: usize,
+) -> Result<usize, fmt::Error> {
+    while cursor < comments.len() {
+        write_indent(writer, indent, depth)?;
+        write_comment(writer, &comments[cursor].comment)?;
+        cursor += 1;
+    }
+    Ok(cursor)
+}
+
 /// Whether a finite `f64` has no fractional part, computed without the
 /// std-only `f64::fract`/`trunc` so it works under `no_std`.
 fn is_integral(value: f64) -> bool {
@@ -922,6 +1023,10 @@ trait DomBuilder<A: Allocator + Clone> {
     /// An object key.
     type Key;
 
+    /// Whether this builder keeps comment trivia. The parser only collects
+    /// comments when this is `true`, so the zero-copy view pays nothing.
+    const PRESERVES_TRIVIA: bool = false;
+
     fn null() -> Self::Value;
     fn boolean(value: bool) -> Self::Value;
     fn integer(value: i64) -> Self::Value;
@@ -930,8 +1035,11 @@ trait DomBuilder<A: Allocator + Clone> {
     fn string(source: &[u8], span: Span, allocator: &A) -> Result<Self::Value, JsonError>;
     fn big_number(source: &[u8], span: Span, allocator: &A) -> Result<Self::Value, JsonError>;
     fn key(source: &[u8], span: Span, allocator: &A) -> Result<Self::Key, JsonError>;
-    fn array(items: Vec<Self::Value, A>) -> Self::Value;
-    fn object(entries: Vec<(Self::Key, Self::Value), A>) -> Self::Value;
+    fn array(items: Vec<Self::Value, A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Self::Value;
+    fn object(
+        entries: Vec<(Self::Key, Self::Value), A>,
+        trivia: Option<Box<TriviaBlock<A>, A>>,
+    ) -> Self::Value;
     /// Orders two object keys by their decoded bytes, for duplicate handling.
     fn key_compare(source: &[u8], left: &Self::Key, right: &Self::Key) -> Ordering;
 }
@@ -942,6 +1050,11 @@ struct Parser<'a, A: Allocator + Clone, B: DomBuilder<A>> {
     depth: u32,
     allocator: A,
     options: ParseOptions,
+    // Comments scanned but not yet bound to a container slot, and whether a
+    // newline has been seen since the last value ended. Both are only touched
+    // when the builder preserves trivia and the option is on.
+    pending: Vec<PendingComment, A>,
+    broke: bool,
     _builder: PhantomData<B>,
 }
 
@@ -951,10 +1064,17 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             source,
             position: 0,
             depth: 0,
+            pending: Vec::new_in(allocator.clone()),
+            broke: false,
             allocator,
             options,
             _builder: PhantomData,
         }
+    }
+
+    /// Whether the parser should record comments into `pending` during scanning.
+    fn collecting_comments(&self) -> bool {
+        B::PRESERVES_TRIVIA && self.options.preserve_comments
     }
 
     fn fault<T>(&self) -> Result<T, JsonError> {
@@ -982,16 +1102,25 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     fn skip_trivia(&mut self) -> Result<(), JsonError> {
         loop {
             match self.peek() {
-                Some(b' ' | b'\t' | b'\n' | b'\r') => self.position += 1,
+                // A newline decides whether a following comment trails the last
+                // value or leads the next one.
+                Some(b'\n' | b'\r') => {
+                    self.broke = true;
+                    self.position += 1;
+                }
+                Some(b' ' | b'\t') => self.position += 1,
                 Some(b'/') => match self.peek_at(1) {
                     Some(b'/') if self.options.allow_line_comments => {
+                        let text_start = self.position + 2;
                         self.position += 2;
                         while !matches!(self.peek(), None | Some(b'\n' | b'\r')) {
                             self.position += 1;
                         }
+                        self.record_comment(text_start, self.position, CommentStyle::Line)?;
                     }
                     Some(b'*') if self.options.allow_block_comments => {
                         let comment_start = self.position;
+                        let text_start = self.position + 2;
                         self.position += 2;
                         loop {
                             match self.peek() {
@@ -1002,6 +1131,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                                     })
                                 }
                                 Some(b'*') if self.peek_at(1) == Some(b'/') => {
+                                    self.record_comment(text_start, self.position, CommentStyle::Block)?;
                                     self.position += 2;
                                     break;
                                 }
@@ -1014,6 +1144,72 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 _ => return Ok(()),
             }
         }
+    }
+
+    /// Records a scanned comment's text span into `pending`, if this parse is
+    /// collecting comments. Best-effort fallible allocation, like the rest of the
+    /// parse path.
+    fn record_comment(
+        &mut self,
+        start: usize,
+        end: usize,
+        style: CommentStyle,
+    ) -> Result<(), JsonError> {
+        if !self.collecting_comments() {
+            return Ok(());
+        }
+        self.pending
+            .try_reserve(1)
+            .map_err(|_| JsonError::Allocation)?;
+        self.pending.push(PendingComment {
+            span: Span { start, len: end - start },
+            style,
+            broke: self.broke,
+        });
+        Ok(())
+    }
+
+    /// Binds every pending comment to a slot of the container currently being
+    /// built, given the number of elements collected so far. A comment with a
+    /// newline before it, or one seen before any element, leads element `index`;
+    /// otherwise it trails element `index - 1`. `index == len` at the closer makes
+    /// the leftover comments the tail before the closing bracket.
+    fn drain_pending(
+        &mut self,
+        index: usize,
+        trivia: &mut Option<Box<TriviaBlock<A>, A>>,
+    ) -> Result<(), JsonError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = core::mem::replace(&mut self.pending, Vec::new_in(self.allocator.clone()));
+        let index_u32 = u32::try_from(index).unwrap_or(u32::MAX);
+        for item in pending {
+            let (anchor, slot) = if !item.broke && index > 0 {
+                (index_u32.saturating_sub(1), CommentSlot::Trailing)
+            } else {
+                (index_u32, CommentSlot::Leading)
+            };
+            let bytes = item.span.bytes(self.source).unwrap_or(&[]);
+            let comment = Comment {
+                style: item.style,
+                text: JsonString::from_bytes_in(bytes, self.allocator.clone()),
+            };
+            if trivia.is_none() {
+                let block = TriviaBlock { comments: Vec::new_in(self.allocator.clone()) };
+                *trivia = Some(
+                    Box::try_new_in(block, self.allocator.clone())
+                        .map_err(|_| JsonError::Allocation)?,
+                );
+            }
+            let block = trivia.as_mut().expect("just set");
+            block
+                .comments
+                .try_reserve(1)
+                .map_err(|_| JsonError::Allocation)?;
+            block.comments.push(AnchoredComment { anchor, slot, comment });
+        }
+        Ok(())
     }
 
     /// Parses a single top-level document, requiring that nothing but
@@ -1420,15 +1616,25 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             return self.fault_kind(SyntaxKind::DepthExceeded);
         }
         self.position += 1; // opening bracket
+        // Comments seen before the `[` belong to the parent container, which has
+        // already bound them; drop whatever leaks in at the top level.
+        self.pending.clear();
+        self.broke = false;
         let mut items: Vec<B::Value, A> = Vec::new_in(self.allocator.clone());
+        let mut trivia: Option<Box<TriviaBlock<A>, A>> = None;
         self.skip_trivia()?;
         if self.peek() == Some(b']') {
+            self.drain_pending(0, &mut trivia)?;
             self.position += 1;
             self.depth -= 1;
-            return Ok(B::array(items));
+            return Ok(B::array(items, trivia));
         }
         loop {
+            // Bind the comments leading this element before parsing it.
+            self.skip_trivia()?;
+            self.drain_pending(items.len(), &mut trivia)?;
             let value = self.value()?;
+            self.broke = false;
             self.try_push(&mut items, value)?;
             self.skip_trivia()?;
             match self.peek() {
@@ -1438,12 +1644,14 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     if self.options.allow_trailing_commas {
                         self.skip_trivia()?;
                         if self.peek() == Some(b']') {
+                            self.drain_pending(items.len(), &mut trivia)?;
                             self.position += 1;
                             break;
                         }
                     }
                 }
                 Some(b']') => {
+                    self.drain_pending(items.len(), &mut trivia)?;
                     self.position += 1;
                     break;
                 }
@@ -1452,7 +1660,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
         }
         self.depth -= 1;
-        Ok(B::array(items))
+        Ok(B::array(items, trivia))
     }
 
     /// Scans an unquoted JSON5 identifier key, returning its raw span. Version one
@@ -1481,15 +1689,21 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             return self.fault_kind(SyntaxKind::DepthExceeded);
         }
         self.position += 1; // opening brace
+        self.pending.clear();
+        self.broke = false;
         let mut entries: Vec<(B::Key, B::Value), A> = Vec::new_in(self.allocator.clone());
+        let mut trivia: Option<Box<TriviaBlock<A>, A>> = None;
         self.skip_trivia()?;
         if self.peek() == Some(b'}') {
+            self.drain_pending(0, &mut trivia)?;
             self.position += 1;
             self.depth -= 1;
-            return Ok(B::object(entries));
+            return Ok(B::object(entries, trivia));
         }
         loop {
+            // Bind the comments leading this entry before parsing its key.
             self.skip_trivia()?;
+            self.drain_pending(entries.len(), &mut trivia)?;
             let key_span = match self.peek() {
                 Some(b'"') => self.scan_string(b'"')?,
                 Some(b'\'') if self.options.allow_single_quotes => self.scan_string(b'\'')?,
@@ -1509,6 +1723,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
             self.position += 1;
             let value = self.value()?;
+            self.broke = false;
             self.try_push(&mut entries, (key, value))?;
             self.skip_trivia()?;
             match self.peek() {
@@ -1518,12 +1733,14 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     if self.options.allow_trailing_commas {
                         self.skip_trivia()?;
                         if self.peek() == Some(b'}') {
+                            self.drain_pending(entries.len(), &mut trivia)?;
                             self.position += 1;
                             break;
                         }
                     }
                 }
                 Some(b'}') => {
+                    self.drain_pending(entries.len(), &mut trivia)?;
                     self.position += 1;
                     break;
                 }
@@ -1533,7 +1750,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
         self.dedup_object(&mut entries)?;
         self.depth -= 1;
-        Ok(B::object(entries))
+        Ok(B::object(entries, trivia))
     }
 
     fn try_push<T>(&self, items: &mut Vec<T, A>, item: T) -> Result<(), JsonError> {
@@ -1745,10 +1962,13 @@ impl<A: Allocator + Clone> DomBuilder<A> for ViewBuilder {
     fn key(_source: &[u8], span: Span, _allocator: &A) -> Result<Span, JsonError> {
         Ok(span)
     }
-    fn array(items: Vec<JsonView<A>, A>) -> JsonView<A> {
+    fn array(items: Vec<JsonView<A>, A>, _trivia: Option<Box<TriviaBlock<A>, A>>) -> JsonView<A> {
         JsonView::Array(items)
     }
-    fn object(entries: Vec<(Span, JsonView<A>), A>) -> JsonView<A> {
+    fn object(
+        entries: Vec<(Span, JsonView<A>), A>,
+        _trivia: Option<Box<TriviaBlock<A>, A>>,
+    ) -> JsonView<A> {
         JsonView::Object(entries)
     }
     fn key_compare(source: &[u8], left: &Span, right: &Span) -> Ordering {
@@ -2132,6 +2352,15 @@ impl<A: Allocator> JsonString<A> {
         JsonString(bytes)
     }
 
+    /// Copies raw `bytes` verbatim, without unescaping. Used for comment text,
+    /// which is not a JSON-escaped string. Falls back to allocation abort like
+    /// the other build-from-code paths. Non-UTF-8 bytes leave `as_str` empty.
+    fn from_bytes_in(bytes: &[u8], allocator: A) -> Self {
+        let mut buffer = Vec::new_in(allocator);
+        buffer.extend_from_slice(bytes);
+        JsonString(buffer)
+    }
+
     /// The decoded string.
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.0).unwrap_or("")
@@ -2243,9 +2472,31 @@ pub struct Comment<A: Allocator = Global> {
     pub text: JsonString<A>,
 }
 
+impl CommentStyle {
+    /// The delimiters that wrap a comment of this style on the way out.
+    fn delimiters(self) -> (&'static str, &'static str) {
+        match self {
+            CommentStyle::Line => ("//", ""),
+            CommentStyle::Block => ("/*", "*/"),
+        }
+    }
+}
+
+impl<A: Allocator> Comment<A> {
+    /// The comment's style: line or block.
+    pub fn style(&self) -> CommentStyle {
+        self.style
+    }
+
+    /// The comment text, without its `//` or `/* */` delimiters, exactly as it
+    /// appeared in the source.
+    pub fn text(&self) -> &str {
+        self.text.as_str()
+    }
+}
+
 /// Where a preserved comment sits relative to the element it anchors to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // constructed once comment collection lands in the next commit
 enum CommentSlot {
     /// On its own line before the element.
     Leading,
@@ -2257,7 +2508,6 @@ enum CommentSlot {
 /// index it attaches to, or the element count for a comment after the last
 /// element and before the closing bracket.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // read once comment collection lands in the next commit
 struct AnchoredComment<A: Allocator> {
     anchor: u32,
     slot: CommentSlot,
@@ -2269,9 +2519,17 @@ struct AnchoredComment<A: Allocator> {
 /// paying an empty slot per element, and the source ordering lets serialization
 /// walk it in lockstep with the elements.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // read once comment collection lands in the next commit
 struct TriviaBlock<A: Allocator> {
     comments: Vec<AnchoredComment<A>, A>,
+}
+
+/// A comment recorded during scanning, before it is bound to a container slot.
+/// `broke` is whether a newline separated it from the previous value, which
+/// decides whether it trails that value or leads the next one.
+struct PendingComment {
+    span: Span,
+    style: CommentStyle,
+    broke: bool,
 }
 
 /// The backing storage for a [`Json::Array`]: its elements plus optional comment
@@ -2295,11 +2553,22 @@ impl<A: Allocator> ArrayBody<A> {
     fn new(items: Vec<Json<A>, A>) -> Self {
         Self { items, trivia: None }
     }
+
+    fn from_parts(items: Vec<Json<A>, A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Self {
+        Self { items, trivia }
+    }
 }
 
 impl<A: Allocator> ObjectBody<A> {
     fn new(entries: Vec<(JsonString<A>, Json<A>), A>) -> Self {
         Self { entries, trivia: None }
+    }
+
+    fn from_parts(
+        entries: Vec<(JsonString<A>, Json<A>), A>,
+        trivia: Option<Box<TriviaBlock<A>, A>>,
+    ) -> Self {
+        Self { entries, trivia }
     }
 }
 
@@ -2439,6 +2708,8 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
     type Value = Json<A>;
     type Key = JsonString<A>;
 
+    const PRESERVES_TRIVIA: bool = true;
+
     fn null() -> Json<A> {
         Json::Null
     }
@@ -2468,11 +2739,14 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
     fn key(source: &[u8], span: Span, allocator: &A) -> Result<JsonString<A>, JsonError> {
         JsonString::from_span(source, span, allocator.clone())
     }
-    fn array(items: Vec<Json<A>, A>) -> Json<A> {
-        Json::Array(items.into())
+    fn array(items: Vec<Json<A>, A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Json<A> {
+        Json::Array(ArrayBody::from_parts(items, trivia))
     }
-    fn object(entries: Vec<(JsonString<A>, Json<A>), A>) -> Json<A> {
-        Json::Object(entries.into())
+    fn object(
+        entries: Vec<(JsonString<A>, Json<A>), A>,
+        trivia: Option<Box<TriviaBlock<A>, A>>,
+    ) -> Json<A> {
+        Json::Object(ObjectBody::from_parts(entries, trivia))
     }
     fn key_compare(_source: &[u8], left: &JsonString<A>, right: &JsonString<A>) -> Ordering {
         left.as_bytes().cmp(right.as_bytes())
@@ -3023,6 +3297,69 @@ impl<A: Allocator> Json<A> {
         }
     }
 
+    /// Writes this value expanded, emitting any preserved comments. Containers
+    /// always expand one element per line; a lockstep cursor over the flat
+    /// comment list places leading comments on their own line before an element,
+    /// trailing comments on the same line after it, and the tail before the
+    /// closing bracket.
+    fn write_commented<W: fmt::Write>(
+        &self,
+        writer: &mut W,
+        indent: Indent,
+        depth: usize,
+    ) -> fmt::Result {
+        match self {
+            Json::Array(body) => {
+                let comments = trivia_comments(&body.trivia);
+                if body.items.is_empty() && comments.is_empty() {
+                    return writer.write_str("[]");
+                }
+                writer.write_char('[')?;
+                let mut cursor = 0;
+                for (index, item) in body.items.iter().enumerate() {
+                    let anchor = index as u32;
+                    cursor = write_leading_comments(writer, comments, cursor, anchor, indent, depth + 1)?;
+                    write_indent(writer, indent, depth + 1)?;
+                    item.write_commented(writer, indent, depth + 1)?;
+                    if index + 1 < body.items.len() {
+                        writer.write_char(',')?;
+                    }
+                    cursor = write_trailing_comments(writer, comments, cursor, anchor)?;
+                }
+                cursor = write_tail_comments(writer, comments, cursor, indent, depth + 1)?;
+                let _ = cursor;
+                write_indent(writer, indent, depth)?;
+                writer.write_char(']')
+            }
+            Json::Object(body) => {
+                let comments = trivia_comments(&body.trivia);
+                if body.entries.is_empty() && comments.is_empty() {
+                    return writer.write_str("{}");
+                }
+                writer.write_char('{')?;
+                let mut cursor = 0;
+                for (index, (key, value)) in body.entries.iter().enumerate() {
+                    let anchor = index as u32;
+                    cursor = write_leading_comments(writer, comments, cursor, anchor, indent, depth + 1)?;
+                    write_indent(writer, indent, depth + 1)?;
+                    write_escaped_str(writer, key.as_str())?;
+                    writer.write_str(": ")?;
+                    value.write_commented(writer, indent, depth + 1)?;
+                    if index + 1 < body.entries.len() {
+                        writer.write_char(',')?;
+                    }
+                    cursor = write_trailing_comments(writer, comments, cursor, anchor)?;
+                }
+                cursor = write_tail_comments(writer, comments, cursor, indent, depth + 1)?;
+                let _ = cursor;
+                write_indent(writer, indent, depth)?;
+                writer.write_char('}')
+            }
+            // Scalars carry no comments and print on one line.
+            _ => self.write_inline(writer),
+        }
+    }
+
     /// Writes this value as compact JSON.
     pub fn write_json<W: fmt::Write>(&self, writer: &mut W) -> fmt::Result {
         self.write_layout(writer, FormatOptions::compact(), 0)
@@ -3040,6 +3377,10 @@ impl<A: Allocator> Json<A> {
         writer: &mut W,
         options: FormatOptions,
     ) -> fmt::Result {
+        if options.comments {
+            let indent = options.indent.unwrap_or(Indent::Spaces(2));
+            return self.write_commented(writer, indent, 0);
+        }
         match (options.indent, options.max_width) {
             (Some(indent), Some(max_width)) => {
                 self.write_wrapped(writer, indent, max_width, 0, 0)
@@ -5267,6 +5608,65 @@ mod tests {
         source.push_str("x'");
         let document = parse_with(source.as_bytes(), &ParseOptions::json5()).unwrap();
         assert_eq!(document.as_str(), Some("x"));
+    }
+
+    #[test]
+    fn comments_preserved_and_placed() {
+        let options = ParseOptions::json5().preserve_comments(true);
+        let commented = FormatOptions::pretty().with_comments(true);
+
+        // A leading block comment lands on its own line before the entry.
+        let document = parse_with(br#"{ /* c */ "a": 1 }"#, &options).unwrap();
+        assert_eq!(
+            document.to_string_with(commented),
+            "{\n  /* c */\n  \"a\": 1\n}",
+        );
+
+        // A line comment after a comma trails the value on the same line.
+        let document = parse_with(b"{ \"a\": 1, // note\n\"b\": 2 }", &options).unwrap();
+        assert_eq!(
+            document.to_string_with(commented),
+            "{\n  \"a\": 1, // note\n  \"b\": 2\n}",
+        );
+
+        // Leading, trailing, and tail comments in an array.
+        let document = parse_with(b"[\n // lead\n 1, // trail\n 2\n // tail\n]", &options).unwrap();
+        assert_eq!(
+            document.to_string_with(commented),
+            "[\n  // lead\n  1, // trail\n  2\n  // tail\n]",
+        );
+    }
+
+    #[test]
+    fn comments_do_not_affect_plain_output() {
+        let options = ParseOptions::json5().preserve_comments(true);
+        let document = parse_with(b"{ /* c */ \"a\": [1, /* x */ 2] }", &options).unwrap();
+
+        // Comment-free serialization is exactly the same as for an uncommented
+        // parse, and equal values compare equal regardless of trivia.
+        let plain = parse(br#"{"a":[1,2]}"#).unwrap();
+        assert_eq!(document.to_string(), r#"{"a":[1,2]}"#);
+        assert_eq!(document.to_string_pretty(2), plain.to_string_pretty(2));
+        assert_eq!(document, plain);
+
+        // Without preserve_comments the comments are simply discarded.
+        let discarded = parse_with(b"{ /* c */ \"a\": 1 }", &ParseOptions::json5()).unwrap();
+        assert_eq!(
+            discarded.to_string_with(FormatOptions::pretty().with_comments(true)),
+            "{\n  \"a\": 1\n}",
+        );
+    }
+
+    #[test]
+    fn comments_survive_appends() {
+        let options = ParseOptions::json5().preserve_comments(true);
+        let mut document = parse_with(b"[\n 1 // one\n]", &options).unwrap();
+        // Appending keeps existing anchors valid: the comment still trails 1.
+        document.push(Json::from(2u64));
+        assert_eq!(
+            document.to_string_with(FormatOptions::pretty().with_comments(true)),
+            "[\n  1, // one\n  2\n]",
+        );
     }
 }
 
