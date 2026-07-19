@@ -73,18 +73,97 @@ impl Span {
 
 /// Why parsing failed. No code path panics on bad input.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JsonError {
-    /// Malformed JSON, with the byte offset of the fault.
-    Syntax { offset: usize },
+    /// Malformed JSON, with the byte offset of the fault and what went wrong.
+    Syntax { offset: usize, kind: SyntaxKind },
     /// A fallible allocation failed.
     Allocation,
+}
+
+/// What kind of syntax fault occurred. Non-exhaustive so new categories can be
+/// added without a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SyntaxKind {
+    /// A byte appeared where a different one was required.
+    UnexpectedByte,
+    /// The input ended while a value or container was still open.
+    UnexpectedEnd,
+    /// Content followed the top-level value.
+    TrailingData,
+    /// A number did not match the RFC 8259 grammar.
+    InvalidNumber,
+    /// A string span was out of bounds or otherwise not a valid string body.
+    InvalidString,
+    /// A string escape sequence was malformed.
+    InvalidEscape,
+    /// A `\u` escape formed an unpaired UTF-16 surrogate.
+    LoneSurrogate,
+    /// A string body was not valid UTF-8.
+    InvalidUtf8,
+    /// An unescaped control character appeared inside a string.
+    ControlCharacter,
+    /// Nesting exceeded the configured depth limit.
+    DepthExceeded,
+}
+
+impl SyntaxKind {
+    /// A short, lowercase description without trailing punctuation.
+    fn message(self) -> &'static str {
+        match self {
+            SyntaxKind::UnexpectedByte => "unexpected byte",
+            SyntaxKind::UnexpectedEnd => "unexpected end of input",
+            SyntaxKind::TrailingData => "trailing data after value",
+            SyntaxKind::InvalidNumber => "invalid number",
+            SyntaxKind::InvalidString => "invalid string",
+            SyntaxKind::InvalidEscape => "invalid string escape",
+            SyntaxKind::LoneSurrogate => "unpaired surrogate",
+            SyntaxKind::InvalidUtf8 => "invalid UTF-8",
+            SyntaxKind::ControlCharacter => "unescaped control character",
+            SyntaxKind::DepthExceeded => "nesting too deep",
+        }
+    }
+}
+
+/// A resolved source position: byte offset plus 1-based line and column. The
+/// column counts bytes since the last newline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Location {
+    pub offset: usize,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl JsonError {
+    /// Resolves a [`Syntax`](JsonError::Syntax) fault to a line and column by
+    /// scanning `source` up to the fault offset. Returns `None` for
+    /// [`Allocation`](JsonError::Allocation).
+    pub fn location(&self, source: &[u8]) -> Option<Location> {
+        let offset = match self {
+            JsonError::Syntax { offset, .. } => *offset,
+            _ => return None,
+        };
+        let end = offset.min(source.len());
+        let mut line = 1;
+        let mut column = 1;
+        for &byte in &source[..end] {
+            if byte == b'\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        Some(Location { offset, line, column })
+    }
 }
 
 impl fmt::Display for JsonError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            JsonError::Syntax { offset } => {
-                write!(formatter, "syntax error at byte offset {offset}")
+            JsonError::Syntax { offset, kind } => {
+                write!(formatter, "{} at byte offset {offset}", kind.message())
             }
             JsonError::Allocation => write!(formatter, "memory allocation failed"),
         }
@@ -244,16 +323,20 @@ pub fn unescape_into<A: Allocator>(
     span: Span,
     output: &mut Vec<u8, A>,
 ) -> Result<(), JsonError> {
-    let content = span
-        .bytes(source)
-        .ok_or(JsonError::Syntax { offset: span.start })?;
+    let content = span.bytes(source).ok_or(JsonError::Syntax {
+        offset: span.start,
+        kind: SyntaxKind::InvalidString,
+    })?;
     let mut decoder = UnescapeBytes::new(content);
     for byte in decoder.by_ref() {
         output.try_reserve(1).map_err(|_| JsonError::Allocation)?;
         output.push(byte);
     }
     if decoder.malformed {
-        return Err(JsonError::Syntax { offset: span.start });
+        return Err(JsonError::Syntax {
+            offset: span.start,
+            kind: SyntaxKind::InvalidEscape,
+        });
     }
     Ok(())
 }
@@ -363,8 +446,13 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     }
 
     fn fault<T>(&self) -> Result<T, JsonError> {
+        self.fault_kind(SyntaxKind::UnexpectedByte)
+    }
+
+    fn fault_kind<T>(&self, kind: SyntaxKind) -> Result<T, JsonError> {
         Err(JsonError::Syntax {
             offset: self.position,
+            kind,
         })
     }
 
@@ -388,7 +476,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         let value = self.value()?;
         self.skip_whitespace();
         if self.position != self.source.len() {
-            return self.fault();
+            return self.fault_kind(SyntaxKind::TrailingData);
         }
         Ok(value)
     }
@@ -406,6 +494,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             Some(b'f') => self.expect_literal(b"false").map(|_| B::boolean(false)),
             Some(b'n') => self.expect_literal(b"null").map(|_| B::null()),
             Some(byte) if byte == b'-' || byte.is_ascii_digit() => self.number(),
+            None => self.fault_kind(SyntaxKind::UnexpectedEnd),
             _ => self.fault(),
         }
     }
@@ -448,7 +537,12 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     self.position += 1;
                 }
             }
-            _ => return Err(JsonError::Syntax { offset: start }),
+            _ => {
+                return Err(JsonError::Syntax {
+                    offset: start,
+                    kind: SyntaxKind::InvalidNumber,
+                })
+            }
         }
 
         let mut is_float = false;
@@ -460,6 +554,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             if !matches!(self.peek(), Some(b'0'..=b'9')) {
                 return Err(JsonError::Syntax {
                     offset: self.position,
+                    kind: SyntaxKind::InvalidNumber,
                 });
             }
             while matches!(self.peek(), Some(b'0'..=b'9')) {
@@ -477,6 +572,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             if !matches!(self.peek(), Some(b'0'..=b'9')) {
                 return Err(JsonError::Syntax {
                     offset: self.position,
+                    kind: SyntaxKind::InvalidNumber,
                 });
             }
             while matches!(self.peek(), Some(b'0'..=b'9')) {
@@ -486,13 +582,13 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 
         let token = &self.source[start..self.position];
         // The token is all ASCII, so this never fails.
-        let text = core::str::from_utf8(token).map_err(|_| JsonError::Syntax { offset: start })?;
+        let text = core::str::from_utf8(token).map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })?;
 
         if is_float {
             return text
                 .parse::<f64>()
                 .map(Scalar::Float)
-                .map_err(|_| JsonError::Syntax { offset: start });
+                .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber });
         }
         if token[0] == b'-' {
             if let Ok(value) = text.parse::<i64>() {
@@ -504,7 +600,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         // Integer too wide for its 64-bit lane; fall back to float.
         text.parse::<f64>()
             .map(Scalar::Float)
-            .map_err(|_| JsonError::Syntax { offset: start })
+            .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })
     }
 
     /// Scans a string, validating escapes and rejecting raw control characters,
@@ -514,14 +610,17 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         let start = self.position;
         loop {
             match self.peek() {
-                None => return self.fault(),
+                None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
                 Some(b'"') => {
                     // RFC 8259 §8.1: the text must be valid UTF-8. Escape bytes
                     // are all ASCII, so validating the whole body catches every
                     // ill-formed literal byte in one pass.
                     let content = &self.source[start..self.position];
                     if let Err(error) = core::str::from_utf8(content) {
-                        return Err(JsonError::Syntax { offset: start + error.valid_up_to() });
+                        return Err(JsonError::Syntax {
+                            offset: start + error.valid_up_to(),
+                            kind: SyntaxKind::InvalidUtf8,
+                        });
                     }
                     let span = Span {
                         start,
@@ -535,7 +634,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     self.scan_escape()?;
                 }
                 // RFC 8259 forbids unescaped control characters in strings.
-                Some(byte) if byte < 0x20 => return self.fault(),
+                Some(byte) if byte < 0x20 => return self.fault_kind(SyntaxKind::ControlCharacter),
                 Some(_) => self.position += 1,
             }
         }
@@ -558,19 +657,19 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         if (0xDC00..=0xDFFF).contains(&low) {
                             Ok(())
                         } else {
-                            self.fault()
+                            self.fault_kind(SyntaxKind::LoneSurrogate)
                         }
                     } else {
-                        self.fault()
+                        self.fault_kind(SyntaxKind::LoneSurrogate)
                     }
                 } else if (0xDC00..=0xDFFF).contains(&high) {
                     // A low surrogate without a preceding high surrogate.
-                    self.fault()
+                    self.fault_kind(SyntaxKind::LoneSurrogate)
                 } else {
                     Ok(())
                 }
             }
-            _ => self.fault(),
+            _ => self.fault_kind(SyntaxKind::InvalidEscape),
         }
     }
 
@@ -585,7 +684,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     value = value * 16 + digit;
                     self.position += 1;
                 }
-                None => return self.fault(),
+                None => return self.fault_kind(SyntaxKind::InvalidEscape),
             }
         }
         Ok(value)
@@ -594,7 +693,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     fn array(&mut self) -> Result<B::Value, JsonError> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            return self.fault();
+            return self.fault_kind(SyntaxKind::DepthExceeded);
         }
         self.position += 1; // opening bracket
         let mut items: Vec<B::Value, A> = Vec::new_in(self.allocator.clone());
@@ -614,6 +713,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     self.position += 1;
                     break;
                 }
+                None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
                 _ => return self.fault(),
             }
         }
@@ -624,7 +724,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     fn object(&mut self) -> Result<B::Value, JsonError> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            return self.fault();
+            return self.fault_kind(SyntaxKind::DepthExceeded);
         }
         self.position += 1; // opening brace
         let mut entries: Vec<(B::Key, B::Value), A> = Vec::new_in(self.allocator.clone());
@@ -655,6 +755,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     self.position += 1;
                     break;
                 }
+                None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
                 _ => return self.fault(),
             }
         }
@@ -685,6 +786,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 /// doubling, so an arena keeps some slack and dead reallocation remnants; it is
 /// arena-flat and cheap to allocate and free, not a compact simdjson-style tape.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum JsonView<A: Allocator = Global> {
     Null,
     Boolean(bool),
@@ -898,7 +1000,10 @@ impl<A: Allocator> JsonString<A> {
         let mut bytes = Vec::new_in(allocator);
         unescape_into(source, span, &mut bytes)?;
         if core::str::from_utf8(&bytes).is_err() {
-            return Err(JsonError::Syntax { offset: span.start });
+            return Err(JsonError::Syntax {
+                offset: span.start,
+                kind: SyntaxKind::InvalidUtf8,
+            });
         }
         Ok(JsonString(bytes))
     }
@@ -973,6 +1078,7 @@ impl<A: Allocator> PartialEq<&str> for JsonString<A> {
 /// allocate infallibly and abort on out-of-memory, matching the standard
 /// collections.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub enum Json<A: Allocator = Global> {
     #[default]
     Null,
@@ -2173,9 +2279,44 @@ mod tests {
     fn error_display_is_readable() {
         #[cfg(feature = "std")]
         {
-            let message = format!("{}", JsonError::Syntax { offset: 7 });
-            assert_eq!(message, "syntax error at byte offset 7");
+            let error = JsonError::Syntax {
+                offset: 7,
+                kind: SyntaxKind::InvalidNumber,
+            };
+            assert_eq!(format!("{error}"), "invalid number at byte offset 7");
         }
+    }
+
+    #[test]
+    fn error_kind_and_location() {
+        // Kinds classify the fault.
+        assert!(matches!(
+            parse(b"1."),
+            Err(JsonError::Syntax { kind: SyntaxKind::InvalidNumber, .. })
+        ));
+        assert!(matches!(
+            parse(br#""bad\x""#),
+            Err(JsonError::Syntax { kind: SyntaxKind::InvalidEscape, .. })
+        ));
+        assert!(matches!(
+            parse(br#""\uDE00""#),
+            Err(JsonError::Syntax { kind: SyntaxKind::LoneSurrogate, .. })
+        ));
+        assert!(matches!(
+            parse(b"{} junk"),
+            Err(JsonError::Syntax { kind: SyntaxKind::TrailingData, .. })
+        ));
+        assert!(matches!(
+            parse(b"[1"),
+            Err(JsonError::Syntax { kind: SyntaxKind::UnexpectedEnd, .. })
+        ));
+        // Location resolves line and column from the offset.
+        let source = b"{\n  \"a\": x\n}";
+        let error = parse(source).unwrap_err();
+        let location = error.location(source).unwrap();
+        assert_eq!(location.line, 2);
+        assert_eq!(source[location.offset], b'x');
+        assert!(JsonError::Allocation.location(source).is_none());
     }
 
     #[test]
