@@ -496,6 +496,92 @@ fn escaped_span_compare(source: &[u8], left: Span, right: Span) -> Ordering {
     }
 }
 
+/// Whether to write compact JSON or indent it for readability.
+#[derive(Clone, Copy)]
+enum Layout {
+    Compact,
+    Pretty { indent: usize },
+}
+
+/// Writes a newline followed by `indent * depth` spaces.
+fn write_indent<W: fmt::Write>(writer: &mut W, indent: usize, depth: usize) -> fmt::Result {
+    writer.write_char('\n')?;
+    for _ in 0..(indent * depth) {
+        writer.write_char(' ')?;
+    }
+    Ok(())
+}
+
+/// Writes `text` as a quoted JSON string, escaping what the grammar requires.
+fn write_escaped_str<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
+    writer.write_char('"')?;
+    let bytes = text.as_bytes();
+    let mut run_start = 0;
+    // Every byte needing an escape is ASCII, and multi-byte UTF-8 bytes are all
+    // >= 0x80, so we can bulk-copy the clean runs between escapes and only break
+    // out to write the escape itself.
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte >= 0x20 && byte != b'"' && byte != b'\\' {
+            continue;
+        }
+        if run_start < index {
+            writer.write_str(&text[run_start..index])?;
+        }
+        match byte {
+            b'"' => writer.write_str("\\\"")?,
+            b'\\' => writer.write_str("\\\\")?,
+            b'\n' => writer.write_str("\\n")?,
+            b'\r' => writer.write_str("\\r")?,
+            b'\t' => writer.write_str("\\t")?,
+            0x08 => writer.write_str("\\b")?,
+            0x0C => writer.write_str("\\f")?,
+            other => write!(writer, "\\u{:04x}", other)?,
+        }
+        run_start = index + 1;
+    }
+    if run_start < bytes.len() {
+        writer.write_str(&text[run_start..])?;
+    }
+    writer.write_char('"')
+}
+
+/// Writes a quoted JSON string straight from a raw source span. The span's bytes
+/// are already valid, escaped JSON string content, so no re-escaping is needed.
+fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) -> fmt::Result {
+    writer.write_char('"')?;
+    writer.write_str(span.resolve(source).unwrap_or(""))?;
+    writer.write_char('"')
+}
+
+/// Whether a finite `f64` has no fractional part, computed without the
+/// std-only `f64::fract`/`trunc` so it works under `no_std`.
+fn is_integral(value: f64) -> bool {
+    // Clear the sign bit for the magnitude; `to_bits`/`from_bits` are `core`.
+    let magnitude = f64::from_bits(value.to_bits() & 0x7fff_ffff_ffff_ffff);
+    if magnitude >= 4_503_599_627_370_496.0 {
+        // At or above 2^52 every representable `f64` is already an integer.
+        true
+    } else {
+        // Otherwise the value fits in `i64`, so a round trip is exact.
+        value == (value as i64) as f64
+    }
+}
+
+/// Writes a finite JSON number straight to `writer`. Non-finite floats become
+/// `null`, and integral floats keep a trailing `.0` so their type survives a
+/// round trip. `f64`'s formatter never uses exponent notation, so writing
+/// directly and appending `.0` when integral needs no intermediate buffer.
+fn write_number<W: fmt::Write>(writer: &mut W, value: f64) -> fmt::Result {
+    if !value.is_finite() {
+        return writer.write_str("null");
+    }
+    write!(writer, "{value}")?;
+    if is_integral(value) {
+        writer.write_str(".0")?;
+    }
+    Ok(())
+}
+
 /// A scanned numeric token, already classified into the narrowest lane.
 enum Scalar {
     Integer(i64),
@@ -1275,6 +1361,187 @@ impl<A: Allocator> JsonView<A> {
     }
 }
 
+/// A key or index that resolves a child of a [`Resolved`] cursor: a `&str`
+/// object key (escape-aware) or a `usize` array position.
+pub trait ResolveKey<A: Allocator> {
+    #[doc(hidden)]
+    fn find<'s>(&self, source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>>;
+}
+
+impl<A: Allocator> ResolveKey<A> for usize {
+    fn find<'s>(&self, _source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>> {
+        match node {
+            JsonView::Array(items) => items.get(*self),
+            _ => None,
+        }
+    }
+}
+
+impl<A: Allocator> ResolveKey<A> for &str {
+    fn find<'s>(&self, source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>> {
+        node.get(source, self)
+    }
+}
+
+/// A [`JsonView`] node paired with the `source` it was parsed from, so string
+/// values resolve and keyed navigation work without threading `source` through
+/// every call. `Copy`, so it chains freely: `view.bind(src).get("a").get(0)`.
+pub struct Resolved<'s, A: Allocator = Global> {
+    source: &'s [u8],
+    node: &'s JsonView<A>,
+}
+
+// Both fields are references, so the cursor is `Copy` for any allocator; the
+// derive would wrongly require `A: Copy`.
+impl<'s, A: Allocator> Clone for Resolved<'s, A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'s, A: Allocator> Copy for Resolved<'s, A> {}
+
+impl<'s, A: Allocator> Resolved<'s, A> {
+    /// The underlying view node.
+    pub fn view(self) -> &'s JsonView<A> {
+        self.node
+    }
+
+    pub fn as_bool(self) -> Option<bool> {
+        self.node.as_bool()
+    }
+    pub fn as_i64(self) -> Option<i64> {
+        self.node.as_i64()
+    }
+    pub fn as_u64(self) -> Option<u64> {
+        self.node.as_u64()
+    }
+    pub fn as_f64(self) -> Option<f64> {
+        // Unlike a bare view, the cursor has `source`, so a big number can be
+        // approximated as an `f64`.
+        match self.node {
+            JsonView::BigNumber(span) => span.resolve(self.source)?.parse::<f64>().ok(),
+            _ => self.node.as_f64(),
+        }
+    }
+
+    /// The string value, resolved against `source` (still escaped).
+    pub fn as_str(self) -> Option<&'s str> {
+        self.node.as_str(self.source)
+    }
+
+    /// The exact decimal text of a big integer that overflowed 64 bits, or `None`.
+    pub fn as_number_str(self) -> Option<&'s str> {
+        self.node.as_number_str(self.source)
+    }
+
+    pub fn is_null(self) -> bool {
+        self.node.is_null()
+    }
+    pub fn is_boolean(self) -> bool {
+        self.node.is_boolean()
+    }
+    pub fn is_number(self) -> bool {
+        self.node.is_number()
+    }
+    pub fn is_string(self) -> bool {
+        self.node.is_string()
+    }
+    pub fn is_array(self) -> bool {
+        self.node.is_array()
+    }
+    pub fn is_object(self) -> bool {
+        self.node.is_object()
+    }
+
+    /// The number of array elements or object entries; `0` for scalars.
+    pub fn len(self) -> usize {
+        self.node.len()
+    }
+    /// Whether an array or object has no elements. Always `false` for scalars.
+    pub fn is_empty(self) -> bool {
+        self.node.is_empty()
+    }
+
+    /// Navigates to a child by `&str` key or `usize` index, returning a
+    /// `Null`-backed cursor on a miss so lookups chain without `?`.
+    pub fn get<K: ResolveKey<A>>(self, key: K) -> Resolved<'s, A> {
+        Resolved {
+            source: self.source,
+            node: key.find(self.source, self.node).unwrap_or(&JsonView::Null),
+        }
+    }
+
+    /// Like [`get`](Resolved::get) but distinguishes a miss with `None`.
+    pub fn try_get<K: ResolveKey<A>>(self, key: K) -> Option<Resolved<'s, A>> {
+        key.find(self.source, self.node).map(|node| Resolved {
+            source: self.source,
+            node,
+        })
+    }
+
+    /// Iterates an object's entries as `(key, value cursor)`.
+    pub fn entries(self) -> impl Iterator<Item = (&'s str, Resolved<'s, A>)> {
+        let source = self.source;
+        let slice: &'s [(Span, JsonView<A>)] = match self.node {
+            JsonView::Object(entries) => entries,
+            _ => &[],
+        };
+        slice
+            .iter()
+            .filter_map(move |(span, value)| span.resolve(source).map(|key| (key, Resolved { source, node: value })))
+    }
+
+    /// Iterates an array's elements as cursors.
+    pub fn elements(self) -> impl Iterator<Item = Resolved<'s, A>> {
+        let source = self.source;
+        let slice: &'s [JsonView<A>] = match self.node {
+            JsonView::Array(items) => items,
+            _ => &[],
+        };
+        slice.iter().map(move |node| Resolved { source, node })
+    }
+
+    /// Resolves an RFC 6901 JSON Pointer, returning a `Null`-backed cursor on a
+    /// miss.
+    pub fn pointer(self, pointer: &str) -> Resolved<'s, A> {
+        self.try_pointer(pointer).unwrap_or(Resolved {
+            source: self.source,
+            node: &JsonView::Null,
+        })
+    }
+
+    /// Like [`pointer`](Resolved::pointer) but distinguishes a miss with `None`.
+    pub fn try_pointer(self, pointer: &str) -> Option<Resolved<'s, A>> {
+        if pointer.is_empty() {
+            return Some(self);
+        }
+        if !pointer.starts_with('/') {
+            return None;
+        }
+        let mut current = self;
+        for raw_token in pointer.split('/').skip(1) {
+            let token = decode_pointer_token(raw_token);
+            current = match current.node {
+                JsonView::Object(_) => current.try_get(token.as_ref())?,
+                JsonView::Array(_) => current.try_get(pointer_array_index(token.as_ref())?)?,
+                _ => return None,
+            };
+        }
+        Some(current)
+    }
+
+    /// Writes this node as compact JSON, no `source` argument needed.
+    pub fn write_json<W: fmt::Write>(self, writer: &mut W) -> fmt::Result {
+        self.node.write_json(self.source, writer)
+    }
+}
+
+impl<'s, A: Allocator> fmt::Display for Resolved<'s, A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.node.write_json(self.source, formatter)
+    }
+}
+
 /// An owned, decoded UTF-8 string used for keys and string values in [`Json`].
 /// Its bytes are always valid UTF-8, so [`JsonString::as_str`] never fails.
 pub struct JsonString<A: Allocator = Global>(Vec<u8, A>);
@@ -1354,6 +1621,43 @@ impl<A: Allocator> PartialEq<str> for JsonString<A> {
 impl<A: Allocator> PartialEq<&str> for JsonString<A> {
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other
+    }
+}
+
+impl<A: Allocator> core::ops::Deref for JsonString<A> {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<A: Allocator> AsRef<str> for JsonString<A> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<A: Allocator> fmt::Display for JsonString<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<A: Allocator> Hash for JsonString<A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+impl<A: Allocator, B: Allocator> PartialOrd<JsonString<B>> for JsonString<A> {
+    fn partial_cmp(&self, other: &JsonString<B>) -> Option<Ordering> {
+        Some(self.as_bytes().cmp(other.as_bytes()))
+    }
+}
+
+impl<A: Allocator> Ord for JsonString<A> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_bytes().cmp(other.as_bytes())
     }
 }
 
@@ -1751,91 +2055,6 @@ impl<A: Allocator> JsonView<A> {
     }
 }
 
-/// Whether to write compact JSON or indent it for readability.
-#[derive(Clone, Copy)]
-enum Layout {
-    Compact,
-    Pretty { indent: usize },
-}
-
-/// Writes a newline followed by `indent * depth` spaces.
-fn write_indent<W: fmt::Write>(writer: &mut W, indent: usize, depth: usize) -> fmt::Result {
-    writer.write_char('\n')?;
-    for _ in 0..(indent * depth) {
-        writer.write_char(' ')?;
-    }
-    Ok(())
-}
-
-/// Writes `text` as a quoted JSON string, escaping what the grammar requires.
-fn write_escaped_str<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
-    writer.write_char('"')?;
-    let bytes = text.as_bytes();
-    let mut run_start = 0;
-    // Every byte needing an escape is ASCII, and multi-byte UTF-8 bytes are all
-    // >= 0x80, so we can bulk-copy the clean runs between escapes and only break
-    // out to write the escape itself.
-    for (index, &byte) in bytes.iter().enumerate() {
-        if byte >= 0x20 && byte != b'"' && byte != b'\\' {
-            continue;
-        }
-        if run_start < index {
-            writer.write_str(&text[run_start..index])?;
-        }
-        match byte {
-            b'"' => writer.write_str("\\\"")?,
-            b'\\' => writer.write_str("\\\\")?,
-            b'\n' => writer.write_str("\\n")?,
-            b'\r' => writer.write_str("\\r")?,
-            b'\t' => writer.write_str("\\t")?,
-            0x08 => writer.write_str("\\b")?,
-            0x0C => writer.write_str("\\f")?,
-            other => write!(writer, "\\u{:04x}", other)?,
-        }
-        run_start = index + 1;
-    }
-    if run_start < bytes.len() {
-        writer.write_str(&text[run_start..])?;
-    }
-    writer.write_char('"')
-}
-
-/// Writes a quoted JSON string straight from a raw source span. The span's bytes
-/// are already valid, escaped JSON string content, so no re-escaping is needed.
-fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) -> fmt::Result {
-    writer.write_char('"')?;
-    writer.write_str(span.resolve(source).unwrap_or(""))?;
-    writer.write_char('"')
-}
-
-/// Whether a finite `f64` has no fractional part, computed without the
-/// std-only `f64::fract`/`trunc` so it works under `no_std`.
-fn is_integral(value: f64) -> bool {
-    // Clear the sign bit for the magnitude; `to_bits`/`from_bits` are `core`.
-    let magnitude = f64::from_bits(value.to_bits() & 0x7fff_ffff_ffff_ffff);
-    if magnitude >= 4_503_599_627_370_496.0 {
-        // At or above 2^52 every representable `f64` is already an integer.
-        true
-    } else {
-        // Otherwise the value fits in `i64`, so a round trip is exact.
-        value == (value as i64) as f64
-    }
-}
-
-/// Writes a finite JSON number straight to `writer`. Non-finite floats become
-/// `null`, and integral floats keep a trailing `.0` so their type survives a
-/// round trip. `f64`'s formatter never uses exponent notation, so writing
-/// directly and appending `.0` when integral needs no intermediate buffer.
-fn write_number<W: fmt::Write>(writer: &mut W, value: f64) -> fmt::Result {
-    if !value.is_finite() {
-        return writer.write_str("null");
-    }
-    write!(writer, "{value}")?;
-    if is_integral(value) {
-        writer.write_str(".0")?;
-    }
-    Ok(())
-}
 
 impl<A: Allocator> Json<A> {
     pub fn is_null(&self) -> bool {
@@ -2194,42 +2413,6 @@ impl<A: Allocator> JsonView<A> {
     }
 }
 
-impl<A: Allocator> core::ops::Deref for JsonString<A> {
-    type Target = str;
-    fn deref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl<A: Allocator> AsRef<str> for JsonString<A> {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl<A: Allocator> fmt::Display for JsonString<A> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl<A: Allocator> Hash for JsonString<A> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_bytes().hash(state);
-    }
-}
-
-impl<A: Allocator, B: Allocator> PartialOrd<JsonString<B>> for JsonString<A> {
-    fn partial_cmp(&self, other: &JsonString<B>) -> Option<Ordering> {
-        Some(self.as_bytes().cmp(other.as_bytes()))
-    }
-}
-
-impl<A: Allocator> Ord for JsonString<A> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.as_bytes().cmp(other.as_bytes())
-    }
-}
 
 impl core::str::FromStr for Json<Global> {
     type Err = JsonError;
@@ -2319,186 +2502,6 @@ impl<A: Allocator> JsonView<A> {
     }
 }
 
-/// A key or index that resolves a child of a [`Resolved`] cursor: a `&str`
-/// object key (escape-aware) or a `usize` array position.
-pub trait ResolveKey<A: Allocator> {
-    #[doc(hidden)]
-    fn find<'s>(&self, source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>>;
-}
-
-impl<A: Allocator> ResolveKey<A> for usize {
-    fn find<'s>(&self, _source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>> {
-        match node {
-            JsonView::Array(items) => items.get(*self),
-            _ => None,
-        }
-    }
-}
-
-impl<A: Allocator> ResolveKey<A> for &str {
-    fn find<'s>(&self, source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>> {
-        node.get(source, self)
-    }
-}
-
-/// A [`JsonView`] node paired with the `source` it was parsed from, so string
-/// values resolve and keyed navigation work without threading `source` through
-/// every call. `Copy`, so it chains freely: `view.bind(src).get("a").get(0)`.
-pub struct Resolved<'s, A: Allocator = Global> {
-    source: &'s [u8],
-    node: &'s JsonView<A>,
-}
-
-// Both fields are references, so the cursor is `Copy` for any allocator; the
-// derive would wrongly require `A: Copy`.
-impl<'s, A: Allocator> Clone for Resolved<'s, A> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<'s, A: Allocator> Copy for Resolved<'s, A> {}
-
-impl<'s, A: Allocator> Resolved<'s, A> {
-    /// The underlying view node.
-    pub fn view(self) -> &'s JsonView<A> {
-        self.node
-    }
-
-    pub fn as_bool(self) -> Option<bool> {
-        self.node.as_bool()
-    }
-    pub fn as_i64(self) -> Option<i64> {
-        self.node.as_i64()
-    }
-    pub fn as_u64(self) -> Option<u64> {
-        self.node.as_u64()
-    }
-    pub fn as_f64(self) -> Option<f64> {
-        // Unlike a bare view, the cursor has `source`, so a big number can be
-        // approximated as an `f64`.
-        match self.node {
-            JsonView::BigNumber(span) => span.resolve(self.source)?.parse::<f64>().ok(),
-            _ => self.node.as_f64(),
-        }
-    }
-
-    /// The string value, resolved against `source` (still escaped).
-    pub fn as_str(self) -> Option<&'s str> {
-        self.node.as_str(self.source)
-    }
-
-    /// The exact decimal text of a big integer that overflowed 64 bits, or `None`.
-    pub fn as_number_str(self) -> Option<&'s str> {
-        self.node.as_number_str(self.source)
-    }
-
-    pub fn is_null(self) -> bool {
-        self.node.is_null()
-    }
-    pub fn is_boolean(self) -> bool {
-        self.node.is_boolean()
-    }
-    pub fn is_number(self) -> bool {
-        self.node.is_number()
-    }
-    pub fn is_string(self) -> bool {
-        self.node.is_string()
-    }
-    pub fn is_array(self) -> bool {
-        self.node.is_array()
-    }
-    pub fn is_object(self) -> bool {
-        self.node.is_object()
-    }
-
-    /// The number of array elements or object entries; `0` for scalars.
-    pub fn len(self) -> usize {
-        self.node.len()
-    }
-    /// Whether an array or object has no elements. Always `false` for scalars.
-    pub fn is_empty(self) -> bool {
-        self.node.is_empty()
-    }
-
-    /// Navigates to a child by `&str` key or `usize` index, returning a
-    /// `Null`-backed cursor on a miss so lookups chain without `?`.
-    pub fn get<K: ResolveKey<A>>(self, key: K) -> Resolved<'s, A> {
-        Resolved {
-            source: self.source,
-            node: key.find(self.source, self.node).unwrap_or(&JsonView::Null),
-        }
-    }
-
-    /// Like [`get`](Resolved::get) but distinguishes a miss with `None`.
-    pub fn try_get<K: ResolveKey<A>>(self, key: K) -> Option<Resolved<'s, A>> {
-        key.find(self.source, self.node).map(|node| Resolved {
-            source: self.source,
-            node,
-        })
-    }
-
-    /// Iterates an object's entries as `(key, value cursor)`.
-    pub fn entries(self) -> impl Iterator<Item = (&'s str, Resolved<'s, A>)> {
-        let source = self.source;
-        let slice: &'s [(Span, JsonView<A>)] = match self.node {
-            JsonView::Object(entries) => entries,
-            _ => &[],
-        };
-        slice
-            .iter()
-            .filter_map(move |(span, value)| span.resolve(source).map(|key| (key, Resolved { source, node: value })))
-    }
-
-    /// Iterates an array's elements as cursors.
-    pub fn elements(self) -> impl Iterator<Item = Resolved<'s, A>> {
-        let source = self.source;
-        let slice: &'s [JsonView<A>] = match self.node {
-            JsonView::Array(items) => items,
-            _ => &[],
-        };
-        slice.iter().map(move |node| Resolved { source, node })
-    }
-
-    /// Resolves an RFC 6901 JSON Pointer, returning a `Null`-backed cursor on a
-    /// miss.
-    pub fn pointer(self, pointer: &str) -> Resolved<'s, A> {
-        self.try_pointer(pointer).unwrap_or(Resolved {
-            source: self.source,
-            node: &JsonView::Null,
-        })
-    }
-
-    /// Like [`pointer`](Resolved::pointer) but distinguishes a miss with `None`.
-    pub fn try_pointer(self, pointer: &str) -> Option<Resolved<'s, A>> {
-        if pointer.is_empty() {
-            return Some(self);
-        }
-        if !pointer.starts_with('/') {
-            return None;
-        }
-        let mut current = self;
-        for raw_token in pointer.split('/').skip(1) {
-            let token = decode_pointer_token(raw_token);
-            current = match current.node {
-                JsonView::Object(_) => current.try_get(token.as_ref())?,
-                JsonView::Array(_) => current.try_get(pointer_array_index(token.as_ref())?)?,
-                _ => return None,
-            };
-        }
-        Some(current)
-    }
-
-    /// Writes this node as compact JSON, no `source` argument needed.
-    pub fn write_json<W: fmt::Write>(self, writer: &mut W) -> fmt::Result {
-        self.node.write_json(self.source, writer)
-    }
-}
-
-impl<'s, A: Allocator> fmt::Display for Resolved<'s, A> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.node.write_json(self.source, formatter)
-    }
-}
 
 /// Parses `source` into an immutable [`JsonView`] allocated in `allocator`,
 /// under `options`. Spans in the result are offsets into `source`.
