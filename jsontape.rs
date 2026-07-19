@@ -77,6 +77,7 @@ use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
 use allocator_api2::alloc::{Allocator, Global};
+use allocator_api2::boxed::Box;
 use allocator_api2::vec::Vec;
 
 #[cfg(not(feature = "std"))]
@@ -2186,6 +2187,183 @@ impl<A: Allocator> Ord for JsonString<A> {
     }
 }
 
+/// Whether a preserved comment was written as a `//` line or `/* */` block comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CommentStyle {
+    /// A `// ...` line comment.
+    Line,
+    /// A `/* ... */` block comment.
+    Block,
+}
+
+/// A comment preserved from JSON5 source, attached to a container element in the
+/// owned [`Json`] tree. The zero-copy [`JsonView`] never carries comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Comment<A: Allocator = Global> {
+    /// Whether it was a line or block comment.
+    pub style: CommentStyle,
+    /// The comment text without its `//` or `/* */` delimiters, verbatim.
+    pub text: JsonString<A>,
+}
+
+/// Where a preserved comment sits relative to the element it anchors to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // constructed once comment collection lands in the next commit
+enum CommentSlot {
+    /// On its own line before the element.
+    Leading,
+    /// On the same line after the element.
+    Trailing,
+}
+
+/// One preserved comment bound to a container position. `anchor` is the element
+/// index it attaches to, or the element count for a comment after the last
+/// element and before the closing bracket.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // read once comment collection lands in the next commit
+struct AnchoredComment<A: Allocator> {
+    anchor: u32,
+    slot: CommentSlot,
+    comment: Comment<A>,
+}
+
+/// A container's preserved comments as one flat list in source order. Storing
+/// only the comments that exist keeps a sparsely commented large container from
+/// paying an empty slot per element, and the source ordering lets serialization
+/// walk it in lockstep with the elements.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // read once comment collection lands in the next commit
+struct TriviaBlock<A: Allocator> {
+    comments: Vec<AnchoredComment<A>, A>,
+}
+
+/// The backing storage for a [`Json::Array`]: its elements plus optional comment
+/// trivia. With no comments `trivia` is `None` and adds no heap allocation. It
+/// dereferences to the element `Vec`, so it indexes, iterates, and pushes like
+/// one — `array.len()`, `array[0]`, `for item in &array` all work.
+pub struct ArrayBody<A: Allocator = Global> {
+    items: Vec<Json<A>, A>,
+    trivia: Option<Box<TriviaBlock<A>, A>>,
+}
+
+/// The backing storage for a [`Json::Object`]: its `(key, value)` entries plus
+/// optional comment trivia. Like [`ArrayBody`], it dereferences to the entry
+/// `Vec` and carries no heap when there are no comments.
+pub struct ObjectBody<A: Allocator = Global> {
+    entries: Vec<(JsonString<A>, Json<A>), A>,
+    trivia: Option<Box<TriviaBlock<A>, A>>,
+}
+
+impl<A: Allocator> ArrayBody<A> {
+    fn new(items: Vec<Json<A>, A>) -> Self {
+        Self { items, trivia: None }
+    }
+}
+
+impl<A: Allocator> ObjectBody<A> {
+    fn new(entries: Vec<(JsonString<A>, Json<A>), A>) -> Self {
+        Self { entries, trivia: None }
+    }
+}
+
+impl<A: Allocator> From<Vec<Json<A>, A>> for ArrayBody<A> {
+    fn from(items: Vec<Json<A>, A>) -> Self {
+        Self::new(items)
+    }
+}
+
+impl<A: Allocator> From<Vec<(JsonString<A>, Json<A>), A>> for ObjectBody<A> {
+    fn from(entries: Vec<(JsonString<A>, Json<A>), A>) -> Self {
+        Self::new(entries)
+    }
+}
+
+impl<A: Allocator> core::ops::Deref for ArrayBody<A> {
+    type Target = Vec<Json<A>, A>;
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl<A: Allocator> core::ops::DerefMut for ArrayBody<A> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.items
+    }
+}
+
+impl<A: Allocator> core::ops::Deref for ObjectBody<A> {
+    type Target = Vec<(JsonString<A>, Json<A>), A>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl<A: Allocator> core::ops::DerefMut for ObjectBody<A> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+
+impl<'a, A: Allocator> IntoIterator for &'a ArrayBody<A> {
+    type Item = &'a Json<A>;
+    type IntoIter = core::slice::Iter<'a, Json<A>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+impl<'a, A: Allocator> IntoIterator for &'a mut ArrayBody<A> {
+    type Item = &'a mut Json<A>;
+    type IntoIter = core::slice::IterMut<'a, Json<A>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter_mut()
+    }
+}
+
+impl<'a, A: Allocator> IntoIterator for &'a ObjectBody<A> {
+    type Item = &'a (JsonString<A>, Json<A>);
+    type IntoIter = core::slice::Iter<'a, (JsonString<A>, Json<A>)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+impl<'a, A: Allocator> IntoIterator for &'a mut ObjectBody<A> {
+    type Item = &'a mut (JsonString<A>, Json<A>);
+    type IntoIter = core::slice::IterMut<'a, (JsonString<A>, Json<A>)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter_mut()
+    }
+}
+
+// Comment trivia is metadata, not document content, so equality and Debug of a
+// body reflect only its elements.
+impl<A: Allocator + fmt::Debug> fmt::Debug for ArrayBody<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.items.fmt(formatter)
+    }
+}
+
+impl<A: Allocator + fmt::Debug> fmt::Debug for ObjectBody<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.entries.fmt(formatter)
+    }
+}
+
+impl<A: Allocator + Clone> Clone for ArrayBody<A> {
+    fn clone(&self) -> Self {
+        Self { items: self.items.clone(), trivia: self.trivia.clone() }
+    }
+}
+
+impl<A: Allocator + Clone> Clone for ObjectBody<A> {
+    fn clone(&self) -> Self {
+        Self { entries: self.entries.clone(), trivia: self.trivia.clone() }
+    }
+}
+
 /// An owned, mutable JSON document. Unlike [`JsonView`], strings are decoded at
 /// parse time, so [`Json::as_str`] needs no source and the tree can be
 /// edited freely. Numbers keep their width past the `2^53` float boundary.
@@ -2214,9 +2392,9 @@ pub enum Json<A: Allocator = Global> {
     /// decimal text so no precision is lost.
     BigNumber(JsonString<A>),
     /// An array of values.
-    Array(Vec<Json<A>, A>),
+    Array(ArrayBody<A>),
     /// An object, as `(key, value)` pairs in insertion order.
-    Object(Vec<(JsonString<A>, Json<A>), A>),
+    Object(ObjectBody<A>),
 }
 
 /// Zero-sized builder that eagerly decodes strings into the allocator.
@@ -2256,10 +2434,10 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
         JsonString::from_span(source, span, allocator.clone())
     }
     fn array(items: Vec<Json<A>, A>) -> Json<A> {
-        Json::Array(items)
+        Json::Array(items.into())
     }
     fn object(entries: Vec<(JsonString<A>, Json<A>), A>) -> Json<A> {
-        Json::Object(entries)
+        Json::Object(entries.into())
     }
     fn key_compare(_source: &[u8], left: &JsonString<A>, right: &JsonString<A>) -> Ordering {
         left.as_bytes().cmp(right.as_bytes())
@@ -2473,12 +2651,12 @@ impl<A: Allocator> Json<A> {
 
     /// An empty object value allocated in `allocator`.
     pub fn object_in(allocator: A) -> Json<A> {
-        Json::Object(Vec::new_in(allocator))
+        Json::Object(Vec::new_in(allocator).into())
     }
 
     /// An empty array value allocated in `allocator`.
     pub fn array_in(allocator: A) -> Json<A> {
-        Json::Array(Vec::new_in(allocator))
+        Json::Array(Vec::new_in(allocator).into())
     }
 
     /// A string value holding a copy of `text`, allocated in `allocator`.
@@ -2565,7 +2743,7 @@ impl<A: Allocator> JsonView<A> {
                     owned.try_reserve(1).map_err(|_| JsonError::Allocation)?;
                     owned.push(converted);
                 }
-                Ok(Json::Array(owned))
+                Ok(Json::Array(owned.into()))
             }
             JsonView::Object(entries) => {
                 let mut owned = Vec::new_in(allocator.clone());
@@ -2575,7 +2753,7 @@ impl<A: Allocator> JsonView<A> {
                     owned.try_reserve(1).map_err(|_| JsonError::Allocation)?;
                     owned.push((key, converted));
                 }
-                Ok(Json::Object(owned))
+                Ok(Json::Object(owned.into()))
             }
         }
     }
@@ -2642,17 +2820,19 @@ impl<A: Allocator> Json<A> {
     }
 
     /// Consumes an array value, yielding its element storage; `None` otherwise.
+    /// Any preserved comment trivia is discarded.
     pub fn into_array(self) -> Option<Vec<Json<A>, A>> {
         match self {
-            Json::Array(items) => Some(items),
+            Json::Array(body) => Some(body.items),
             _ => None,
         }
     }
 
     /// Consumes an object value, yielding its entry storage; `None` otherwise.
+    /// Any preserved comment trivia is discarded.
     pub fn into_object(self) -> Option<ObjectEntries<A>> {
         match self {
-            Json::Object(entries) => Some(entries),
+            Json::Object(body) => Some(body.entries),
             _ => None,
         }
     }
@@ -3240,7 +3420,7 @@ impl FromIterator<Json<Global>> for Json<Global> {
         for value in iter {
             items.push(value);
         }
-        Json::Array(items)
+        Json::Array(items.into())
     }
 }
 
@@ -3250,7 +3430,7 @@ impl FromIterator<(String, Json<Global>)> for Json<Global> {
         for (key, value) in iter {
             entries.push((JsonString::from_str_in(&key, Global), value));
         }
-        Json::Object(entries)
+        Json::Object(entries.into())
     }
 }
 
@@ -3536,14 +3716,14 @@ mod serde_impls {
             while let Some(element) = seq.next_element::<Json<Global>>()? {
                 items.push(element);
             }
-            Ok(Json::Array(items))
+            Ok(Json::Array(items.into()))
         }
         fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Json<Global>, M::Error> {
             let mut entries: Vec<(JsonString<Global>, Json<Global>), Global> = Vec::new_in(Global);
             while let Some((key, value)) = map.next_entry::<String, Json<Global>>()? {
                 entries.push((JsonString::from_str_in(&key, Global), value));
             }
-            Ok(Json::Object(entries))
+            Ok(Json::Object(entries.into()))
         }
     }
 
@@ -3601,7 +3781,7 @@ mod serde_impls {
     fn single_entry_object(key: &str, value: Json<Global>) -> Json<Global> {
         let mut entries: Vec<(JsonString<Global>, Json<Global>), Global> = Vec::new_in(Global);
         entries.push((JsonString::from_str_in(key, Global), value));
-        Json::Object(entries)
+        Json::Object(entries.into())
     }
 
     fn json_to_key(json: Json<Global>) -> Result<JsonString<Global>, JsonError> {
@@ -3682,7 +3862,7 @@ mod serde_impls {
             for &byte in value {
                 items.push(Json::Unsigned(byte as u64));
             }
-            Ok(Json::Array(items))
+            Ok(Json::Array(items.into()))
         }
         fn serialize_none(self) -> Result<Json<Global>, JsonError> {
             Ok(Json::Null)
@@ -3786,7 +3966,7 @@ mod serde_impls {
             Ok(())
         }
         fn end(self) -> Result<Json<Global>, JsonError> {
-            Ok(Json::Array(self.items))
+            Ok(Json::Array(self.items.into()))
         }
     }
 
@@ -3825,7 +4005,7 @@ mod serde_impls {
             Ok(())
         }
         fn end(self) -> Result<Json<Global>, JsonError> {
-            Ok(single_entry_object(self.variant, Json::Array(self.items)))
+            Ok(single_entry_object(self.variant, Json::Array(self.items.into())))
         }
     }
 
@@ -3850,7 +4030,7 @@ mod serde_impls {
             Ok(())
         }
         fn end(self) -> Result<Json<Global>, JsonError> {
-            Ok(Json::Object(self.entries))
+            Ok(Json::Object(self.entries.into()))
         }
     }
 
@@ -3867,7 +4047,7 @@ mod serde_impls {
             Ok(())
         }
         fn end(self) -> Result<Json<Global>, JsonError> {
-            Ok(Json::Object(self.entries))
+            Ok(Json::Object(self.entries.into()))
         }
     }
 
@@ -3889,7 +4069,7 @@ mod serde_impls {
             Ok(())
         }
         fn end(self) -> Result<Json<Global>, JsonError> {
-            Ok(single_entry_object(self.variant, Json::Object(self.entries)))
+            Ok(single_entry_object(self.variant, Json::Object(self.entries.into())))
         }
     }
 
@@ -4813,6 +4993,38 @@ mod tests {
 
         // A user-built non-finite float is still serialized as null (unchanged).
         assert_eq!(Json::from(f64::INFINITY).to_string(), "null");
+    }
+
+    #[test]
+    fn container_bodies_deref_like_vecs() {
+        // Destructuring a container variant still yields something that indexes,
+        // measures, iterates, and mutates like the underlying Vec.
+        let mut document = parse(br#"{"xs":[10,20,30]}"#).unwrap();
+        if let Json::Object(entries) = &document {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0.as_str(), "xs");
+            // Iterating a shared reference to the body goes through IntoIterator.
+            let mut seen = 0;
+            for _ in entries {
+                seen += 1;
+            }
+            assert_eq!(seen, 1);
+        } else {
+            panic!("expected object");
+        }
+        if let Some(Json::Array(items)) = document.get_mut("xs") {
+            assert_eq!(items.len(), 3);
+            assert_eq!(items[1].as_u64(), Some(20));
+            let mut total = 0;
+            for item in &*items {
+                total += item.as_u64().unwrap();
+            }
+            assert_eq!(total, 60);
+            items.push(Json::from(40u64));
+        }
+        assert_eq!(document["xs"].len(), 4);
+        // Trivia does not affect value equality or serialization.
+        assert_eq!(document.to_string(), r#"{"xs":[10,20,30,40]}"#);
     }
 
     #[test]
