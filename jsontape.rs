@@ -153,6 +153,8 @@ pub enum SyntaxKind {
     DepthExceeded,
     /// An object repeated a key under [`DuplicateKeys::Reject`].
     DuplicateKey,
+    /// A `/* ... */` block comment was never closed.
+    UnterminatedComment,
 }
 
 impl SyntaxKind {
@@ -170,6 +172,7 @@ impl SyntaxKind {
             SyntaxKind::ControlCharacter => "unescaped control character",
             SyntaxKind::DepthExceeded => "nesting too deep",
             SyntaxKind::DuplicateKey => "duplicate object key",
+            SyntaxKind::UnterminatedComment => "unterminated comment",
         }
     }
 }
@@ -250,8 +253,11 @@ pub enum DuplicateKeys {
     KeepAll,
 }
 
-/// Knobs for a parse: the nesting limit and the duplicate-key policy. Build one
-/// from [`ParseOptions::default`] and adjust, then pass it to a `*_with` parser.
+/// Knobs for a parse: the nesting limit, the duplicate-key policy, and a set of
+/// opt-in lenient extensions toward JSON5. Every lenient flag defaults to `false`
+/// so the default is strict RFC 8259; enable them individually, or start from the
+/// [`jsonc`](ParseOptions::jsonc) or [`json5`](ParseOptions::json5) preset. Build
+/// from [`ParseOptions::default`] and adjust, then pass to a `*_with` parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ParseOptions {
@@ -259,18 +265,78 @@ pub struct ParseOptions {
     pub max_depth: u32,
     /// How repeated object keys are handled. Defaults to [`DuplicateKeys::LastWins`].
     pub duplicate_keys: DuplicateKeys,
+    /// Accept `// ...` line comments as whitespace.
+    pub allow_line_comments: bool,
+    /// Accept `/* ... */` block comments as whitespace.
+    pub allow_block_comments: bool,
+    /// Accept a single trailing comma before a `]` or `}`.
+    pub allow_trailing_commas: bool,
+    /// Accept unquoted ASCII identifier object keys.
+    pub allow_unquoted_keys: bool,
+    /// Accept `0x`-prefixed hexadecimal integers.
+    pub allow_hex_numbers: bool,
+    /// Accept a leading `+` sign on numbers.
+    pub allow_leading_plus: bool,
+    /// Accept a leading decimal point, as in `.5`.
+    pub allow_leading_decimal: bool,
+    /// Accept a trailing decimal point, as in `5.`.
+    pub allow_trailing_decimal: bool,
+    /// Accept `Infinity`, `-Infinity`, and `NaN` number literals.
+    pub allow_infinity_nan: bool,
 }
 
 impl Default for ParseOptions {
     fn default() -> Self {
-        ParseOptions {
-            max_depth: MAX_DEPTH,
-            duplicate_keys: DuplicateKeys::LastWins,
-        }
+        Self::strict()
     }
 }
 
 impl ParseOptions {
+    /// Strict RFC 8259: every lenient extension off. This is the default.
+    pub const fn strict() -> Self {
+        ParseOptions {
+            max_depth: MAX_DEPTH,
+            duplicate_keys: DuplicateKeys::LastWins,
+            allow_line_comments: false,
+            allow_block_comments: false,
+            allow_trailing_commas: false,
+            allow_unquoted_keys: false,
+            allow_hex_numbers: false,
+            allow_leading_plus: false,
+            allow_leading_decimal: false,
+            allow_trailing_decimal: false,
+            allow_infinity_nan: false,
+        }
+    }
+
+    /// The "JSONC" subset: line and block comments plus trailing commas, and
+    /// nothing else. Handy for reading configuration files.
+    pub const fn jsonc() -> Self {
+        ParseOptions {
+            allow_line_comments: true,
+            allow_block_comments: true,
+            allow_trailing_commas: true,
+            ..Self::strict()
+        }
+    }
+
+    /// The full set of lenient extensions this crate implements toward JSON5:
+    /// comments, trailing commas, unquoted keys, and the extended number forms.
+    pub const fn json5() -> Self {
+        ParseOptions {
+            allow_line_comments: true,
+            allow_block_comments: true,
+            allow_trailing_commas: true,
+            allow_unquoted_keys: true,
+            allow_hex_numbers: true,
+            allow_leading_plus: true,
+            allow_leading_decimal: true,
+            allow_trailing_decimal: true,
+            allow_infinity_nan: true,
+            ..Self::strict()
+        }
+    }
+
     /// Sets the maximum nesting depth.
     pub fn max_depth(mut self, max_depth: u32) -> Self {
         self.max_depth = max_depth;
@@ -805,17 +871,51 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         self.source.get(self.position + offset).copied()
     }
 
-    fn skip_whitespace(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.position += 1;
+    /// Skips insignificant whitespace, and — when the matching options are
+    /// enabled — `//` line and `/* */` block comments. A lone `/` that does not
+    /// open an enabled comment is left in place for the caller to fault on.
+    fn skip_trivia(&mut self) -> Result<(), JsonError> {
+        loop {
+            match self.peek() {
+                Some(b' ' | b'\t' | b'\n' | b'\r') => self.position += 1,
+                Some(b'/') => match self.peek_at(1) {
+                    Some(b'/') if self.options.allow_line_comments => {
+                        self.position += 2;
+                        while !matches!(self.peek(), None | Some(b'\n' | b'\r')) {
+                            self.position += 1;
+                        }
+                    }
+                    Some(b'*') if self.options.allow_block_comments => {
+                        let comment_start = self.position;
+                        self.position += 2;
+                        loop {
+                            match self.peek() {
+                                None => {
+                                    return Err(JsonError::Syntax {
+                                        offset: comment_start,
+                                        kind: SyntaxKind::UnterminatedComment,
+                                    })
+                                }
+                                Some(b'*') if self.peek_at(1) == Some(b'/') => {
+                                    self.position += 2;
+                                    break;
+                                }
+                                Some(_) => self.position += 1,
+                            }
+                        }
+                    }
+                    _ => return Ok(()),
+                },
+                _ => return Ok(()),
+            }
         }
     }
 
     /// Parses a single top-level document, requiring that nothing but
-    /// whitespace follows the value.
+    /// trivia follows the value.
     fn parse_document(&mut self) -> Result<B::Value, JsonError> {
         let value = self.value()?;
-        self.skip_whitespace();
+        self.skip_trivia()?;
         if self.position != self.source.len() {
             return self.fault_kind(SyntaxKind::TrailingData);
         }
@@ -823,7 +923,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     }
 
     fn value(&mut self) -> Result<B::Value, JsonError> {
-        self.skip_whitespace();
+        self.skip_trivia()?;
         match self.peek() {
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
@@ -835,6 +935,9 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             Some(b'f') => self.expect_literal(b"false").map(|_| B::boolean(false)),
             Some(b'n') => self.expect_literal(b"null").map(|_| B::null()),
             Some(byte) if byte == b'-' || byte.is_ascii_digit() => self.number(),
+            Some(b'+') if self.options.allow_leading_plus => self.number(),
+            Some(b'.') if self.options.allow_leading_decimal => self.number(),
+            Some(b'I' | b'N') if self.options.allow_infinity_nan => self.number(),
             None => self.fault_kind(SyntaxKind::UnexpectedEnd),
             _ => self.fault(),
         }
@@ -859,26 +962,68 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
     }
 
-    /// Scans a number under the strict RFC 8259 grammar: an optional minus, an
-    /// integer part of either a lone zero or a non-zero digit followed by more
-    /// digits, an optional fraction of a dot and digits, and an optional
-    /// exponent. Then classifies it into the narrowest of `i64`, `u64`, or `f64`.
+    /// Scans a number. Strict RFC 8259 is an optional minus, an integer part of
+    /// either a lone zero or a non-zero digit run, an optional fraction of a dot
+    /// and digits, and an optional exponent, classified into the narrowest of
+    /// `i64`, `u64`, or `f64`. The JSON5 options additionally accept a leading
+    /// `+`, `0x` hexadecimal integers, `.5`/`5.` decimal points, and the
+    /// `Infinity`/`NaN` literals.
     fn scan_number(&mut self) -> Result<Scalar, JsonError> {
         let start = self.position;
 
-        if self.peek() == Some(b'-') {
-            self.position += 1;
+        // Leading sign: a minus always, a plus only under JSON5.
+        let mut negative = false;
+        match self.peek() {
+            Some(b'-') => {
+                negative = true;
+                self.position += 1;
+            }
+            Some(b'+') if self.options.allow_leading_plus => self.position += 1,
+            _ => {}
         }
 
+        // The `Infinity` and `NaN` literals, optionally signed.
+        if self.options.allow_infinity_nan {
+            match self.peek() {
+                Some(b'I') => {
+                    self.expect_literal(b"Infinity")?;
+                    let value = if negative { f64::NEG_INFINITY } else { f64::INFINITY };
+                    return Ok(Scalar::Float(value));
+                }
+                Some(b'N') => {
+                    self.expect_literal(b"NaN")?;
+                    return Ok(Scalar::Float(f64::NAN));
+                }
+                _ => {}
+            }
+        }
+
+        // Hexadecimal integer: `0x` or `0X` followed by hex digits.
+        if self.options.allow_hex_numbers
+            && self.peek() == Some(b'0')
+            && matches!(self.peek_at(1), Some(b'x' | b'X'))
+        {
+            return self.scan_hex_integer(start, negative);
+        }
+
+        let mut is_float = false;
+        let mut has_integer_digits = false;
+
         // Integer part: a lone zero, or a non-zero digit run with no leading zeros.
+        // JSON5 may also open with a decimal point and no integer digits at all.
         match self.peek() {
-            Some(b'0') => self.position += 1,
+            Some(b'0') => {
+                self.position += 1;
+                has_integer_digits = true;
+            }
             Some(b'1'..=b'9') => {
                 self.position += 1;
+                has_integer_digits = true;
                 while matches!(self.peek(), Some(b'0'..=b'9')) {
                     self.position += 1;
                 }
             }
+            Some(b'.') if self.options.allow_leading_decimal => {}
             _ => {
                 return Err(JsonError::Syntax {
                     offset: start,
@@ -887,21 +1032,32 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
         }
 
-        let mut is_float = false;
-
-        // Fractional part: a dot followed by at least one digit.
+        // Fractional part: a dot followed by digits. Strict JSON requires at
+        // least one digit; JSON5 allows a trailing dot when integer digits are
+        // present, and a leading dot when a fraction follows.
         if self.peek() == Some(b'.') {
             is_float = true;
             self.position += 1;
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(JsonError::Syntax {
-                    offset: self.position,
-                    kind: SyntaxKind::InvalidNumber,
-                });
-            }
+            let mut has_fraction_digits = false;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.position += 1;
+                has_fraction_digits = true;
             }
+            if !has_fraction_digits {
+                let trailing_ok = self.options.allow_trailing_decimal && has_integer_digits;
+                if !trailing_ok {
+                    return Err(JsonError::Syntax {
+                        offset: self.position,
+                        kind: SyntaxKind::InvalidNumber,
+                    });
+                }
+            }
+        } else if !has_integer_digits {
+            // A leading dot was permitted but no fraction followed it.
+            return Err(JsonError::Syntax {
+                offset: start,
+                kind: SyntaxKind::InvalidNumber,
+            });
         }
 
         // Exponent part: e/E, an optional sign, then at least one digit.
@@ -937,10 +1093,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             if value.is_finite() && !underflowed_to_zero {
                 return Ok(Scalar::Float(value));
             }
-            return Ok(Scalar::Big(Span {
-                start,
-                len: self.position - start,
-            }));
+            return self.big_number(start);
         }
         if token[0] == b'-' {
             if let Ok(value) = text.parse::<i64>() {
@@ -950,10 +1103,60 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             return Ok(Scalar::Unsigned(value));
         }
         // Integer too wide for a 64-bit lane; keep the exact lexeme losslessly.
+        self.big_number(start)
+    }
+
+    /// Builds a [`Scalar::Big`] span from `start` to the cursor, keeping the
+    /// exact lexeme. A leading `+` is dropped and a leading decimal point is
+    /// rejected so the preserved text is always valid strict JSON to re-emit.
+    fn big_number(&self, start: usize) -> Result<Scalar, JsonError> {
+        let mut low = start;
+        if self.source.get(low) == Some(&b'+') {
+            low += 1;
+        }
+        let after_sign = if self.source.get(low) == Some(&b'-') { low + 1 } else { low };
+        if self.source.get(after_sign) == Some(&b'.') {
+            return Err(JsonError::Syntax {
+                offset: start,
+                kind: SyntaxKind::InvalidNumber,
+            });
+        }
         Ok(Scalar::Big(Span {
-            start,
-            len: self.position - start,
+            start: low,
+            len: self.position - low,
         }))
+    }
+
+    /// Scans a `0x`/`0X` hexadecimal integer, already positioned on the `0`. The
+    /// magnitude must fit a 64-bit lane, so the decimal it re-emits is valid JSON.
+    fn scan_hex_integer(&mut self, start: usize, negative: bool) -> Result<Scalar, JsonError> {
+        self.position += 2; // the "0x"
+        let digits_start = self.position;
+        while matches!(self.peek(), Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')) {
+            self.position += 1;
+        }
+        if self.position == digits_start {
+            return Err(JsonError::Syntax {
+                offset: start,
+                kind: SyntaxKind::InvalidNumber,
+            });
+        }
+        let digits = core::str::from_utf8(&self.source[digits_start..self.position])
+            .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })?;
+        let magnitude = u64::from_str_radix(digits, 16)
+            .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })?;
+        if !negative {
+            return Ok(Scalar::Unsigned(magnitude));
+        }
+        // Negate through i128 so the i64::MIN magnitude (2^63) stays representable.
+        let signed = -(magnitude as i128);
+        if signed < i64::MIN as i128 {
+            return Err(JsonError::Syntax {
+                offset: start,
+                kind: SyntaxKind::InvalidNumber,
+            });
+        }
+        Ok(Scalar::Integer(signed as i64))
     }
 
     /// Scans a string, validating escapes and rejecting raw control characters,
@@ -1058,7 +1261,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
         self.position += 1; // opening bracket
         let mut items: Vec<B::Value, A> = Vec::new_in(self.allocator.clone());
-        self.skip_whitespace();
+        self.skip_trivia()?;
         if self.peek() == Some(b']') {
             self.position += 1;
             self.depth -= 1;
@@ -1067,9 +1270,19 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         loop {
             let value = self.value()?;
             self.try_push(&mut items, value)?;
-            self.skip_whitespace();
+            self.skip_trivia()?;
             match self.peek() {
-                Some(b',') => self.position += 1,
+                Some(b',') => {
+                    self.position += 1;
+                    // A trailing comma is only allowed to precede the closer.
+                    if self.options.allow_trailing_commas {
+                        self.skip_trivia()?;
+                        if self.peek() == Some(b']') {
+                            self.position += 1;
+                            break;
+                        }
+                    }
+                }
                 Some(b']') => {
                     self.position += 1;
                     break;
@@ -1082,6 +1295,26 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(B::array(items))
     }
 
+    /// Scans an unquoted JSON5 identifier key, returning its raw span. Version one
+    /// accepts ASCII identifier characters only, with no `\u` escapes.
+    fn scan_identifier(&mut self) -> Result<Span, JsonError> {
+        let start = self.position;
+        match self.peek() {
+            Some(byte) if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' => {
+                self.position += 1;
+            }
+            _ => return self.fault(),
+        }
+        while matches!(self.peek(), Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$')
+        {
+            self.position += 1;
+        }
+        Ok(Span {
+            start,
+            len: self.position - start,
+        })
+    }
+
     fn object(&mut self) -> Result<B::Value, JsonError> {
         self.depth += 1;
         if self.depth > self.options.max_depth {
@@ -1089,29 +1322,46 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
         self.position += 1; // opening brace
         let mut entries: Vec<(B::Key, B::Value), A> = Vec::new_in(self.allocator.clone());
-        self.skip_whitespace();
+        self.skip_trivia()?;
         if self.peek() == Some(b'}') {
             self.position += 1;
             self.depth -= 1;
             return Ok(B::object(entries));
         }
         loop {
-            self.skip_whitespace();
-            if self.peek() != Some(b'"') {
-                return self.fault();
-            }
-            let key_span = self.scan_string()?;
+            self.skip_trivia()?;
+            let key_span = match self.peek() {
+                Some(b'"') => self.scan_string()?,
+                Some(byte)
+                    if self.options.allow_unquoted_keys
+                        && (byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$') =>
+                {
+                    self.scan_identifier()?
+                }
+                None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
+                _ => return self.fault(),
+            };
             let key = B::key(self.source, key_span, &self.allocator)?;
-            self.skip_whitespace();
+            self.skip_trivia()?;
             if self.peek() != Some(b':') {
                 return self.fault();
             }
             self.position += 1;
             let value = self.value()?;
             self.try_push(&mut entries, (key, value))?;
-            self.skip_whitespace();
+            self.skip_trivia()?;
             match self.peek() {
-                Some(b',') => self.position += 1,
+                Some(b',') => {
+                    self.position += 1;
+                    // A trailing comma is only allowed to precede the closer.
+                    if self.options.allow_trailing_commas {
+                        self.skip_trivia()?;
+                        if self.peek() == Some(b'}') {
+                            self.position += 1;
+                            break;
+                        }
+                    }
+                }
                 Some(b'}') => {
                     self.position += 1;
                     break;
@@ -4438,6 +4688,113 @@ mod tests {
 
         // A user-built non-finite float is still serialized as null (unchanged).
         assert_eq!(Json::from(f64::INFINITY).to_string(), "null");
+    }
+
+    #[test]
+    fn strict_rejects_lenient_syntax() {
+        // Every JSON5 extension is a hard error under the default strict options.
+        for source in [
+            b"[1, 2,]".as_slice(),
+            b"{\"a\": 1,}",
+            b"{a: 1}",
+            b"// c\n1",
+            b"/* c */ 1",
+            b"0x10",
+            b"+1",
+            b".5",
+            b"5.",
+            b"Infinity",
+            b"NaN",
+        ] {
+            assert!(parse(source).is_err(), "strict accepted {source:?}");
+        }
+    }
+
+    #[test]
+    fn json5_comments_and_trailing_commas() {
+        let options = ParseOptions::jsonc();
+        let source = br#"{
+            // the leading identifier
+            "name": "tape", /* inline */
+            "tags": [
+                "json",
+                "json5", // trailing item comment
+            ],
+        }"#;
+        let document = parse_with(source, &options).unwrap();
+        assert_eq!(document["name"].as_str(), Some("tape"));
+        assert_eq!(document["tags"].len(), 2);
+        // The re-serialized form is strict JSON with the comments gone.
+        assert_eq!(document.to_string(), r#"{"name":"tape","tags":["json","json5"]}"#);
+    }
+
+    #[test]
+    fn json5_unquoted_keys_round_trip_to_quoted() {
+        let options = ParseOptions::json5();
+        let document = parse_with(br#"{ name: "tape", $id: 1, _v: 2 }"#, &options).unwrap();
+        assert_eq!(document["name"].as_str(), Some("tape"));
+        assert_eq!(document["$id"].as_u64(), Some(1));
+        assert_eq!(document["_v"].as_u64(), Some(2));
+        // Unquoted keys serialize back as quoted, valid strict JSON.
+        assert_eq!(document.to_string(), r#"{"name":"tape","$id":1,"_v":2}"#);
+
+        // An unquoted key and its quoted twin collide under the dedup policy.
+        let merged = parse_with(br#"{ a: 1, "a": 2 }"#, &options).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged["a"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn json5_extended_numbers() {
+        let options = ParseOptions::json5();
+        let cases: &[(&[u8], &str)] = &[
+            (b"0x10", "16"),
+            (b"-0xff", "-255"),
+            (b"0xDEADBEEF", "3735928559"),
+            (b"+42", "42"),
+            (b".5", "0.5"),
+            (b"5.", "5.0"),
+            (b"-.25", "-0.25"),
+            (b"1.5e3", "1500.0"),
+        ];
+        for (source, expected) in cases {
+            let document = parse_with(source, &options).unwrap();
+            assert_eq!(document.to_string(), *expected, "for {source:?}");
+        }
+
+        // Infinity and NaN parse as non-finite floats and re-emit as null, the
+        // same lossy-but-valid path a user-built infinity already takes.
+        for source in [b"Infinity".as_slice(), b"-Infinity", b"NaN"] {
+            let document = parse_with(source, &options).unwrap();
+            assert!(document.is_number());
+            assert_eq!(document.to_string(), "null");
+        }
+    }
+
+    #[test]
+    fn json5_faults_are_precise() {
+        // An unterminated block comment reports its own category.
+        let error = parse_with(b"/* open", &ParseOptions::jsonc()).unwrap_err();
+        assert!(matches!(
+            error,
+            JsonError::Syntax { kind: SyntaxKind::UnterminatedComment, .. }
+        ));
+        // A lone slash is not a comment and still faults.
+        assert!(parse_with(b"/ 1", &ParseOptions::jsonc()).is_err());
+        // A doubled trailing comma is not a single trailing comma.
+        assert!(parse_with(b"[1,,]", &ParseOptions::json5()).is_err());
+        // A block comment is not opened when only line comments are enabled.
+        let line_only = ParseOptions::strict().max_depth(8);
+        let line_only = ParseOptions { allow_line_comments: true, ..line_only };
+        assert!(parse_with(b"/* x */ 1", &line_only).is_err());
+    }
+
+    #[test]
+    fn json5_view_parses_and_reserializes() {
+        // The zero-copy view accepts JSON5 too; unquoted keys serialize quoted.
+        let source = br#"{ a: 0x10, b: [1, 2,], }"#;
+        let view = view_with(source, &ParseOptions::json5()).unwrap();
+        assert_eq!(view.to_json_string(source), r#"{"a":16,"b":[1,2]}"#);
     }
 }
 
