@@ -58,7 +58,7 @@ assert_eq!(document.get(source, "nodes").and_then(|v| v.as_u64()), Some(20_000_0
   Integers keep their width as `i64` or `u64` and only fall back to `f64` when they overflow 64 bits, so values past the 2^53 float boundary survive.
 - __Strict strings.__
   Unescaped control characters, invalid `\u` escapes, and lone surrogates are rejected; surrogate pairs are combined.
-  `JsonView` keeps raw spans and validates UTF-8 on access; `Json` decodes and validates eagerly.
+  Both paths validate UTF-8 and escapes at parse time; `JsonView` then keeps the raw spans while `Json` stores the decoded strings.
 - __Fallible parsing.__
   Parsing untrusted input uses fallible allocation and returns `JsonError` rather than aborting.
   Build-from-code mutators allocate infallibly, like the standard collections.

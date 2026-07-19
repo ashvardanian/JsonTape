@@ -108,9 +108,10 @@ fn hex_value(byte: u8) -> Option<u16> {
     }
 }
 
-/// Decodes the bytes of a *validated* JSON string span, yielding the resulting
-/// UTF-8 bytes one at a time. The scanner has already checked that every escape
-/// is well-formed and every surrogate is paired, so decoding is infallible.
+/// Decodes the bytes of a JSON string span, yielding the resulting UTF-8 bytes
+/// one at a time. Every access is bounds-checked: on a malformed span the
+/// iterator stops early and sets [`malformed`](UnescapeBytes::malformed), so it
+/// never panics even on a span the scanner did not produce.
 struct UnescapeBytes<'a> {
     content: &'a [u8],
     index: usize,
@@ -119,6 +120,8 @@ struct UnescapeBytes<'a> {
     pending: [u8; 4],
     pending_len: u8,
     pending_position: u8,
+    // Set when decoding hit an escape the scanner would have rejected.
+    malformed: bool,
 }
 
 impl<'a> UnescapeBytes<'a> {
@@ -129,18 +132,20 @@ impl<'a> UnescapeBytes<'a> {
             pending: [0; 4],
             pending_len: 0,
             pending_position: 0,
+            malformed: false,
         }
     }
 
     /// Reads four hex digits starting at `self.index`, advancing past them.
-    /// Assumes the digits are present and valid, as guaranteed by the scanner.
-    fn read_hex4(&mut self) -> u16 {
+    /// Returns `None` if any are missing or not hexadecimal.
+    fn read_hex4(&mut self) -> Option<u16> {
         let mut value = 0u16;
         for _ in 0..4 {
-            value = value * 16 + hex_value(self.content[self.index]).unwrap_or(0);
+            let digit = hex_value(*self.content.get(self.index)?)?;
+            value = value * 16 + digit;
             self.index += 1;
         }
-        value
+        Some(value)
     }
 
     /// Encodes `character` into the pending buffer and returns its first byte.
@@ -151,6 +156,12 @@ impl<'a> UnescapeBytes<'a> {
         self.pending_len = encoded as u8;
         self.pending_position = 1;
         Some(self.pending[0])
+    }
+
+    /// Marks the span malformed and stops the iterator.
+    fn fail(&mut self) -> Option<u8> {
+        self.malformed = true;
+        None
     }
 }
 
@@ -170,7 +181,10 @@ impl<'a> Iterator for UnescapeBytes<'a> {
         }
         // Consume the backslash and its escape selector.
         self.index += 1;
-        let selector = self.content[self.index];
+        let selector = match self.content.get(self.index) {
+            Some(&selector) => selector,
+            None => return self.fail(),
+        };
         self.index += 1;
         match selector {
             b'"' => Some(b'"'),
@@ -182,32 +196,50 @@ impl<'a> Iterator for UnescapeBytes<'a> {
             b'r' => Some(b'\r'),
             b't' => Some(b'\t'),
             b'u' => {
-                let high = self.read_hex4();
+                let high = match self.read_hex4() {
+                    Some(high) => high,
+                    None => return self.fail(),
+                };
                 let code_point = if (0xD800..=0xDBFF).contains(&high) {
-                    // A paired low surrogate is guaranteed to follow: `\uXXXX`.
+                    // A high surrogate must be followed by `\u` and a low one.
+                    if self.content.get(self.index) != Some(&b'\\')
+                        || self.content.get(self.index + 1) != Some(&b'u')
+                    {
+                        return self.fail();
+                    }
                     self.index += 2; // skip the "\u" of the low surrogate
-                    let low = self.read_hex4();
+                    let low = match self.read_hex4() {
+                        Some(low) => low,
+                        None => return self.fail(),
+                    };
+                    if !(0xDC00..=0xDFFF).contains(&low) {
+                        return self.fail();
+                    }
                     0x10000 + (((high - 0xD800) as u32) << 10) + (low - 0xDC00) as u32
+                } else if (0xDC00..=0xDFFF).contains(&high) {
+                    return self.fail(); // lone low surrogate
                 } else {
                     high as u32
                 };
-                let character = char::from_u32(code_point).unwrap_or('\u{FFFD}');
-                self.emit_character(character)
+                match char::from_u32(code_point) {
+                    Some(character) => self.emit_character(character),
+                    None => self.fail(),
+                }
             }
-            // The scanner rejects every other escape before we get here.
-            _ => None,
+            _ => self.fail(),
         }
     }
 }
 
 /// Decodes a JSON string `span` from `source`, appending the resulting UTF-8
-/// bytes to `output`. The span must have been produced by this crate's parser,
-/// so all escapes are well-formed.
+/// bytes to `output`. Spans produced by this crate's parser are always
+/// well-formed; a hand-built or mismatched span is reported, never panicked on.
 ///
 /// # Errors
 ///
 /// Returns [`JsonError::Allocation`] if `output` cannot grow, or
-/// [`JsonError::Syntax`] if the span falls outside `source`.
+/// [`JsonError::Syntax`] if the span falls outside `source` or is not a
+/// well-formed JSON string body.
 pub fn unescape_into<A: Allocator>(
     source: &[u8],
     span: Span,
@@ -216,9 +248,13 @@ pub fn unescape_into<A: Allocator>(
     let content = span
         .bytes(source)
         .ok_or(JsonError::Syntax { offset: span.start })?;
-    for byte in UnescapeBytes::new(content) {
+    let mut decoder = UnescapeBytes::new(content);
+    for byte in decoder.by_ref() {
         output.try_reserve(1).map_err(|_| JsonError::Allocation)?;
         output.push(byte);
+    }
+    if decoder.malformed {
+        return Err(JsonError::Syntax { offset: span.start });
     }
     Ok(())
 }
@@ -477,6 +513,13 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             match self.peek() {
                 None => return self.fault(),
                 Some(b'"') => {
+                    // RFC 8259 §8.1: the text must be valid UTF-8. Escape bytes
+                    // are all ASCII, so validating the whole body catches every
+                    // ill-formed literal byte in one pass.
+                    let content = &self.source[start..self.position];
+                    if let Err(error) = core::str::from_utf8(content) {
+                        return Err(JsonError::Syntax { offset: start + error.valid_up_to() });
+                    }
                     let span = Span {
                         start,
                         len: self.position - start,
@@ -1122,7 +1165,14 @@ impl<A: Allocator> Json<A> {
             let token = raw_token.replace("~1", "/").replace("~0", "~");
             current = match current {
                 Json::Object(_) => current.get(token.as_str())?,
-                Json::Array(_) => current.get(token.parse::<usize>().ok()?)?,
+                Json::Array(_) => {
+                    // RFC 6901: an array index is `0` or `[1-9][0-9]*`; reject
+                    // leading zeros, which `usize::from_str` would accept.
+                    if token.len() > 1 && token.starts_with('0') {
+                        return None;
+                    }
+                    current.get(token.parse::<usize>().ok()?)?
+                }
                 _ => return None,
             };
         }
@@ -1518,19 +1568,21 @@ impl<A: Allocator> Lookup<A> for &str {
     }
 }
 
-impl core::ops::Index<usize> for Json<Global> {
-    type Output = Json<Global>;
-    fn index(&self, index: usize) -> &Json<Global> {
-        static NULL: Json<Global> = Json::Null;
-        self.get(index).unwrap_or(&NULL)
+// The `Null` fallback below is a promoted `&'static Json<A>`. Rvalue static
+// promotion applies because `Json` has no explicit `Drop` impl (its drop glue
+// comes only from the `Vec` fields), so this works for every allocator `A`, not
+// just `Global` — indexing a miss yields `Null` instead of panicking.
+impl<A: Allocator> core::ops::Index<usize> for Json<A> {
+    type Output = Json<A>;
+    fn index(&self, index: usize) -> &Json<A> {
+        self.get(index).unwrap_or(&Json::Null)
     }
 }
 
-impl core::ops::Index<&str> for Json<Global> {
-    type Output = Json<Global>;
-    fn index(&self, key: &str) -> &Json<Global> {
-        static NULL: Json<Global> = Json::Null;
-        self.get(key).unwrap_or(&NULL)
+impl<A: Allocator> core::ops::Index<&str> for Json<A> {
+    type Output = Json<A>;
+    fn index(&self, key: &str) -> &Json<A> {
+        self.get(key).unwrap_or(&Json::Null)
     }
 }
 
@@ -1986,13 +2038,15 @@ mod tests {
     }
 
     #[test]
-    fn view_invalid_utf8_is_lazy() {
-        // A raw 0xFF byte inside a string: the view parses, but resolving fails.
-        let source = b"\"\xff\"";
-        let document = view(source).unwrap();
-        assert!(document.as_str(source).is_none());
-        // The owned parser eagerly rejects the invalid UTF-8.
-        assert!(matches!(parse(source), Err(JsonError::Syntax { .. })));
+    fn strings_must_be_valid_utf8() {
+        // A raw 0xFF byte is rejected by both paths, in a value and in a key.
+        assert!(matches!(view(b"\"\xff\""), Err(JsonError::Syntax { .. })));
+        assert!(matches!(parse(b"\"\xff\""), Err(JsonError::Syntax { .. })));
+        assert!(matches!(view(b"{\"\xff\":1}"), Err(JsonError::Syntax { .. })));
+        // A truncated multi-byte sequence before the closing quote is rejected.
+        assert!(matches!(parse(b"\"a\xc3\""), Err(JsonError::Syntax { .. })));
+        // Well-formed multi-byte UTF-8 is accepted.
+        assert_eq!(parse("\"café\"".as_bytes()).unwrap().as_str(), Some("café"));
     }
 
     #[test]
@@ -2197,6 +2251,31 @@ mod tests {
         assert_eq!(document.pointer("/x~1y").and_then(|v| v.as_u64()), Some(1));
         assert!(document.pointer("/a/b/9").is_none());
         assert!(document.pointer("no-leading-slash").is_none());
+        // RFC 6901: array indices may not have leading zeros.
+        assert!(document.pointer("/a/b/01").is_none());
+        assert_eq!(document.pointer("/a/b/0/c").and_then(|v| v.as_u64()), Some(42));
+    }
+
+    #[test]
+    fn unescape_into_never_panics_on_bad_span() {
+        // A hand-built span the parser would never produce: a lone trailing
+        // backslash. It must be reported, not panicked on.
+        let source = b"x\\";
+        let span = Span { start: 1, len: 1 };
+        let mut output = Vec::new();
+        assert!(matches!(
+            unescape_into(source, span, &mut output),
+            Err(JsonError::Syntax { .. })
+        ));
+        // A truncated `\u` escape and a lone surrogate likewise report.
+        let mut output = Vec::new();
+        assert!(unescape_into(b"\\u12", Span { start: 0, len: 4 }, &mut output).is_err());
+        let mut output = Vec::new();
+        assert!(unescape_into(b"\\uDE00", Span { start: 0, len: 6 }, &mut output).is_err());
+        // A well-formed span still decodes cleanly.
+        let mut output = Vec::new();
+        unescape_into(b"a\\nb", Span { start: 0, len: 4 }, &mut output).unwrap();
+        assert_eq!(output.as_slice(), b"a\nb");
     }
 
     #[test]
@@ -2207,5 +2286,31 @@ mod tests {
         assert_eq!(key.len(), 8);
         assert!(key.starts_with("greet"));
         assert_eq!(key.to_string(), "greeting");
+    }
+
+    /// A distinct allocator type that just forwards to the global heap, used to
+    /// prove the ergonomics work for any allocator, not only `Global`.
+    #[derive(Clone, Copy)]
+    struct Passthrough;
+
+    unsafe impl Allocator for Passthrough {
+        fn allocate(
+            &self,
+            layout: core::alloc::Layout,
+        ) -> Result<core::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+            Global.allocate(layout)
+        }
+        unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: core::alloc::Layout) {
+            Global.deallocate(ptr, layout)
+        }
+    }
+
+    #[test]
+    fn indexing_works_for_any_allocator() {
+        let document = parse_in(br#"{"k":[1,2]}"#, Passthrough).unwrap();
+        // The infix `[]` sugar and its Null-on-miss fallback are not limited to
+        // `Json<Global>`; the `Null` sentinel promotes for every allocator.
+        assert_eq!(document["k"][1].as_u64(), Some(2));
+        assert!(document["missing"].is_null());
     }
 }
