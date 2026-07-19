@@ -468,6 +468,8 @@ enum Scalar {
     Integer(i64),
     Unsigned(u64),
     Float(f64),
+    /// An integer too wide for 64 bits, kept as its raw source span.
+    Big(Span),
 }
 
 /// Turns raw JSON tokens into a document. The parser is generic over this trait
@@ -484,6 +486,7 @@ trait DomBuilder<A: Allocator + Clone> {
     fn unsigned(value: u64) -> Self::Value;
     fn float(value: f64) -> Self::Value;
     fn string(source: &[u8], span: Span, allocator: &A) -> Result<Self::Value, JsonError>;
+    fn big_number(source: &[u8], span: Span, allocator: &A) -> Result<Self::Value, JsonError>;
     fn key(source: &[u8], span: Span, allocator: &A) -> Result<Self::Key, JsonError>;
     fn array(items: Vec<Self::Value, A>) -> Self::Value;
     fn object(entries: Vec<(Self::Key, Self::Value), A>) -> Self::Value;
@@ -581,6 +584,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             Scalar::Integer(value) => Ok(B::integer(value)),
             Scalar::Unsigned(value) => Ok(B::unsigned(value)),
             Scalar::Float(value) => Ok(B::float(value)),
+            Scalar::Big(span) => B::big_number(self.source, span, &self.allocator),
         }
     }
 
@@ -664,10 +668,11 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         } else if let Ok(value) = text.parse::<u64>() {
             return Ok(Scalar::Unsigned(value));
         }
-        // Integer too wide for its 64-bit lane; fall back to float.
-        text.parse::<f64>()
-            .map(Scalar::Float)
-            .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })
+        // Integer too wide for a 64-bit lane; keep the exact lexeme losslessly.
+        Ok(Scalar::Big(Span {
+            start,
+            len: self.position - start,
+        }))
     }
 
     /// Scans a string, validating escapes and rejecting raw control characters,
@@ -887,6 +892,8 @@ pub enum JsonView<A: Allocator = Global> {
     Unsigned(u64),
     Float(f64),
     String(Span),
+    /// An integer wider than 64 bits, kept as its raw source span.
+    BigNumber(Span),
     Array(Vec<JsonView<A>, A>),
     Object(Vec<(Span, JsonView<A>), A>),
 }
@@ -915,6 +922,9 @@ impl<A: Allocator + Clone> DomBuilder<A> for ViewBuilder {
     }
     fn string(_source: &[u8], span: Span, _allocator: &A) -> Result<JsonView<A>, JsonError> {
         Ok(JsonView::String(span))
+    }
+    fn big_number(_source: &[u8], span: Span, _allocator: &A) -> Result<JsonView<A>, JsonError> {
+        Ok(JsonView::BigNumber(span))
     }
     fn key(_source: &[u8], span: Span, _allocator: &A) -> Result<Span, JsonError> {
         Ok(span)
@@ -975,6 +985,15 @@ impl<A: Allocator> JsonView<A> {
     pub fn as_str<'s>(&self, source: &'s [u8]) -> Option<&'s str> {
         match self {
             JsonView::String(span) => span.resolve(source),
+            _ => None,
+        }
+    }
+
+    /// The exact decimal text of a big integer that overflowed 64 bits, or
+    /// `None`. Resolved against `source`.
+    pub fn as_number_str<'s>(&self, source: &'s [u8]) -> Option<&'s str> {
+        match self {
+            JsonView::BigNumber(span) => span.resolve(source),
             _ => None,
         }
     }
@@ -1183,6 +1202,8 @@ pub enum Json<A: Allocator = Global> {
     Unsigned(u64),
     Float(f64),
     String(JsonString<A>),
+    /// An integer wider than 64 bits, kept as its exact decimal text.
+    BigNumber(JsonString<A>),
     Array(Vec<Json<A>, A>),
     Object(Vec<(JsonString<A>, Json<A>), A>),
 }
@@ -1216,6 +1237,10 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
             allocator.clone(),
         )?))
     }
+    fn big_number(source: &[u8], span: Span, allocator: &A) -> Result<Json<A>, JsonError> {
+        // The number token has no escapes, so `from_span` copies it verbatim.
+        Ok(Json::BigNumber(JsonString::from_span(source, span, allocator.clone())?))
+    }
     fn key(source: &[u8], span: Span, allocator: &A) -> Result<JsonString<A>, JsonError> {
         JsonString::from_span(source, span, allocator.clone())
     }
@@ -1238,6 +1263,7 @@ impl<A: Allocator, B: Allocator> PartialEq<Json<B>> for Json<A> {
             (Json::Integer(left), Json::Integer(right)) => left == right,
             (Json::Unsigned(left), Json::Unsigned(right)) => left == right,
             (Json::Float(left), Json::Float(right)) => left == right,
+            (Json::BigNumber(left), Json::BigNumber(right)) => left == right,
             (Json::String(left), Json::String(right)) => left == right,
             (Json::Array(left), Json::Array(right)) => {
                 left.len() == right.len() && left.iter().zip(right.iter()).all(|(a, b)| a == b)
@@ -1285,6 +1311,16 @@ impl<A: Allocator> Json<A> {
             Json::Float(value) => Some(*value),
             Json::Integer(value) => Some(*value as f64),
             Json::Unsigned(value) => Some(*value as f64),
+            Json::BigNumber(number) => number.as_str().parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+
+    /// The exact decimal text of a big integer that overflowed 64 bits, or
+    /// `None`. Pair with a big-integer crate for lossless arithmetic.
+    pub fn as_number_str(&self) -> Option<&str> {
+        match self {
+            Json::BigNumber(number) => Some(number.as_str()),
             _ => None,
         }
     }
@@ -1515,6 +1551,11 @@ impl<A: Allocator> JsonView<A> {
             JsonView::Integer(value) => Ok(Json::Integer(*value)),
             JsonView::Unsigned(value) => Ok(Json::Unsigned(*value)),
             JsonView::Float(value) => Ok(Json::Float(*value)),
+            JsonView::BigNumber(span) => Ok(Json::BigNumber(JsonString::from_span(
+                source,
+                *span,
+                allocator.clone(),
+            )?)),
             JsonView::String(span) => Ok(Json::String(JsonString::from_span(
                 source,
                 *span,
@@ -1642,7 +1683,10 @@ impl<A: Allocator> Json<A> {
         matches!(self, Json::Boolean(_))
     }
     pub fn is_number(&self) -> bool {
-        matches!(self, Json::Integer(_) | Json::Unsigned(_) | Json::Float(_))
+        matches!(
+            self,
+            Json::Integer(_) | Json::Unsigned(_) | Json::Float(_) | Json::BigNumber(_)
+        )
     }
     pub fn is_string(&self) -> bool {
         matches!(self, Json::String(_))
@@ -1708,6 +1752,8 @@ impl<A: Allocator> Json<A> {
             Json::Integer(value) => write!(writer, "{value}"),
             Json::Unsigned(value) => write!(writer, "{value}"),
             Json::Float(value) => write_number(writer, *value),
+            // The lexeme is exact JSON number text; emit it verbatim.
+            Json::BigNumber(number) => writer.write_str(number.as_str()),
             Json::String(string) => write_escaped_str(writer, string.as_str()),
             Json::Array(items) => {
                 if items.is_empty() {
@@ -1860,7 +1906,10 @@ impl<A: Allocator> JsonView<A> {
         matches!(self, JsonView::Boolean(_))
     }
     pub fn is_number(&self) -> bool {
-        matches!(self, JsonView::Integer(_) | JsonView::Unsigned(_) | JsonView::Float(_))
+        matches!(
+            self,
+            JsonView::Integer(_) | JsonView::Unsigned(_) | JsonView::Float(_) | JsonView::BigNumber(_)
+        )
     }
     pub fn is_string(&self) -> bool {
         matches!(self, JsonView::String(_))
@@ -1904,6 +1953,8 @@ impl<A: Allocator> JsonView<A> {
             JsonView::Integer(value) => write!(writer, "{value}"),
             JsonView::Unsigned(value) => write!(writer, "{value}"),
             JsonView::Float(value) => write_number(writer, *value),
+            // The span is exact JSON number text; emit it verbatim.
+            JsonView::BigNumber(span) => writer.write_str(span.resolve(source).unwrap_or("")),
             JsonView::String(span) => write_raw_string(writer, source, *span),
             JsonView::Array(items) => {
                 if items.is_empty() {
@@ -2161,12 +2212,22 @@ impl<'s, A: Allocator> Resolved<'s, A> {
         self.node.as_u64()
     }
     pub fn as_f64(self) -> Option<f64> {
-        self.node.as_f64()
+        // Unlike a bare view, the cursor has `source`, so a big number can be
+        // approximated as an `f64`.
+        match self.node {
+            JsonView::BigNumber(span) => span.resolve(self.source)?.parse::<f64>().ok(),
+            _ => self.node.as_f64(),
+        }
     }
 
     /// The string value, resolved against `source` (still escaped).
     pub fn as_str(self) -> Option<&'s str> {
         self.node.as_str(self.source)
+    }
+
+    /// The exact decimal text of a big integer that overflowed 64 bits, or `None`.
+    pub fn as_number_str(self) -> Option<&'s str> {
+        self.node.as_number_str(self.source)
     }
 
     pub fn is_null(self) -> bool {
@@ -2363,6 +2424,7 @@ impl<A: Allocator> serde::Serialize for Json<A> {
             Json::Integer(value) => serializer.serialize_i64(*value),
             Json::Unsigned(value) => serializer.serialize_u64(*value),
             Json::Float(value) => serializer.serialize_f64(*value),
+            Json::BigNumber(number) => serialize_big_number(number.as_str(), serializer),
             Json::String(value) => serializer.serialize_str(value.as_str()),
             Json::Array(items) => {
                 let mut sequence = serializer.serialize_seq(Some(items.len()))?;
@@ -2379,6 +2441,21 @@ impl<A: Allocator> serde::Serialize for Json<A> {
                 map.end()
             }
         }
+    }
+}
+
+/// Serializes a big-number lexeme, preferring an exact 128-bit integer and
+/// falling back to `f64` (then a string) for anything wider.
+#[cfg(feature = "serde")]
+fn serialize_big_number<S: serde::Serializer>(lexeme: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    if let Ok(value) = lexeme.parse::<i128>() {
+        serializer.serialize_i128(value)
+    } else if let Ok(value) = lexeme.parse::<u128>() {
+        serializer.serialize_u128(value)
+    } else if let Ok(value) = lexeme.parse::<f64>() {
+        serializer.serialize_f64(value)
+    } else {
+        serializer.serialize_str(lexeme)
     }
 }
 
@@ -2404,6 +2481,9 @@ impl<'s, A: Allocator> serde::Serialize for Resolved<'s, A> {
             JsonView::Integer(value) => serializer.serialize_i64(*value),
             JsonView::Unsigned(value) => serializer.serialize_u64(*value),
             JsonView::Float(value) => serializer.serialize_f64(*value),
+            JsonView::BigNumber(span) => {
+                serialize_big_number(span.resolve(self.source).unwrap_or("0"), serializer)
+            }
             // The span is still escaped, so decode it before handing serde a
             // plain string it would otherwise escape a second time.
             JsonView::String(span) => {
@@ -2858,6 +2938,16 @@ impl<'de, A: Allocator> serde::Deserializer<'de> for &'de Json<A> {
             Json::Integer(value) => visitor.visit_i64(*value),
             Json::Unsigned(value) => visitor.visit_u64(*value),
             Json::Float(value) => visitor.visit_f64(*value),
+            Json::BigNumber(number) => {
+                let lexeme = number.as_str();
+                if let Ok(value) = lexeme.parse::<i128>() {
+                    visitor.visit_i128(value)
+                } else if let Ok(value) = lexeme.parse::<u128>() {
+                    visitor.visit_u128(value)
+                } else {
+                    visitor.visit_borrowed_str(lexeme)
+                }
+            }
             Json::String(value) => visitor.visit_borrowed_str(value.as_str()),
             Json::Array(items) => visitor.visit_seq(SeqAccess { iter: items.iter() }),
             Json::Object(entries) => visitor.visit_map(MapAccess {
@@ -3065,10 +3155,12 @@ mod tests {
             view(b"20000000000000001").unwrap().as_u64(),
             Some(20_000_000_000_000_001)
         );
-        // Wider than u64 falls back to a float.
-        let huge = view(b"99999999999999999999999999").unwrap();
-        assert!(matches!(huge, JsonView::Float(_)));
+        // Wider than u64 is preserved losslessly as a big number.
+        let source = b"99999999999999999999999999";
+        let huge = view(source).unwrap();
+        assert!(matches!(huge, JsonView::BigNumber(_)));
         assert!(huge.as_u64().is_none());
+        assert_eq!(huge.as_number_str(source), Some("99999999999999999999999999"));
     }
 
     #[test]
@@ -3604,6 +3696,36 @@ mod tests {
         assert!(parse_with(source, &ParseOptions::default().max_depth(2)).is_err());
         assert!(parse_with(source, &ParseOptions::default().max_depth(10)).is_ok());
     }
+
+    #[test]
+    fn big_numbers_are_preserved_losslessly() {
+        // A 30-digit integer overflows u64 and is kept as its exact text.
+        let source = b"123456789012345678901234567890";
+        let owned = parse(source).unwrap();
+        assert!(matches!(owned, Json::BigNumber(_)));
+        assert!(owned.is_number());
+        assert!(owned.as_u64().is_none());
+        assert_eq!(owned.as_number_str(), Some("123456789012345678901234567890"));
+        // Serializing round-trips the exact digits.
+        assert_eq!(owned.to_string(), "123456789012345678901234567890");
+        let reparsed = parse(owned.to_string().as_bytes()).unwrap();
+        assert_eq!(owned, reparsed);
+
+        // The view keeps the raw span; the cursor resolves the text and an f64.
+        let view = view(source).unwrap();
+        assert_eq!(view.as_number_str(source), Some("123456789012345678901234567890"));
+        assert_eq!(view.to_json_string(source), "123456789012345678901234567890");
+        assert!(view.bind(source).as_f64().unwrap() > 1.2e29);
+
+        // A negative overflow stays a big number too.
+        assert!(matches!(
+            parse(b"-99999999999999999999999999999").unwrap(),
+            Json::BigNumber(_)
+        ));
+        // In-range integers keep their narrow lanes.
+        assert!(matches!(parse(b"42").unwrap(), Json::Unsigned(42)));
+        assert!(matches!(parse(b"-42").unwrap(), Json::Integer(-42)));
+    }
 }
 
 #[cfg(all(test, feature = "serde"))]
@@ -3700,5 +3822,16 @@ mod serde_tests {
         let json = parse(br#"{"s":"hello"}"#).unwrap();
         let borrowed: Borrowed = from_value(&json).unwrap();
         assert_eq!(borrowed.s, "hello");
+    }
+
+    #[test]
+    fn big_number_serializes_as_a_json_number() {
+        // Overflows u64 but fits u128, so serde_json emits it as a lossless
+        // number, not a string.
+        let document = parse(b"123456789012345678901234567890").unwrap();
+        assert_eq!(
+            serde_json::to_string(&document).unwrap(),
+            "123456789012345678901234567890"
+        );
     }
 }
