@@ -109,6 +109,8 @@ pub enum SyntaxKind {
     ControlCharacter,
     /// Nesting exceeded the configured depth limit.
     DepthExceeded,
+    /// An object repeated a key under [`DuplicateKeys::Reject`].
+    DuplicateKey,
 }
 
 impl SyntaxKind {
@@ -125,6 +127,7 @@ impl SyntaxKind {
             SyntaxKind::InvalidUtf8 => "invalid UTF-8",
             SyntaxKind::ControlCharacter => "unescaped control character",
             SyntaxKind::DepthExceeded => "nesting too deep",
+            SyntaxKind::DuplicateKey => "duplicate object key",
         }
     }
 }
@@ -184,8 +187,57 @@ impl std::error::Error for JsonError {}
 #[cfg(all(feature = "serde", not(feature = "std")))]
 impl serde::ser::StdError for JsonError {}
 
-/// Guards against stack exhaustion on adversarially nested input.
+/// Default nesting limit, guarding against stack exhaustion on adversarial input.
 const MAX_DEPTH: u32 = 128;
+
+/// How to handle repeated keys within a single object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DuplicateKeys {
+    /// Keep the last value for a repeated key, in the first key's position.
+    /// This is the default and matches `serde_json`.
+    LastWins,
+    /// Keep the first value for a repeated key and ignore later ones.
+    FirstWins,
+    /// Reject any object containing a repeated key.
+    Reject,
+    /// Keep every occurrence, so lookups see the first and iteration sees all.
+    KeepAll,
+}
+
+/// Knobs for a parse: the nesting limit and the duplicate-key policy. Build one
+/// from [`ParseOptions::default`] and adjust, then pass it to a `*_with` parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParseOptions {
+    /// The maximum container nesting depth. Defaults to 128.
+    pub max_depth: u32,
+    /// How repeated object keys are handled. Defaults to [`DuplicateKeys::LastWins`].
+    pub duplicate_keys: DuplicateKeys,
+}
+
+impl Default for ParseOptions {
+    fn default() -> Self {
+        ParseOptions {
+            max_depth: MAX_DEPTH,
+            duplicate_keys: DuplicateKeys::LastWins,
+        }
+    }
+}
+
+impl ParseOptions {
+    /// Sets the maximum nesting depth.
+    pub fn max_depth(mut self, max_depth: u32) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+
+    /// Sets the duplicate-key policy.
+    pub fn duplicate_keys(mut self, policy: DuplicateKeys) -> Self {
+        self.duplicate_keys = policy;
+        self
+    }
+}
 
 /// Maps a single ASCII hex digit to its value, or `None` if it is not one.
 fn hex_value(byte: u8) -> Option<u16> {
@@ -435,6 +487,8 @@ trait DomBuilder<A: Allocator + Clone> {
     fn key(source: &[u8], span: Span, allocator: &A) -> Result<Self::Key, JsonError>;
     fn array(items: Vec<Self::Value, A>) -> Self::Value;
     fn object(entries: Vec<(Self::Key, Self::Value), A>) -> Self::Value;
+    /// Whether two object keys decode to the same string, for duplicate handling.
+    fn keys_equal(source: &[u8], left: &Self::Key, right: &Self::Key) -> bool;
 }
 
 struct Parser<'a, A: Allocator + Clone, B: DomBuilder<A>> {
@@ -442,16 +496,18 @@ struct Parser<'a, A: Allocator + Clone, B: DomBuilder<A>> {
     position: usize,
     depth: u32,
     allocator: A,
+    options: ParseOptions,
     _builder: PhantomData<B>,
 }
 
 impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
-    fn new(source: &'a [u8], allocator: A) -> Self {
+    fn new(source: &'a [u8], allocator: A, options: ParseOptions) -> Self {
         Parser {
             source,
             position: 0,
             depth: 0,
             allocator,
+            options,
             _builder: PhantomData,
         }
     }
@@ -703,7 +759,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 
     fn array(&mut self) -> Result<B::Value, JsonError> {
         self.depth += 1;
-        if self.depth > MAX_DEPTH {
+        if self.depth > self.options.max_depth {
             return self.fault_kind(SyntaxKind::DepthExceeded);
         }
         self.position += 1; // opening bracket
@@ -734,7 +790,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 
     fn object(&mut self) -> Result<B::Value, JsonError> {
         self.depth += 1;
-        if self.depth > MAX_DEPTH {
+        if self.depth > self.options.max_depth {
             return self.fault_kind(SyntaxKind::DepthExceeded);
         }
         self.position += 1; // opening brace
@@ -758,7 +814,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
             self.position += 1;
             let value = self.value()?;
-            self.try_push(&mut entries, (key, value))?;
+            self.insert_entry(&mut entries, key, value)?;
             self.skip_whitespace();
             match self.peek() {
                 Some(b',') => self.position += 1,
@@ -778,6 +834,32 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         items.try_reserve(1).map_err(|_| JsonError::Allocation)?;
         items.push(item);
         Ok(())
+    }
+
+    /// Adds a key/value pair to an object under the configured duplicate policy.
+    /// The scan is linear, so a large object with the non-`KeepAll` policies is
+    /// O(n^2); objects are usually small.
+    fn insert_entry(
+        &self,
+        entries: &mut Vec<(B::Key, B::Value), A>,
+        key: B::Key,
+        value: B::Value,
+    ) -> Result<(), JsonError> {
+        if self.options.duplicate_keys != DuplicateKeys::KeepAll {
+            if let Some(index) = entries
+                .iter()
+                .position(|(existing, _)| B::keys_equal(self.source, existing, &key))
+            {
+                match self.options.duplicate_keys {
+                    DuplicateKeys::LastWins => entries[index].1 = value,
+                    DuplicateKeys::FirstWins => {}
+                    DuplicateKeys::Reject => return self.fault_kind(SyntaxKind::DuplicateKey),
+                    DuplicateKeys::KeepAll => unreachable!(),
+                }
+                return Ok(());
+            }
+        }
+        self.try_push(entries, (key, value))
     }
 }
 
@@ -842,6 +924,9 @@ impl<A: Allocator + Clone> DomBuilder<A> for ViewBuilder {
     }
     fn object(entries: Vec<(Span, JsonView<A>), A>) -> JsonView<A> {
         JsonView::Object(entries)
+    }
+    fn keys_equal(source: &[u8], left: &Span, right: &Span) -> bool {
+        escaped_span_compare(source, *left, *right) == Ordering::Equal
     }
 }
 
@@ -1139,6 +1224,9 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
     }
     fn object(entries: Vec<(JsonString<A>, Json<A>), A>) -> Json<A> {
         Json::Object(entries)
+    }
+    fn keys_equal(_source: &[u8], left: &JsonString<A>, right: &JsonString<A>) -> bool {
+        left == right
     }
 }
 
@@ -2200,13 +2288,28 @@ impl<'s, A: Allocator> fmt::Display for Resolved<'s, A> {
     }
 }
 
+/// Parses `source` into an immutable [`JsonView`] allocated in `allocator`,
+/// under `options`. Spans in the result are offsets into `source`.
+pub fn view_in_with<A: Allocator + Clone>(
+    source: &[u8],
+    allocator: A,
+    options: &ParseOptions,
+) -> Result<JsonView<A>, JsonError> {
+    Parser::<A, ViewBuilder>::new(source, allocator, *options).parse_document()
+}
+
 /// Parses `source` into an immutable [`JsonView`] allocated in `allocator`.
 /// Spans in the result are offsets into `source`, so keep `source` alive.
 pub fn view_in<A: Allocator + Clone>(
     source: &[u8],
     allocator: A,
 ) -> Result<JsonView<A>, JsonError> {
-    Parser::<A, ViewBuilder>::new(source, allocator).parse_document()
+    view_in_with(source, allocator, &ParseOptions::default())
+}
+
+/// Parses `source` into an immutable [`JsonView`] on the global heap under `options`.
+pub fn view_with(source: &[u8], options: &ParseOptions) -> Result<JsonView<Global>, JsonError> {
+    view_in_with(source, Global, options)
 }
 
 /// Parses `source` into an immutable [`JsonView`] on the global heap.
@@ -2215,12 +2318,27 @@ pub fn view(source: &[u8]) -> Result<JsonView<Global>, JsonError> {
 }
 
 /// Parses `source` into an owned, mutable [`Json`] allocated in `allocator`,
+/// under `options`. The result borrows nothing from `source`.
+pub fn parse_in_with<A: Allocator + Clone>(
+    source: &[u8],
+    allocator: A,
+    options: &ParseOptions,
+) -> Result<Json<A>, JsonError> {
+    Parser::<A, OwnedBuilder>::new(source, allocator, *options).parse_document()
+}
+
+/// Parses `source` into an owned, mutable [`Json`] allocated in `allocator`,
 /// decoding every string's escapes. The result borrows nothing from `source`.
 pub fn parse_in<A: Allocator + Clone>(
     source: &[u8],
     allocator: A,
 ) -> Result<Json<A>, JsonError> {
-    Parser::<A, OwnedBuilder>::new(source, allocator).parse_document()
+    parse_in_with(source, allocator, &ParseOptions::default())
+}
+
+/// Parses `source` into an owned, mutable [`Json`] on the global heap under `options`.
+pub fn parse_with(source: &[u8], options: &ParseOptions) -> Result<Json<Global>, JsonError> {
+    parse_in_with(source, Global, options)
 }
 
 /// Parses `source` into an owned, mutable [`Json`] on the global heap.
@@ -3450,6 +3568,41 @@ mod tests {
         // `Json<Global>`; the `Null` sentinel promotes for every allocator.
         assert_eq!(document["k"][1].as_u64(), Some(2));
         assert!(document["missing"].is_null());
+    }
+
+    #[test]
+    fn duplicate_key_policies() {
+        let source = br#"{"a":1,"a":2,"b":3}"#;
+        // Default is last-wins, in the first key's position.
+        assert_eq!(parse(source).unwrap().get("a").and_then(|v| v.as_u64()), Some(2));
+
+        let first =
+            parse_with(source, &ParseOptions::default().duplicate_keys(DuplicateKeys::FirstWins)).unwrap();
+        assert_eq!(first.get("a").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(first.len(), 2);
+
+        assert!(matches!(
+            parse_with(source, &ParseOptions::default().duplicate_keys(DuplicateKeys::Reject)),
+            Err(JsonError::Syntax { kind: SyntaxKind::DuplicateKey, .. })
+        ));
+
+        let all =
+            parse_with(source, &ParseOptions::default().duplicate_keys(DuplicateKeys::KeepAll)).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all.get("a").and_then(|v| v.as_u64()), Some(1));
+
+        // The view path detects duplicates across escape forms: a == "a".
+        let escaped = br#"{"a":1,"\u0061":2}"#;
+        let document = view_with(escaped, &ParseOptions::default()).unwrap();
+        assert_eq!(document.len(), 1);
+        assert_eq!(document.get(escaped, "a").and_then(|v| v.as_u64()), Some(2));
+    }
+
+    #[test]
+    fn max_depth_option() {
+        let source = b"[[[[1]]]]";
+        assert!(parse_with(source, &ParseOptions::default().max_depth(2)).is_err());
+        assert!(parse_with(source, &ParseOptions::default().max_depth(10)).is_ok());
     }
 }
 
