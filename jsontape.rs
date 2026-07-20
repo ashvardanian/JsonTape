@@ -83,10 +83,10 @@ use allocator_api2::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
-#[cfg(feature = "std")]
-use std::borrow::Cow;
 #[cfg(not(feature = "std"))]
 use alloc::borrow::Cow;
+#[cfg(feature = "std")]
+use std::borrow::Cow;
 
 /// A span into the source bytes: a byte offset and a length. String values and
 /// object keys are stored this way, undecoded, so parsing copies nothing.
@@ -474,8 +474,8 @@ fn hex4_at(bytes: &[u8], start: usize) -> Option<u16> {
     Some(value)
 }
 
-/// A private set of all possible byte values. The representation maps directly
-/// to StringZilla's byte-mask search API while staying dependency-free today.
+/// A private set of all possible byte values, held as a 256-bit bitmap. Scans
+/// stop on the first byte in the set via [`ByteMask::find_in`].
 #[derive(Clone, Copy)]
 struct ByteMask([u64; 4]);
 
@@ -511,38 +511,29 @@ impl ByteMask {
     const fn contains(self, byte: u8) -> bool {
         self.0[(byte / 64) as usize] & (1u64 << (byte % 64)) != 0
     }
-}
 
-/// Private byte-search seam for scanner hot paths. The two operations mirror
-/// `strcspn`/`strspn`: `find_first` stops on the first byte in the set, and
-/// `find_first_absent` stops on the first byte outside it. A SIMD backend maps
-/// them onto its byte-set search directly.
-trait ByteSearch {
-    fn find_first(bytes: &[u8], mask: ByteMask) -> Option<usize>;
-    fn find_first_absent(bytes: &[u8], mask: ByteMask) -> Option<usize>;
-}
-
-struct PortableSearch;
-
-impl ByteSearch for PortableSearch {
+    /// Position of the first byte of `bytes` that is in this set, or `None`.
+    /// Used to stop a scan on a string or comment terminator.
     #[inline]
-    fn find_first(bytes: &[u8], mask: ByteMask) -> Option<usize> {
-        bytes.iter().position(|&byte| mask.contains(byte))
-    }
-
-    #[inline]
-    fn find_first_absent(bytes: &[u8], mask: ByteMask) -> Option<usize> {
-        bytes.iter().position(|&byte| !mask.contains(byte))
+    fn find_in(self, bytes: &[u8]) -> Option<usize> {
+        bytes.iter().position(|&byte| self.contains(byte))
     }
 }
 
-type ActiveSearch = PortableSearch;
+/// Finds the first occurrence of the fixed `needle` substring in `bytes`. Used
+/// for the block-comment terminator `*/`; the "skip while in set" direction stays
+/// a scalar scan in `advance_while`, and "stop on first byte in set" is
+/// [`ByteMask::find_in`].
+#[inline]
+fn find_subslice(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len() > bytes.len() {
+        return None;
+    }
+    bytes.windows(needle.len()).position(|window| window == needle)
+}
 
 const LINE_BREAKS: ByteMask = ByteMask::with(b'\n').union(ByteMask::with(b'\r'));
-const WHITESPACE: ByteMask = ByteMask::with(b' ')
-    .union(ByteMask::with(b'\t'))
-    .union(LINE_BREAKS);
-const ASTERISK: ByteMask = ByteMask::with(b'*');
+const WHITESPACE: ByteMask = ByteMask::with(b' ').union(ByteMask::with(b'\t')).union(LINE_BREAKS);
 const BACKSLASH: ByteMask = ByteMask::with(b'\\');
 const ASCII_CONTROLS: ByteMask = ByteMask::ascii_range(0, 0x1f);
 const DECIMAL_DIGITS: ByteMask = ByteMask::ascii_range(b'0', b'9');
@@ -741,11 +732,7 @@ impl<'a> Iterator for UnescapeBytes<'a> {
 /// Returns [`JsonError::Allocation`] if `output` cannot grow, or
 /// [`JsonError::Syntax`] if the span falls outside `source` or is not a
 /// well-formed JSON string body.
-pub fn unescape_into<A: Allocator>(
-    source: &[u8],
-    span: Span,
-    output: &mut Vec<u8, A>,
-) -> Result<(), JsonError> {
+pub fn unescape_into<A: Allocator>(source: &[u8], span: Span, output: &mut Vec<u8, A>) -> Result<(), JsonError> {
     let content = span.bytes(source).ok_or(JsonError::Syntax {
         offset: span.start,
         kind: SyntaxKind::InvalidString,
@@ -753,9 +740,7 @@ pub fn unescape_into<A: Allocator>(
     validate_string_body(content, span.start)?;
     // Decoding only collapses escapes, so the escaped length is an upper bound —
     // reserve once and push without a per-byte check.
-    output
-        .try_reserve(content.len())
-        .map_err(|_| JsonError::Allocation)?;
+    output.try_reserve(content.len()).map_err(|_| JsonError::Allocation)?;
     // Fast path: an escape-free string is copied verbatim.
     if !content.contains(&b'\\') {
         output.extend_from_slice(content);
@@ -779,14 +764,17 @@ pub fn unescape_into<A: Allocator>(
 /// this public function also accepts caller-provided spans.
 fn validate_string_body(content: &[u8], offset: usize) -> Result<(), JsonError> {
     if core::str::from_utf8(content).is_err() {
-        return Err(JsonError::Syntax { offset, kind: SyntaxKind::InvalidUtf8 });
+        return Err(JsonError::Syntax {
+            offset,
+            kind: SyntaxKind::InvalidUtf8,
+        });
     }
     // The same interesting set the parser's string scanner uses, minus the
     // delimiter: skip ordinary runs and stop only on a backslash or a control.
     let stops = BACKSLASH.union(ASCII_CONTROLS);
     let mut index = 0;
     while index < content.len() {
-        match ActiveSearch::find_first(&content[index..], stops) {
+        match stops.find_in(&content[index..]) {
             None => break,
             Some(run) => index += run,
         }
@@ -924,18 +912,30 @@ pub struct FormatOptions {
 impl FormatOptions {
     /// Compact output: no newlines and no spaces around `,` or `:`.
     pub const fn compact() -> Self {
-        Self { indent: None, max_width: None, comments: false }
+        Self {
+            indent: None,
+            max_width: None,
+            comments: false,
+        }
     }
 
     /// Indented output at two spaces per nesting level, always expanded.
     pub const fn pretty() -> Self {
-        Self { indent: Some(Indent::Spaces(2)), max_width: None, comments: false }
+        Self {
+            indent: Some(Indent::Spaces(2)),
+            max_width: None,
+            comments: false,
+        }
     }
 
     /// Two-space indentation that keeps a container on one line while it fits
     /// within `columns`, wrapping to one element per line only when it does not.
     pub const fn pretty_width(columns: usize) -> Self {
-        Self { indent: Some(Indent::Spaces(2)), max_width: Some(columns), comments: false }
+        Self {
+            indent: Some(Indent::Spaces(2)),
+            max_width: Some(columns),
+            comments: false,
+        }
     }
 
     /// Sets the indentation, returning the updated options.
@@ -1159,9 +1159,7 @@ fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) ->
 }
 
 /// The comment list of a container body, empty when there is no trivia.
-fn trivia_comments<A: Allocator>(
-    trivia: &Option<Box<TriviaBlock<A>, A>>,
-) -> &[AnchoredComment<A>] {
+fn trivia_comments<A: Allocator>(trivia: &Option<Box<TriviaBlock<A>, A>>) -> &[AnchoredComment<A>] {
     match trivia {
         Some(block) => &block.comments,
         None => &[],
@@ -1189,9 +1187,7 @@ fn write_leading_comments<W: fmt::Write, A: Allocator>(
     indent: Indent,
     depth: usize,
 ) -> Result<usize, fmt::Error> {
-    while cursor < comments.len()
-        && comments[cursor].anchor == anchor
-        && comments[cursor].slot == CommentSlot::Leading
+    while cursor < comments.len() && comments[cursor].anchor == anchor && comments[cursor].slot == CommentSlot::Leading
     {
         write_indent(writer, indent, depth)?;
         write_comment(writer, &comments[cursor].comment)?;
@@ -1208,9 +1204,7 @@ fn write_trailing_comments<W: fmt::Write, A: Allocator>(
     mut cursor: usize,
     anchor: u32,
 ) -> Result<usize, fmt::Error> {
-    while cursor < comments.len()
-        && comments[cursor].anchor == anchor
-        && comments[cursor].slot == CommentSlot::Trailing
+    while cursor < comments.len() && comments[cursor].anchor == anchor && comments[cursor].slot == CommentSlot::Trailing
     {
         writer.write_char(' ')?;
         write_comment(writer, &comments[cursor].comment)?;
@@ -1295,10 +1289,7 @@ trait DomBuilder<A: Allocator + Clone> {
     fn big_number(source: &[u8], span: Span, allocator: &A) -> Result<Self::Value, JsonError>;
     fn key(source: &[u8], span: Span, allocator: &A) -> Result<Self::Key, JsonError>;
     fn array(items: Vec<Self::Value, A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Self::Value;
-    fn object(
-        entries: Vec<(Self::Key, Self::Value), A>,
-        trivia: Option<Box<TriviaBlock<A>, A>>,
-    ) -> Self::Value;
+    fn object(entries: Vec<(Self::Key, Self::Value), A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Self::Value;
     /// Orders two object keys by their decoded bytes, for duplicate handling.
     fn key_compare(source: &[u8], left: &Self::Key, right: &Self::Key) -> Ordering;
 }
@@ -1409,15 +1400,19 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             .copied()
     }
 
-    /// Advances through the maximal byte run accepted by `mask`.
-    ///
-    /// Scanner states use this as their one transition from an ordinary run to
-    /// an interesting byte, leaving the concrete search backend private.
+    /// Advances through the maximal byte run accepted by `mask` with a plain
+    /// scalar scan. Every such run in real JSON — a number's digits, an
+    /// identifier, a run of indentation whitespace — is short, so a scalar scan
+    /// is the right tool; the contrasting "find the terminator" direction is
+    /// [`ByteMask::find_in`].
     #[inline]
     fn advance_while(&mut self, mask: ByteMask) {
         let remaining = &self.source[self.position..];
-        self.position += ActiveSearch::find_first_absent(remaining, mask)
+        let run = remaining
+            .iter()
+            .position(|&byte| !mask.contains(byte))
             .unwrap_or(remaining.len());
+        self.position += run;
     }
 
     /// Skips insignificant whitespace, and — when the matching options are
@@ -1430,8 +1425,12 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             // the next one.
             let whitespace_start = self.position;
             self.advance_while(WHITESPACE);
-            if ActiveSearch::find_first(&self.source[whitespace_start..self.position], LINE_BREAKS)
-                .is_some()
+            // The newline flag only matters for comment classification, so re-scan
+            // the skipped run for a line break only when collecting comments.
+            if self.collecting_comments()
+                && self.source[whitespace_start..self.position]
+                    .iter()
+                    .any(|&byte| LINE_BREAKS.contains(byte))
             {
                 self.broke = true;
             }
@@ -1441,37 +1440,29 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         let text_start = self.position + 2;
                         self.position += 2;
                         let remaining = &self.source[self.position..];
-                        self.position += ActiveSearch::find_first(remaining, LINE_BREAKS)
-                            .unwrap_or(remaining.len());
+                        self.position += LINE_BREAKS.find_in(remaining).unwrap_or(remaining.len());
                         self.record_comment(text_start, self.position, CommentStyle::Line)?;
                     }
                     Some(b'*') if self.options.allow_block_comments => {
                         let comment_start = self.position;
                         let text_start = self.position + 2;
                         self.position += 2;
-                        loop {
-                            let remaining = &self.source[self.position..];
-                            let Some(relative_star) = ActiveSearch::find_first(remaining, ASTERISK) else {
-                                self.check_limit(
-                                    self.position.saturating_sub(text_start).saturating_add(remaining.len()),
-                                    self.options.limits.max_comment_bytes,
-                                )?;
+                        // One substring search finds the `*/` terminator.
+                        let remaining = &self.source[self.position..];
+                        match find_subslice(remaining, b"*/") {
+                            Some(offset) => {
+                                self.check_limit(offset, self.options.limits.max_comment_bytes)?;
+                                let text_end = self.position + offset;
+                                self.record_comment(text_start, text_end, CommentStyle::Block)?;
+                                self.position = text_end + 2;
+                            }
+                            None => {
+                                self.check_limit(remaining.len(), self.options.limits.max_comment_bytes)?;
                                 return Err(JsonError::Syntax {
                                     offset: comment_start,
                                     kind: SyntaxKind::UnterminatedComment,
                                 });
-                            };
-                            self.check_limit(
-                                self.position.saturating_sub(text_start).saturating_add(relative_star),
-                                self.options.limits.max_comment_bytes,
-                            )?;
-                            self.position += relative_star;
-                            if self.peek_at(1) == Some(b'/') {
-                                self.record_comment(text_start, self.position, CommentStyle::Block)?;
-                                self.position += 2;
-                                break;
                             }
-                            self.position += 1;
                         }
                     }
                     _ => return Ok(()),
@@ -1484,24 +1475,17 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     /// Records a scanned comment's text span into `pending`, if this parse is
     /// collecting comments. Best-effort fallible allocation, like the rest of the
     /// parse path.
-    fn record_comment(
-        &mut self,
-        start: usize,
-        end: usize,
-        style: CommentStyle,
-    ) -> Result<(), JsonError> {
-        self.check_limit(
-            end.saturating_sub(start),
-            self.options.limits.max_comment_bytes,
-        )?;
+    fn record_comment(&mut self, start: usize, end: usize, style: CommentStyle) -> Result<(), JsonError> {
+        self.check_limit(end.saturating_sub(start), self.options.limits.max_comment_bytes)?;
         if !self.collecting_comments() {
             return Ok(());
         }
-        self.pending
-            .try_reserve(1)
-            .map_err(|_| JsonError::Allocation)?;
+        self.pending.try_reserve(1).map_err(|_| JsonError::Allocation)?;
         self.pending.push(PendingComment {
-            span: Span { start, len: end - start },
+            span: Span {
+                start,
+                len: end - start,
+            },
             style,
             broke: self.broke,
         });
@@ -1513,11 +1497,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     /// newline before it, or one seen before any element, leads element `index`;
     /// otherwise it trails element `index - 1`. `index == len` at the closer makes
     /// the leftover comments the tail before the closing bracket.
-    fn drain_pending(
-        &mut self,
-        index: usize,
-        trivia: &mut Option<Box<TriviaBlock<A>, A>>,
-    ) -> Result<(), JsonError> {
+    fn drain_pending(&mut self, index: usize, trivia: &mut Option<Box<TriviaBlock<A>, A>>) -> Result<(), JsonError> {
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -1535,17 +1515,13 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 text: JsonString::from_bytes_in(bytes, self.allocator.clone()),
             };
             if trivia.is_none() {
-                let block = TriviaBlock { comments: Vec::new_in(self.allocator.clone()) };
-                *trivia = Some(
-                    Box::try_new_in(block, self.allocator.clone())
-                        .map_err(|_| JsonError::Allocation)?,
-                );
+                let block = TriviaBlock {
+                    comments: Vec::new_in(self.allocator.clone()),
+                };
+                *trivia = Some(Box::try_new_in(block, self.allocator.clone()).map_err(|_| JsonError::Allocation)?);
             }
             let block = trivia.as_mut().expect("just set");
-            block
-                .comments
-                .try_reserve(1)
-                .map_err(|_| JsonError::Allocation)?;
+            block.comments.try_reserve(1).map_err(|_| JsonError::Allocation)?;
             block.comments.push(AnchoredComment { anchor, slot, comment });
         }
         Ok(())
@@ -1592,11 +1568,22 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             };
 
             match frame {
-                ParseFrame::Array { state: ArrayState::FirstValueOrEnd | ArrayState::ValueRequired, .. } => {
+                ParseFrame::Array {
+                    state: ArrayState::FirstValueOrEnd | ArrayState::ValueRequired,
+                    ..
+                } => {
                     self.skip_trivia()?;
-                    let permits_end = matches!(frames.last(), Some(ParseFrame::Array { state: ArrayState::FirstValueOrEnd, .. }));
+                    let permits_end = matches!(
+                        frames.last(),
+                        Some(ParseFrame::Array {
+                            state: ArrayState::FirstValueOrEnd,
+                            ..
+                        })
+                    );
                     let frame = frames.last_mut().expect("checked above");
-                    let ParseFrame::Array { items, trivia, .. } = frame else { unreachable!() };
+                    let ParseFrame::Array { items, trivia, .. } = frame else {
+                        unreachable!()
+                    };
                     self.drain_pending(items.len(), trivia)?;
                     if permits_end && self.peek() == Some(b']') {
                         self.position += 1;
@@ -1605,7 +1592,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         need_value = true;
                     }
                 }
-                ParseFrame::Array { state: ArrayState::DelimiterOrEnd, .. } => {
+                ParseFrame::Array {
+                    state: ArrayState::DelimiterOrEnd,
+                    ..
+                } => {
                     self.skip_trivia()?;
                     match self.peek() {
                         Some(b',') => {
@@ -1630,11 +1620,22 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         _ => return self.fault(),
                     }
                 }
-                ParseFrame::Object { state: ObjectState::FirstKeyOrEnd | ObjectState::KeyRequired, .. } => {
+                ParseFrame::Object {
+                    state: ObjectState::FirstKeyOrEnd | ObjectState::KeyRequired,
+                    ..
+                } => {
                     self.skip_trivia()?;
-                    let permits_end = matches!(frames.last(), Some(ParseFrame::Object { state: ObjectState::FirstKeyOrEnd, .. }));
+                    let permits_end = matches!(
+                        frames.last(),
+                        Some(ParseFrame::Object {
+                            state: ObjectState::FirstKeyOrEnd,
+                            ..
+                        })
+                    );
                     let frame = frames.last_mut().expect("checked above");
-                    let ParseFrame::Object { entries, trivia, .. } = frame else { unreachable!() };
+                    let ParseFrame::Object { entries, trivia, .. } = frame else {
+                        unreachable!()
+                    };
                     self.drain_pending(entries.len(), trivia)?;
                     if permits_end && self.peek() == Some(b'}') {
                         self.position += 1;
@@ -1644,8 +1645,12 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     let key_span = match self.peek() {
                         Some(b'"') => self.scan_string(b'"')?,
                         Some(b'\'') if self.options.allow_single_quotes => self.scan_string(b'\'')?,
-                        Some(byte) if self.options.allow_unquoted_keys
-                            && (byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$') => self.scan_identifier()?,
+                        Some(byte)
+                            if self.options.allow_unquoted_keys
+                                && (byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$') =>
+                        {
+                            self.scan_identifier()?
+                        }
                         None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
                         _ => return self.fault(),
                     };
@@ -1655,7 +1660,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         *state = ObjectState::ColonRequired;
                     }
                 }
-                ParseFrame::Object { state: ObjectState::ColonRequired, .. } => {
+                ParseFrame::Object {
+                    state: ObjectState::ColonRequired,
+                    ..
+                } => {
                     self.skip_trivia()?;
                     if self.peek() != Some(b':') {
                         return self.fault();
@@ -1665,8 +1673,14 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         *state = ObjectState::ValueRequired;
                     }
                 }
-                ParseFrame::Object { state: ObjectState::ValueRequired, .. } => need_value = true,
-                ParseFrame::Object { state: ObjectState::DelimiterOrEnd, .. } => {
+                ParseFrame::Object {
+                    state: ObjectState::ValueRequired,
+                    ..
+                } => need_value = true,
+                ParseFrame::Object {
+                    state: ObjectState::DelimiterOrEnd,
+                    ..
+                } => {
                     self.skip_trivia()?;
                     match self.peek() {
                         Some(b',') => {
@@ -1739,7 +1753,9 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     fn scalar_value(&mut self) -> Result<B::Value, JsonError> {
         match self.peek() {
             Some(b'"') => B::string(self.source, self.scan_string(b'"')?, &self.allocator),
-            Some(b'\'') if self.options.allow_single_quotes => B::string(self.source, self.scan_string(b'\'')?, &self.allocator),
+            Some(b'\'') if self.options.allow_single_quotes => {
+                B::string(self.source, self.scan_string(b'\'')?, &self.allocator)
+            }
             Some(b't') => self.expect_literal(b"true").map(|_| B::boolean(true)),
             Some(b'f') => self.expect_literal(b"false").map(|_| B::boolean(false)),
             Some(b'n') => self.expect_literal(b"null").map(|_| B::null()),
@@ -1764,7 +1780,9 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 self.try_push(items, value)?;
                 *state = ArrayState::DelimiterOrEnd;
             }
-            Some(ParseFrame::Object { entries, key, state, .. }) => {
+            Some(ParseFrame::Object {
+                entries, key, state, ..
+            }) => {
                 self.broke = false;
                 let key = key.take().expect("object value follows a key");
                 self.try_push(entries, (key, value))?;
@@ -1784,12 +1802,18 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         let value = match &mut frame {
             ParseFrame::Array { items, trivia, .. } => {
                 self.drain_pending(items.len(), trivia)?;
-                B::array(core::mem::replace(items, Vec::new_in(self.allocator.clone())), trivia.take())
+                B::array(
+                    core::mem::replace(items, Vec::new_in(self.allocator.clone())),
+                    trivia.take(),
+                )
             }
             ParseFrame::Object { entries, trivia, .. } => {
                 self.drain_pending(entries.len(), trivia)?;
                 self.dedup_object(entries)?;
-                B::object(core::mem::replace(entries, Vec::new_in(self.allocator.clone())), trivia.take())
+                B::object(
+                    core::mem::replace(entries, Vec::new_in(self.allocator.clone())),
+                    trivia.take(),
+                )
             }
         };
         self.depth = self.depth.checked_sub(1).expect("a closed frame has entered depth");
@@ -1855,10 +1879,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
 
         // Hexadecimal integer: `0x` or `0X` followed by hex digits.
-        if self.options.allow_hex_numbers
-            && self.peek() == Some(b'0')
-            && matches!(self.peek_at(1), Some(b'x' | b'X'))
-        {
+        if self.options.allow_hex_numbers && self.peek() == Some(b'0') && matches!(self.peek_at(1), Some(b'x' | b'X')) {
             return self.scan_hex_integer(start, negative);
         }
 
@@ -1929,12 +1950,16 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 
         let token = &self.source[start..self.position];
         // The token is all ASCII, so this never fails.
-        let text = core::str::from_utf8(token).map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })?;
+        let text = core::str::from_utf8(token).map_err(|_| JsonError::Syntax {
+            offset: start,
+            kind: SyntaxKind::InvalidNumber,
+        })?;
 
         if is_float {
-            let value = text
-                .parse::<f64>()
-                .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })?;
+            let value = text.parse::<f64>().map_err(|_| JsonError::Syntax {
+                offset: start,
+                kind: SyntaxKind::InvalidNumber,
+            })?;
             // A finite, faithfully-represented value keeps its `f64` lane. One
             // that overflowed to infinity, or a nonzero magnitude that
             // underflowed to zero, would lose data — preserve its exact lexeme.
@@ -1997,10 +2022,15 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 kind: SyntaxKind::InvalidNumber,
             });
         }
-        let digits = core::str::from_utf8(&self.source[digits_start..self.position])
-            .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })?;
-        let magnitude = u64::from_str_radix(digits, 16)
-            .map_err(|_| JsonError::Syntax { offset: start, kind: SyntaxKind::InvalidNumber })?;
+        let digits =
+            core::str::from_utf8(&self.source[digits_start..self.position]).map_err(|_| JsonError::Syntax {
+                offset: start,
+                kind: SyntaxKind::InvalidNumber,
+            })?;
+        let magnitude = u64::from_str_radix(digits, 16).map_err(|_| JsonError::Syntax {
+            offset: start,
+            kind: SyntaxKind::InvalidNumber,
+        })?;
         if !negative {
             return Ok(Scalar::Unsigned(magnitude));
         }
@@ -2027,7 +2057,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         let interesting = ByteMask::with(delimiter).union(BACKSLASH).union(ASCII_CONTROLS);
         loop {
             let remaining = &self.source[self.position..];
-            let run_len = ActiveSearch::find_first(remaining, interesting).unwrap_or(remaining.len());
+            let run_len = interesting.find_in(remaining).unwrap_or(remaining.len());
             let run = &remaining[..run_len];
             has_non_ascii |= !run.is_ascii();
             self.position += run_len;
@@ -2177,10 +2207,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     }
 
     fn try_push<T>(&self, items: &mut Vec<T, A>, item: T) -> Result<(), JsonError> {
-        self.check_limit(
-            items.len().saturating_add(1),
-            self.options.limits.max_container_entries,
-        )?;
+        self.check_limit(items.len().saturating_add(1), self.options.limits.max_container_entries)?;
         items.try_reserve(1).map_err(|_| JsonError::Allocation)?;
         items.push(item);
         Ok(())
@@ -2206,9 +2233,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     fn dedup_linear(&self, entries: &mut Vec<(B::Key, B::Value), A>) -> Result<(), JsonError> {
         let mut current = 1;
         while current < entries.len() {
-            let earlier = (0..current).find(|&j| {
-                B::key_compare(self.source, &entries[j].0, &entries[current].0) == Ordering::Equal
-            });
+            let earlier = (0..current)
+                .find(|&j| B::key_compare(self.source, &entries[j].0, &entries[current].0) == Ordering::Equal);
             match earlier {
                 None => current += 1,
                 Some(first) => match self.options.duplicate_keys {
@@ -2237,9 +2263,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         for position in 0..count {
             order.push(position);
         }
-        order.sort_unstable_by(|&a, &b| {
-            B::key_compare(self.source, &entries[a].0, &entries[b].0)
-        });
+        order.sort_unstable_by(|&a, &b| B::key_compare(self.source, &entries[a].0, &entries[b].0));
 
         // Decide each position's fate: kept positions take their own value unless a
         // later duplicate overrides it (`LastWins`); others are removed.
@@ -2256,11 +2280,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         while run_start < count {
             let mut run_end = run_start + 1;
             while run_end < count
-                && B::key_compare(
-                    self.source,
-                    &entries[order[run_end]].0,
-                    &entries[order[run_start]].0,
-                ) == Ordering::Equal
+                && B::key_compare(self.source, &entries[order[run_end]].0, &entries[order[run_start]].0)
+                    == Ordering::Equal
             {
                 run_end += 1;
             }
@@ -2329,11 +2350,11 @@ const DEDUP_LINEAR_LIMIT: usize = 16;
 /// Each array and object owns its own [`Vec`], so parsing with the default
 /// global allocator scatters those nodes across the heap. Parse with
 /// [`view_in`] and a bump or slab allocator (any [`allocator_api2::alloc::Allocator`],
-/// for example a `bumpalo::Bump`) to pack the whole document into one contiguous
+/// for example a `bump-scope` arena) to pack the whole document into one contiguous
 /// region that frees in `O(1)` when the arena is dropped — the closest this design
 /// gets to a flat tape. Note the caveat: the per-node `Vec`s still grow by
 /// doubling, so an arena keeps some slack and dead reallocation remnants; it is
-/// arena-flat and cheap to allocate and free, not a compact simdjson-style tape.
+/// arena-flat and cheap to allocate and free, not a single compact flat buffer.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum JsonView<A: Allocator = Global> {
@@ -2392,10 +2413,7 @@ impl<A: Allocator + Clone> DomBuilder<A> for ViewBuilder {
     fn array(items: Vec<JsonView<A>, A>, _trivia: Option<Box<TriviaBlock<A>, A>>) -> JsonView<A> {
         JsonView::Array(items)
     }
-    fn object(
-        entries: Vec<(Span, JsonView<A>), A>,
-        _trivia: Option<Box<TriviaBlock<A>, A>>,
-    ) -> JsonView<A> {
+    fn object(entries: Vec<(Span, JsonView<A>), A>, _trivia: Option<Box<TriviaBlock<A>, A>>) -> JsonView<A> {
         JsonView::Object(entries)
     }
     fn key_compare(source: &[u8], left: &Span, right: &Span) -> Ordering {
@@ -2467,11 +2485,7 @@ impl<A: Allocator> JsonView<A> {
 
     /// Decodes a string value's escapes into `output`. Returns `None` if this is
     /// not a string, otherwise the result of the decode.
-    pub fn unescape_into<B: Allocator>(
-        &self,
-        source: &[u8],
-        output: &mut Vec<u8, B>,
-    ) -> Option<Result<(), JsonError>> {
+    pub fn unescape_into<B: Allocator>(&self, source: &[u8], output: &mut Vec<u8, B>) -> Option<Result<(), JsonError>> {
         match self {
             JsonView::String(span) => Some(unescape_into(source, *span, output)),
             _ => None,
@@ -2544,9 +2558,7 @@ impl<A: Allocator> JsonView<A> {
                 }
             }
             JsonView::Object(entries) => {
-                entries.sort_unstable_by(|(left, _), (right, _)| {
-                    escaped_span_compare(source, *left, *right)
-                });
+                entries.sort_unstable_by(|(left, _), (right, _)| escaped_span_compare(source, *left, *right));
                 for (_, value) in entries.iter_mut() {
                     value.sort_keys(source);
                 }
@@ -2991,10 +3003,7 @@ impl<A: Allocator> ObjectBody<A> {
         Self { entries, trivia: None }
     }
 
-    fn from_parts(
-        entries: Vec<(JsonString<A>, Json<A>), A>,
-        trivia: Option<Box<TriviaBlock<A>, A>>,
-    ) -> Self {
+    fn from_parts(entries: Vec<(JsonString<A>, Json<A>), A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Self {
         Self { entries, trivia }
     }
 }
@@ -3085,13 +3094,19 @@ impl<A: Allocator + fmt::Debug> fmt::Debug for ObjectBody<A> {
 
 impl<A: Allocator + Clone> Clone for ArrayBody<A> {
     fn clone(&self) -> Self {
-        Self { items: self.items.clone(), trivia: self.trivia.clone() }
+        Self {
+            items: self.items.clone(),
+            trivia: self.trivia.clone(),
+        }
     }
 }
 
 impl<A: Allocator + Clone> Clone for ObjectBody<A> {
     fn clone(&self) -> Self {
-        Self { entries: self.entries.clone(), trivia: self.trivia.clone() }
+        Self {
+            entries: self.entries.clone(),
+            trivia: self.trivia.clone(),
+        }
     }
 }
 
@@ -3153,11 +3168,7 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
         Json::Float(value)
     }
     fn string(source: &[u8], span: Span, allocator: &A) -> Result<Json<A>, JsonError> {
-        Ok(Json::String(JsonString::from_span(
-            source,
-            span,
-            allocator.clone(),
-        )?))
+        Ok(Json::String(JsonString::from_span(source, span, allocator.clone())?))
     }
     fn big_number(source: &[u8], span: Span, allocator: &A) -> Result<Json<A>, JsonError> {
         // The number token has no escapes, so `from_span` copies it verbatim.
@@ -3169,10 +3180,7 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
     fn array(items: Vec<Json<A>, A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Json<A> {
         Json::Array(ArrayBody::from_parts(items, trivia))
     }
-    fn object(
-        entries: Vec<(JsonString<A>, Json<A>), A>,
-        trivia: Option<Box<TriviaBlock<A>, A>>,
-    ) -> Json<A> {
+    fn object(entries: Vec<(JsonString<A>, Json<A>), A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Json<A> {
         Json::Object(ObjectBody::from_parts(entries, trivia))
     }
     fn key_compare(_source: &[u8], left: &JsonString<A>, right: &JsonString<A>) -> Ordering {
@@ -3198,9 +3206,7 @@ impl<A: Allocator, B: Allocator> PartialEq<Json<B>> for Json<A> {
                     && left
                         .iter()
                         .zip(right.iter())
-                        .all(|((key_a, value_a), (key_b, value_b))| {
-                            key_a == key_b && value_a == value_b
-                        })
+                        .all(|((key_a, value_a), (key_b, value_b))| key_a == key_b && value_a == value_b)
             }
             _ => false,
         }
@@ -3376,9 +3382,7 @@ impl<A: Allocator> Json<A> {
     pub fn remove(&mut self, key: &str) -> Option<Json<A>> {
         match self {
             Json::Object(entries) => {
-                let index = entries
-                    .iter()
-                    .position(|(stored, _)| stored.as_str() == key)?;
+                let index = entries.iter().position(|(stored, _)| stored.as_str() == key)?;
                 Some(entries.remove(index).1)
             }
             _ => None,
@@ -3402,9 +3406,7 @@ impl<A: Allocator> Json<A> {
     /// Returns [`JsonError::Allocation`] if the copy cannot be allocated.
     pub fn string_in(text: &str, allocator: A) -> Result<Json<A>, JsonError> {
         let mut bytes = Vec::new_in(allocator);
-        bytes
-            .try_reserve(text.len())
-            .map_err(|_| JsonError::Allocation)?;
+        bytes.try_reserve(text.len()).map_err(|_| JsonError::Allocation)?;
         bytes.extend_from_slice(text.as_bytes());
         Ok(Json::String(JsonString(bytes)))
     }
@@ -3417,10 +3419,7 @@ impl<A: Allocator + Clone> Json<A> {
     pub fn insert(&mut self, key: &str, value: Json<A>) -> Option<Json<A>> {
         match self {
             Json::Object(entries) => {
-                if let Some((_, existing)) = entries
-                    .iter_mut()
-                    .find(|(stored, _)| stored.as_str() == key)
-                {
+                if let Some((_, existing)) = entries.iter_mut().find(|(stored, _)| stored.as_str() == key) {
                     return Some(core::mem::replace(existing, value));
                 }
                 let allocator = entries.allocator().clone();
@@ -3440,22 +3439,14 @@ impl<A: Allocator> JsonView<A> {
     ///
     /// Returns [`JsonError::Allocation`] on allocation failure, or
     /// [`JsonError::Syntax`] if a string decodes to invalid UTF-8.
-    pub fn to_json_in<B: Allocator + Clone>(
-        &self,
-        source: &[u8],
-        allocator: B,
-    ) -> Result<Json<B>, JsonError> {
+    pub fn to_json_in<B: Allocator + Clone>(&self, source: &[u8], allocator: B) -> Result<Json<B>, JsonError> {
         self.to_json_ref(source, &allocator)
     }
 
     /// Shared recursion for [`to_json_in`](JsonView::to_json_in) that borrows the
     /// allocator, cloning it only where a `Vec` or `JsonString` must own one
     /// rather than once per traversal step.
-    fn to_json_ref<B: Allocator + Clone>(
-        &self,
-        source: &[u8],
-        allocator: &B,
-    ) -> Result<Json<B>, JsonError> {
+    fn to_json_ref<B: Allocator + Clone>(&self, source: &[u8], allocator: &B) -> Result<Json<B>, JsonError> {
         match self {
             JsonView::Null => Ok(Json::Null),
             JsonView::Boolean(value) => Ok(Json::Boolean(*value)),
@@ -3467,11 +3458,7 @@ impl<A: Allocator> JsonView<A> {
                 *span,
                 allocator.clone(),
             )?)),
-            JsonView::String(span) => Ok(Json::String(JsonString::from_span(
-                source,
-                *span,
-                allocator.clone(),
-            )?)),
+            JsonView::String(span) => Ok(Json::String(JsonString::from_span(source, *span, allocator.clone())?)),
             JsonView::Array(items) => {
                 let mut owned = Vec::new_in(allocator.clone());
                 for item in items {
@@ -3499,7 +3486,6 @@ impl<A: Allocator> JsonView<A> {
         self.to_json_in(source, Global)
     }
 }
-
 
 impl<A: Allocator> Json<A> {
     pub fn is_null(&self) -> bool {
@@ -3549,10 +3535,7 @@ impl<A: Allocator> Json<A> {
 
     /// Iterates an object value's values mutably.
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Json<A>> {
-        self.as_object_mut()
-            .into_iter()
-            .flatten()
-            .map(|(_, value)| value)
+        self.as_object_mut().into_iter().flatten().map(|(_, value)| value)
     }
 
     /// Consumes an array value, yielding its element storage; `None` otherwise.
@@ -3626,12 +3609,7 @@ impl<A: Allocator> Json<A> {
             .map(|entry| &entry.comment)
     }
 
-    fn write_layout<W: fmt::Write>(
-        &self,
-        writer: &mut W,
-        options: FormatOptions,
-        depth: usize,
-    ) -> fmt::Result {
+    fn write_layout<W: fmt::Write>(&self, writer: &mut W, options: FormatOptions, depth: usize) -> fmt::Result {
         match self {
             Json::Null => writer.write_str("null"),
             Json::Boolean(value) => writer.write_str(if *value { "true" } else { "false" }),
@@ -3782,12 +3760,7 @@ impl<A: Allocator> Json<A> {
     /// comment list places leading comments on their own line before an element,
     /// trailing comments on the same line after it, and the tail before the
     /// closing bracket.
-    fn write_commented<W: fmt::Write>(
-        &self,
-        writer: &mut W,
-        indent: Indent,
-        depth: usize,
-    ) -> fmt::Result {
+    fn write_commented<W: fmt::Write>(&self, writer: &mut W, indent: Indent, depth: usize) -> fmt::Result {
         match self {
             Json::Array(body) => {
                 let comments = trivia_comments(&body.trivia);
@@ -3852,19 +3825,13 @@ impl<A: Allocator> Json<A> {
     }
 
     /// Writes this value with the given [`FormatOptions`].
-    pub fn write_json_with<W: fmt::Write>(
-        &self,
-        writer: &mut W,
-        options: FormatOptions,
-    ) -> fmt::Result {
+    pub fn write_json_with<W: fmt::Write>(&self, writer: &mut W, options: FormatOptions) -> fmt::Result {
         if options.comments {
             let indent = options.indent.unwrap_or(Indent::Spaces(2));
             return self.write_commented(writer, indent, 0);
         }
         match (options.indent, options.max_width) {
-            (Some(indent), Some(max_width)) => {
-                self.write_wrapped(writer, indent, max_width, 0, 0)
-            }
+            (Some(indent), Some(max_width)) => self.write_wrapped(writer, indent, max_width, 0, 0),
             _ => self.write_layout(writer, options, 0),
         }
     }
@@ -4160,27 +4127,15 @@ impl<A: Allocator> JsonView<A> {
     }
 
     /// Writes this view as JSON indented by `indent` spaces per level.
-    pub fn write_json_pretty<W: fmt::Write>(
-        &self,
-        source: &[u8],
-        writer: &mut W,
-        indent: usize,
-    ) -> fmt::Result {
+    pub fn write_json_pretty<W: fmt::Write>(&self, source: &[u8], writer: &mut W, indent: usize) -> fmt::Result {
         let options = FormatOptions::compact().with_indent(spaces_indent(indent));
         self.write_layout(source, writer, options, 0)
     }
 
     /// Writes this view with the given [`FormatOptions`], resolving spans against `source`.
-    pub fn write_json_with<W: fmt::Write>(
-        &self,
-        source: &[u8],
-        writer: &mut W,
-        options: FormatOptions,
-    ) -> fmt::Result {
+    pub fn write_json_with<W: fmt::Write>(&self, source: &[u8], writer: &mut W, options: FormatOptions) -> fmt::Result {
         match (options.indent, options.max_width) {
-            (Some(indent), Some(max_width)) => {
-                self.write_wrapped(source, writer, indent, max_width, 0, 0)
-            }
+            (Some(indent), Some(max_width)) => self.write_wrapped(source, writer, indent, max_width, 0, 0),
             _ => self.write_layout(source, writer, options, 0),
         }
     }
@@ -4206,7 +4161,6 @@ impl<A: Allocator> JsonView<A> {
         output
     }
 }
-
 
 impl core::str::FromStr for Json<Global> {
     type Err = JsonError;
@@ -4349,7 +4303,6 @@ impl<'src, A: Allocator> BoundJsonView<'src, A> {
     }
 }
 
-
 /// Parses `source` into an immutable [`JsonView`] allocated in `allocator`,
 /// under `options`. Spans in the result are offsets into `source`.
 pub fn view_in_with<A: Allocator + Clone>(
@@ -4367,10 +4320,7 @@ pub fn view_in_with<A: Allocator + Clone>(
 ///
 /// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
 /// if the document cannot be allocated.
-pub fn view_in<A: Allocator + Clone>(
-    source: &[u8],
-    allocator: A,
-) -> Result<JsonView<A>, JsonError> {
+pub fn view_in<A: Allocator + Clone>(source: &[u8], allocator: A) -> Result<JsonView<A>, JsonError> {
     view_in_with(source, allocator, &ParseOptions::default())
 }
 
@@ -4463,10 +4413,7 @@ pub fn parse_in_with<A: Allocator + Clone>(
 ///
 /// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
 /// if the document cannot be allocated.
-pub fn parse_in<A: Allocator + Clone>(
-    source: &[u8],
-    allocator: A,
-) -> Result<Json<A>, JsonError> {
+pub fn parse_in<A: Allocator + Clone>(source: &[u8], allocator: A) -> Result<Json<A>, JsonError> {
     parse_in_with(source, allocator, &ParseOptions::default())
 }
 
@@ -4558,15 +4505,12 @@ mod serde_impls {
                 JsonView::Integer(value) => serializer.serialize_i64(*value),
                 JsonView::Unsigned(value) => serializer.serialize_u64(*value),
                 JsonView::Float(value) => serializer.serialize_f64(*value),
-                JsonView::BigNumber(span) => {
-                    serialize_big_number(span.resolve(self.source).unwrap_or("0"), serializer)
-                }
+                JsonView::BigNumber(span) => serialize_big_number(span.resolve(self.source).unwrap_or("0"), serializer),
                 // The span is still escaped, so decode it before handing serde a
                 // plain string it would otherwise escape a second time.
                 JsonView::String(span) => {
                     let buffer = decode_for_serde::<S::Error>(self.source, *span)?;
-                    let decoded =
-                        core::str::from_utf8(&buffer).map_err(serde::ser::Error::custom)?;
+                    let decoded = core::str::from_utf8(&buffer).map_err(serde::ser::Error::custom)?;
                     serializer.serialize_str(decoded)
                 }
                 JsonView::Array(items) => {
@@ -4583,8 +4527,7 @@ mod serde_impls {
                     let mut map = serializer.serialize_map(Some(entries.len()))?;
                     for (key_span, value) in entries {
                         let buffer = decode_for_serde::<S::Error>(self.source, *key_span)?;
-                        let key =
-                            core::str::from_utf8(&buffer).map_err(serde::ser::Error::custom)?;
+                        let key = core::str::from_utf8(&buffer).map_err(serde::ser::Error::custom)?;
                         map.serialize_entry(
                             key,
                             &Resolved {
@@ -4832,11 +4775,7 @@ mod serde_impls {
         fn serialize_tuple(self, len: usize) -> Result<SerializeVec, JsonError> {
             self.serialize_seq(Some(len))
         }
-        fn serialize_tuple_struct(
-            self,
-            _name: &'static str,
-            len: usize,
-        ) -> Result<SerializeVec, JsonError> {
+        fn serialize_tuple_struct(self, _name: &'static str, len: usize) -> Result<SerializeVec, JsonError> {
             self.serialize_seq(Some(len))
         }
         fn serialize_tuple_variant(
@@ -4857,11 +4796,7 @@ mod serde_impls {
                 pending_key: None,
             })
         }
-        fn serialize_struct(
-            self,
-            _name: &'static str,
-            len: usize,
-        ) -> Result<SerializeObject, JsonError> {
+        fn serialize_struct(self, _name: &'static str, len: usize) -> Result<SerializeObject, JsonError> {
             self.serialize_map(Some(len))
         }
         fn serialize_struct_variant(
@@ -5088,14 +5023,8 @@ mod serde_impls {
                 None => Ok(None),
             }
         }
-        fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
-            &mut self,
-            seed: V,
-        ) -> Result<V::Value, JsonError> {
-            let value = self
-                .value
-                .take()
-                .ok_or_else(|| serde_message("map value missing"))?;
+        fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, JsonError> {
+            let value = self.value.take().ok_or_else(|| serde_message("map value missing"))?;
             seed.deserialize(value)
         }
     }
@@ -5151,20 +5080,13 @@ mod serde_impls {
         fn unit_variant(self) -> Result<(), JsonError> {
             Ok(())
         }
-        fn newtype_variant_seed<T: serde::de::DeserializeSeed<'de>>(
-            self,
-            seed: T,
-        ) -> Result<T::Value, JsonError> {
+        fn newtype_variant_seed<T: serde::de::DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, JsonError> {
             match self.value {
                 Some(value) => seed.deserialize(value),
                 None => Err(serde_message("expected a newtype variant")),
             }
         }
-        fn tuple_variant<V: serde::de::Visitor<'de>>(
-            self,
-            _len: usize,
-            visitor: V,
-        ) -> Result<V::Value, JsonError> {
+        fn tuple_variant<V: serde::de::Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, JsonError> {
             match self.value {
                 Some(value) => serde::Deserializer::deserialize_seq(value, visitor),
                 None => Err(serde_message("expected a tuple variant")),
@@ -5280,10 +5202,7 @@ mod tests {
             .unwrap();
         assert_eq!(buffer.as_slice(), b"a\n\t\r\"\\/b");
         // The view keeps the raw, still-escaped bytes.
-        assert_eq!(
-            view(source).unwrap().as_str(source),
-            Some("a\\n\\t\\r\\\"\\\\\\/b")
-        );
+        assert_eq!(view(source).unwrap().as_str(source), Some("a\\n\\t\\r\\\"\\\\\\/b"));
     }
 
     #[test]
@@ -5344,14 +5263,8 @@ mod tests {
     fn view_get_is_escape_aware() {
         let source = br#"{"na\u00efve": 1, "plain": 2}"#;
         let document = view(source).unwrap();
-        assert_eq!(
-            document.get(source, "naïve").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        assert_eq!(
-            document.get(source, "plain").and_then(|v| v.as_u64()),
-            Some(2)
-        );
+        assert_eq!(document.get(source, "naïve").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(document.get(source, "plain").and_then(|v| v.as_u64()), Some(2));
         assert!(document.get(source, "missing").is_none());
     }
 
@@ -5360,18 +5273,9 @@ mod tests {
         let source = br#"{"c": 3, "a": 1, "b": 2}"#;
         let mut document = view(source).unwrap();
         document.sort_keys(source);
-        assert_eq!(
-            document.get_sorted(source, "a").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        assert_eq!(
-            document.get_sorted(source, "b").and_then(|v| v.as_u64()),
-            Some(2)
-        );
-        assert_eq!(
-            document.get_sorted(source, "c").and_then(|v| v.as_u64()),
-            Some(3)
-        );
+        assert_eq!(document.get_sorted(source, "a").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(document.get_sorted(source, "b").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(document.get_sorted(source, "c").and_then(|v| v.as_u64()), Some(3));
         assert!(document.get_sorted(source, "z").is_none());
     }
 
@@ -5391,10 +5295,7 @@ mod tests {
     fn owned_needs_no_source() {
         let source = br#"{"greeting": "a\nb", "count": 5}"#;
         let document = parse(source).unwrap();
-        assert_eq!(
-            document.get("greeting").and_then(|v| v.as_str()),
-            Some("a\nb")
-        );
+        assert_eq!(document.get("greeting").and_then(|v| v.as_str()), Some("a\nb"));
         assert_eq!(document.get("count").and_then(|v| v.as_u64()), Some(5));
     }
 
@@ -5404,10 +5305,7 @@ mod tests {
         assert!(document.insert("x", Json::from(1i64)).is_none());
         assert!(document.insert("y", Json::from(2i64)).is_none());
         // Overwriting returns the old value.
-        assert_eq!(
-            document.insert("x", Json::from(9i64)),
-            Some(Json::from(1i64))
-        );
+        assert_eq!(document.insert("x", Json::from(9i64)), Some(Json::from(1i64)));
         assert_eq!(document.get("x"), Some(&Json::from(9i64)));
         assert_eq!(document.remove("y"), Some(Json::from(2i64)));
         assert!(document.get("y").is_none());
@@ -5463,23 +5361,38 @@ mod tests {
         // Kinds classify the fault.
         assert!(matches!(
             parse(b"1."),
-            Err(JsonError::Syntax { kind: SyntaxKind::InvalidNumber, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::InvalidNumber,
+                ..
+            })
         ));
         assert!(matches!(
             parse(br#""bad\x""#),
-            Err(JsonError::Syntax { kind: SyntaxKind::InvalidEscape, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::InvalidEscape,
+                ..
+            })
         ));
         assert!(matches!(
             parse(br#""\uDE00""#),
-            Err(JsonError::Syntax { kind: SyntaxKind::LoneSurrogate, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::LoneSurrogate,
+                ..
+            })
         ));
         assert!(matches!(
             parse(b"{} junk"),
-            Err(JsonError::Syntax { kind: SyntaxKind::TrailingData, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::TrailingData,
+                ..
+            })
         ));
         assert!(matches!(
             parse(b"[1"),
-            Err(JsonError::Syntax { kind: SyntaxKind::UnexpectedEnd, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::UnexpectedEnd,
+                ..
+            })
         ));
         // Location resolves line and column from the offset.
         let source = b"{\n  \"a\": x\n}";
@@ -5554,10 +5467,7 @@ mod tests {
         // after the opening `{` and newline is still an indent space, not a quote.
         let clamped = parse(br#"{"a":1}"#).unwrap().to_string_pretty(65_536);
         assert_eq!(clamped.as_bytes().get(2), Some(&b' '));
-        assert_eq!(
-            indent_cols(Indent::Spaces(u16::MAX), usize::MAX),
-            usize::MAX
-        );
+        assert_eq!(indent_cols(Indent::Spaces(u16::MAX), usize::MAX), usize::MAX);
     }
 
     #[test]
@@ -5674,7 +5584,10 @@ mod tests {
     #[test]
     fn get_accepts_key_or_position() {
         let document = parse(br#"{"items":[7,8,9]}"#).unwrap();
-        assert_eq!(document.get("items").and_then(|v| v.get(2)).and_then(|v| v.as_u64()), Some(9));
+        assert_eq!(
+            document.get("items").and_then(|v| v.get(2)).and_then(|v| v.as_u64()),
+            Some(9)
+        );
         assert!(document.get("items").unwrap().get(5).is_none());
         assert!(document.get("missing").is_none());
     }
@@ -5714,12 +5627,18 @@ mod tests {
         let mut output = Vec::new();
         assert!(matches!(
             unescape_into(b"a\nb", Span { start: 0, len: 3 }, &mut output),
-            Err(JsonError::Syntax { kind: SyntaxKind::ControlCharacter, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::ControlCharacter,
+                ..
+            })
         ));
         let mut output = Vec::new();
         assert!(matches!(
             unescape_into(b"\xff", Span { start: 0, len: 1 }, &mut output),
-            Err(JsonError::Syntax { kind: SyntaxKind::InvalidUtf8, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::InvalidUtf8,
+                ..
+            })
         ));
         // A well-formed span still decodes cleanly.
         let mut output = Vec::new();
@@ -5730,7 +5649,10 @@ mod tests {
     #[test]
     fn manually_constructed_view_spans_still_serialize_as_json() {
         for source in [b"a\nb".as_slice(), b"\\u12", b"\\uD800", b"\xff"] {
-            let document = JsonView::<Global>::String(Span { start: 0, len: source.len() });
+            let document = JsonView::<Global>::String(Span {
+                start: 0,
+                len: source.len(),
+            });
             assert!(parse(document.to_json_string(source).as_bytes()).is_ok());
         }
     }
@@ -5738,7 +5660,10 @@ mod tests {
     #[test]
     fn malformed_spans_do_not_match_decoded_key_prefixes() {
         let source = b"key\\";
-        let span = Span { start: 0, len: source.len() };
+        let span = Span {
+            start: 0,
+            len: source.len(),
+        };
         assert!(!escaped_equals(source, span, "key"));
         assert_ne!(escaped_compare(source, span, "key"), Ordering::Equal);
     }
@@ -5751,7 +5676,10 @@ mod tests {
         });
         assert!(matches!(
             parse_with(b"[1,2,3]", &node_limited),
-            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::ResourceLimitExceeded,
+                ..
+            })
         ));
         let entry_limited = ParseOptions::strict().limits(ParseLimits {
             max_container_entries: Some(2),
@@ -5759,7 +5687,10 @@ mod tests {
         });
         assert!(matches!(
             parse_with(b"[1,2,3]", &entry_limited),
-            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::ResourceLimitExceeded,
+                ..
+            })
         ));
         let string_limited = ParseOptions::strict().limits(ParseLimits {
             max_string_bytes: Some(2),
@@ -5767,14 +5698,21 @@ mod tests {
         });
         assert!(matches!(
             parse_with(b"\"abc\"", &string_limited),
-            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::ResourceLimitExceeded,
+                ..
+            })
         ));
-        let comments = ParseOptions::json5()
-            .preserve_comments(true)
-            .limits(ParseLimits { max_comment_bytes: Some(2), ..ParseLimits::unlimited() });
+        let comments = ParseOptions::json5().preserve_comments(true).limits(ParseLimits {
+            max_comment_bytes: Some(2),
+            ..ParseLimits::unlimited()
+        });
         assert!(matches!(
             parse_with(b"/* long */ 1", &comments),
-            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::ResourceLimitExceeded,
+                ..
+            })
         ));
         let bounded_comment = ParseOptions::jsonc().limits(ParseLimits {
             max_comment_bytes: Some(2),
@@ -5782,7 +5720,10 @@ mod tests {
         });
         assert!(matches!(
             parse_with(b"/* long", &bounded_comment),
-            Err(JsonError::Syntax { kind: SyntaxKind::ResourceLimitExceeded, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::ResourceLimitExceeded,
+                ..
+            })
         ));
     }
 
@@ -5833,14 +5774,20 @@ mod tests {
         // A compact, deterministic fuzz-regression corpus. Every mutation must
         // either be rejected by both DOM builders or re-serialize as strict JSON.
         let seed = br#"{"key":"a\nb","items":[0,true,null],"ratio":1.25e-2}"#;
-        let replacements = [0, b' ', b'"', b'\\', b'[', b']', b'{', b'}', b',', b':', b'0', b'x', 0xff];
+        let replacements = [
+            0, b' ', b'"', b'\\', b'[', b']', b'{', b'}', b',', b':', b'0', b'x', 0xff,
+        ];
         for index in 0..seed.len() {
             for replacement in replacements {
                 let mut source = seed.to_vec();
                 source[index] = replacement;
                 let owned = parse(&source);
                 let borrowed = view(&source);
-                assert_eq!(owned.is_ok(), borrowed.is_ok(), "mutation at {index} to {replacement:#x}");
+                assert_eq!(
+                    owned.is_ok(),
+                    borrowed.is_ok(),
+                    "mutation at {index} to {replacement:#x}"
+                );
                 if let Ok(document) = owned {
                     assert!(parse(document.to_string().as_bytes()).is_ok());
                 }
@@ -5852,13 +5799,13 @@ mod tests {
     }
 
     #[test]
-    fn byte_masks_find_first_interesting_byte() {
+    fn byte_mask_locates_first_member() {
         let mask = ByteMask::with(b'"').union(ByteMask::with(b'\\'));
         assert!(mask.contains(b'"'));
         assert!(mask.contains(b'\\'));
         assert!(!mask.contains(b'x'));
-        assert_eq!(ActiveSearch::find_first(b"plain\\escape", mask), Some(5));
-        assert_eq!(ActiveSearch::find_first(b"plain", mask), None);
+        assert_eq!(mask.find_in(b"plain\\escape"), Some(5));
+        assert_eq!(mask.find_in(b"plain"), None);
     }
 
     /// A distinct allocator type that just forwards to the global heap, used to
@@ -5893,18 +5840,23 @@ mod tests {
         // Default is last-wins, in the first key's position.
         assert_eq!(parse(source).unwrap().get("a").and_then(|v| v.as_u64()), Some(2));
 
-        let first =
-            parse_with(source, &ParseOptions::default().duplicate_keys(DuplicateKeys::FirstWins)).unwrap();
+        let first = parse_with(
+            source,
+            &ParseOptions::default().duplicate_keys(DuplicateKeys::FirstWins),
+        )
+        .unwrap();
         assert_eq!(first.get("a").and_then(|v| v.as_u64()), Some(1));
         assert_eq!(first.len(), 2);
 
         assert!(matches!(
             parse_with(source, &ParseOptions::default().duplicate_keys(DuplicateKeys::Reject)),
-            Err(JsonError::Syntax { kind: SyntaxKind::DuplicateKey, .. })
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::DuplicateKey,
+                ..
+            })
         ));
 
-        let all =
-            parse_with(source, &ParseOptions::default().duplicate_keys(DuplicateKeys::KeepAll)).unwrap();
+        let all = parse_with(source, &ParseOptions::default().duplicate_keys(DuplicateKeys::KeepAll)).unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all.get("a").and_then(|v| v.as_u64()), Some(1));
 
@@ -5948,16 +5900,28 @@ mod tests {
         assert_eq!(document.get("k499").and_then(|v| v.as_u64()), Some(499));
 
         // First-wins keeps the originals; reject faults; keep-all keeps every copy.
-        let first =
-            parse_with(source.as_bytes(), &ParseOptions::default().duplicate_keys(DuplicateKeys::FirstWins)).unwrap();
+        let first = parse_with(
+            source.as_bytes(),
+            &ParseOptions::default().duplicate_keys(DuplicateKeys::FirstWins),
+        )
+        .unwrap();
         assert_eq!(first.get("k0").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(first.len(), count);
         assert!(matches!(
-            parse_with(source.as_bytes(), &ParseOptions::default().duplicate_keys(DuplicateKeys::Reject)),
-            Err(JsonError::Syntax { kind: SyntaxKind::DuplicateKey, .. })
+            parse_with(
+                source.as_bytes(),
+                &ParseOptions::default().duplicate_keys(DuplicateKeys::Reject)
+            ),
+            Err(JsonError::Syntax {
+                kind: SyntaxKind::DuplicateKey,
+                ..
+            })
         ));
-        let all =
-            parse_with(source.as_bytes(), &ParseOptions::default().duplicate_keys(DuplicateKeys::KeepAll)).unwrap();
+        let all = parse_with(
+            source.as_bytes(),
+            &ParseOptions::default().duplicate_keys(DuplicateKeys::KeepAll),
+        )
+        .unwrap();
         assert_eq!(all.len(), count + 2);
     }
 
@@ -6159,7 +6123,10 @@ mod tests {
         let error = parse_with(b"/* open", &ParseOptions::jsonc()).unwrap_err();
         assert!(matches!(
             error,
-            JsonError::Syntax { kind: SyntaxKind::UnterminatedComment, .. }
+            JsonError::Syntax {
+                kind: SyntaxKind::UnterminatedComment,
+                ..
+            }
         ));
         // A lone slash is not a comment and still faults.
         assert!(parse_with(b"/ 1", &ParseOptions::jsonc()).is_err());
@@ -6167,7 +6134,10 @@ mod tests {
         assert!(parse_with(b"[1,,]", &ParseOptions::json5()).is_err());
         // A block comment is not opened when only line comments are enabled.
         let line_only = ParseOptions::strict().max_depth(8);
-        let line_only = ParseOptions { allow_line_comments: true, ..line_only };
+        let line_only = ParseOptions {
+            allow_line_comments: true,
+            ..line_only
+        };
         assert!(parse_with(b"/* x */ 1", &line_only).is_err());
     }
 
@@ -6293,10 +6263,7 @@ mod tests {
 
         // A leading block comment lands on its own line before the entry.
         let document = parse_with(br#"{ /* c */ "a": 1 }"#, &options).unwrap();
-        assert_eq!(
-            document.to_string_with(commented),
-            "{\n  /* c */\n  \"a\": 1\n}",
-        );
+        assert_eq!(document.to_string_with(commented), "{\n  /* c */\n  \"a\": 1\n}",);
 
         // A line comment after a comma trails the value on the same line.
         let document = parse_with(b"{ \"a\": 1, // note\n\"b\": 2 }", &options).unwrap();
@@ -6336,8 +6303,7 @@ mod tests {
     #[test]
     fn comment_accessors_read_placement() {
         let options = ParseOptions::json5().preserve_comments(true);
-        let document =
-            parse_with(b"[\n // lead\n 1, // trail\n 2\n // tail\n]", &options).unwrap();
+        let document = parse_with(b"[\n // lead\n 1, // trail\n 2\n // tail\n]", &options).unwrap();
 
         assert!(document.has_comments());
         let lead: Vec<_> = document.leading_comments(0).collect();
@@ -6424,10 +6390,7 @@ mod serde_tests {
     fn resolved_serializes_without_double_escaping() {
         let source = br#"{ "k" : "v\n" }"#;
         let document = view(source).unwrap();
-        assert_eq!(
-            serde_json::to_string(&document.bind(source)).unwrap(),
-            r#"{"k":"v\n"}"#
-        );
+        assert_eq!(serde_json::to_string(&document.bind(source)).unwrap(), r#"{"k":"v\n"}"#);
     }
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
