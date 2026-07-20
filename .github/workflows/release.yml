@@ -43,6 +43,8 @@ jobs:
         uses: actions/checkout@v5
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: Test `std`
         run: cargo test
       - name: Test `no_std`
@@ -53,11 +55,31 @@ jobs:
         run: cargo test --no-default-features --features serde
       - name: Test docs
         run: cargo test --doc
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Compile benches
+        run: cargo bench --no-run
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Fuzz the parser
+        run: |
+          cargo build
+          rustc --edition=2021 scripts/fuzz.rs \
+            --extern jsontape=target/debug/libjsontape.rlib \
+            -L dependency=target/debug/deps -o fuzz
+          ./fuzz 100000 512
 
   publish_rust:
     name: Publish to crates.io
     runs-on: ubuntu-24.04
-    needs: [versioning, test]
+    needs: [versioning, test, fuzz]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
