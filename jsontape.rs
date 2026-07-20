@@ -1,4 +1,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+// The library is entirely safe Rust; this makes that property compiler-enforced
+// rather than a convention. The test module needs `unsafe impl Allocator` for its
+// stand-in allocators, so the lint is lifted only there. Doctests compile as
+// separate crates and are unaffected.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 //! # JsonTape
 //!
@@ -416,6 +421,14 @@ impl ParseOptions {
     }
 
     /// Sets the maximum nesting depth.
+    ///
+    /// Parsing is iterative over an explicit frame stack and never recurses, so
+    /// this limit does not protect the parser — it protects everything that
+    /// walks the resulting tree. Dropping, formatting, cloning, and comparing a
+    /// document all recurse once per level, so a depth raised far above the
+    /// default of 128 can overflow the stack after a successful parse, when the
+    /// document is used or freed. Raise it deliberately, and only as far as the
+    /// consuming code can walk.
     pub fn max_depth(mut self, max_depth: u32) -> Self {
         self.max_depth = max_depth;
         self
@@ -518,6 +531,82 @@ impl ByteMask {
     fn find_in(self, bytes: &[u8]) -> Option<usize> {
         bytes.iter().position(|&byte| self.contains(byte))
     }
+}
+
+/// One set bit per byte lane, and one high bit per byte lane: the two constants
+/// every SWAR byte test below is built from.
+const SWAR_ONES: u64 = 0x0101_0101_0101_0101;
+const SWAR_HIGHS: u64 = 0x8080_8080_8080_8080;
+
+/// Leaves `0x80` in the lane of every zero byte of `word`, and nothing in the
+/// lanes of the rest.
+///
+/// Borrows propagate from less significant lanes to more significant ones, so a
+/// lane above a zero byte can be flagged spuriously — but a lane *below* the
+/// first zero byte never can, which is all [`find_string_stop`] relies on when
+/// it takes the lowest set bit.
+#[inline]
+const fn swar_zero_lanes(word: u64) -> u64 {
+    word.wrapping_sub(SWAR_ONES) & !word & SWAR_HIGHS
+}
+
+/// Position of the first byte that ends a string body — the closing `delimiter`,
+/// a backslash opening an escape, or a raw control byte below `0x20` — or
+/// `bytes.len()` if the body runs to the end. Also reports whether any byte
+/// *before* that position was non-ASCII, which is what decides if the body needs
+/// a UTF-8 validation pass.
+///
+/// This is the parser's hottest scan: string bytes dominate real documents, and
+/// the generic [`ByteMask::find_in`] costs an index, a shift and a mask per
+/// byte. Testing eight bytes per iteration with three SWAR comparisons is the
+/// same predicate for a fraction of the work, in portable safe Rust. The scalar
+/// tail keeps the two paths agreeing on inputs shorter than a word.
+#[inline]
+fn find_string_stop(bytes: &[u8], delimiter: u8) -> (usize, bool) {
+    let delimiters = SWAR_ONES.wrapping_mul(delimiter as u64);
+    let backslashes = SWAR_ONES.wrapping_mul(b'\\' as u64);
+    let controls = SWAR_ONES.wrapping_mul(0x20);
+    let mut index = 0;
+    let mut non_ascii = false;
+    while index + 8 <= bytes.len() {
+        let Ok(chunk) = <[u8; 8]>::try_from(&bytes[index..index + 8]) else {
+            // The loop bound guarantees eight bytes, so this never runs; falling
+            // out to the scalar tail rather than unwrapping keeps the function
+            // panic-free even if that bound is ever edited.
+            break;
+        };
+        // `from_le_bytes` fixes the lane order regardless of host endianness, so
+        // chunk byte `i` always occupies bits `8i..8i+8` and the bit arithmetic
+        // below is portable rather than little-endian-only.
+        let word = u64::from_le_bytes(chunk);
+        // A lane is flagged when it equals the delimiter, equals a backslash, or
+        // is below 0x20. The last is the classic "has a byte less than n" test,
+        // valid for any n up to 128.
+        let hits = swar_zero_lanes(word ^ delimiters)
+            | swar_zero_lanes(word ^ backslashes)
+            | (word.wrapping_sub(controls) & !word & SWAR_HIGHS);
+        if hits != 0 {
+            // The lowest set bit is the earliest byte, and it is always a real
+            // hit: a spurious flag needs a borrow out of a lower lane, which
+            // only a genuine match produces.
+            let offset = (hits.trailing_zeros() / 8) as usize;
+            // Only the bytes preceding the stop belong to the run.
+            let before = (1u64 << (offset * 8)) - 1;
+            non_ascii |= word & SWAR_HIGHS & before != 0;
+            return (index + offset, non_ascii);
+        }
+        non_ascii |= word & SWAR_HIGHS != 0;
+        index += 8;
+    }
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == delimiter || byte == b'\\' || byte < 0x20 {
+            return (index, non_ascii);
+        }
+        non_ascii |= byte >= 0x80;
+        index += 1;
+    }
+    (index, non_ascii)
 }
 
 /// Finds the first occurrence of the fixed `needle` substring in `bytes`. Used
@@ -738,6 +827,17 @@ pub fn unescape_into<A: Allocator>(source: &[u8], span: Span, output: &mut Vec<u
         kind: SyntaxKind::InvalidString,
     })?;
     validate_string_body(content, span.start)?;
+    unescape_validated(content, span.start, output)
+}
+
+/// The decoding half of [`unescape_into`], for a `content` slice already known
+/// to be well-formed: valid UTF-8, no unescaped control bytes, and only escapes
+/// the scanner accepts. Parser-produced spans satisfy all three by construction —
+/// [`Parser::scan_string`] checks them while scanning — so the owned builder
+/// calls this directly and skips a second validation pass over every string and
+/// key. The public [`unescape_into`] keeps validating, since it accepts spans
+/// this crate did not produce.
+fn unescape_validated<A: Allocator>(content: &[u8], offset: usize, output: &mut Vec<u8, A>) -> Result<(), JsonError> {
     // Decoding only collapses escapes, so the escaped length is an upper bound —
     // reserve once and push without a per-byte check.
     output.try_reserve(content.len()).map_err(|_| JsonError::Allocation)?;
@@ -752,7 +852,7 @@ pub fn unescape_into<A: Allocator>(source: &[u8], span: Span, output: &mut Vec<u
     }
     if decoder.malformed {
         return Err(JsonError::Syntax {
-            offset: span.start,
+            offset,
             kind: SyntaxKind::InvalidEscape,
         });
     }
@@ -1292,6 +1392,20 @@ trait DomBuilder<A: Allocator + Clone> {
     fn object(entries: Vec<(Self::Key, Self::Value), A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Self::Value;
     /// Orders two object keys by their decoded bytes, for duplicate handling.
     fn key_compare(source: &[u8], left: &Self::Key, right: &Self::Key) -> Ordering;
+    /// Orders two object keys that are known to contain no escape sequences.
+    /// Defaults to the general comparison, which is already the right thing for
+    /// a builder holding decoded keys; the zero-copy builder overrides it to
+    /// compare raw source bytes rather than decoding as it goes.
+    fn key_compare_plain(source: &[u8], left: &Self::Key, right: &Self::Key) -> Ordering {
+        Self::key_compare(source, left, right)
+    }
+    /// Whether two escape-free object keys are equal. Deduplication only ever
+    /// asks this question, and equality is strictly cheaper than an ordering: it
+    /// can reject on differing lengths without looking at a single byte, where
+    /// an ordering must walk the common prefix first.
+    fn key_equals_plain(source: &[u8], left: &Self::Key, right: &Self::Key) -> bool {
+        Self::key_compare_plain(source, left, right) == Ordering::Equal
+    }
 }
 
 /// The explicit structural stack used by the parser.
@@ -1309,6 +1423,11 @@ enum ParseFrame<A: Allocator + Clone, B: DomBuilder<A>> {
         trivia: Option<Box<TriviaBlock<A>, A>>,
         key: Option<B::Key>,
         state: ObjectState,
+        /// Whether every key scanned into this object so far was free of escape
+        /// sequences. Almost every real document satisfies this, and when it
+        /// holds, deduplication can compare raw source bytes instead of
+        /// decoding both keys through the escape-aware iterator.
+        keys_plain: bool,
     },
 }
 
@@ -1340,6 +1459,10 @@ struct Parser<'a, A: Allocator + Clone, B: DomBuilder<A>> {
     // when the builder preserves trivia and the option is on.
     pending: Vec<PendingComment, A>,
     broke: bool,
+    /// Whether the most recent `scan_string` passed over a backslash. Read right
+    /// after scanning an object key, to keep the containing frame's `keys_plain`
+    /// flag current.
+    scanned_escape: bool,
     _builder: PhantomData<B>,
 }
 
@@ -1352,6 +1475,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             nodes: 0,
             pending: Vec::new_in(allocator.clone()),
             broke: false,
+            scanned_escape: false,
             allocator,
             options,
             _builder: PhantomData,
@@ -1512,7 +1636,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             let bytes = item.span.bytes(self.source).unwrap_or(&[]);
             let comment = Comment {
                 style: item.style,
-                text: JsonString::from_bytes_in(bytes, self.allocator.clone()),
+                text: JsonString::try_from_bytes_in(bytes, self.allocator.clone())?,
             };
             if trivia.is_none() {
                 let block = TriviaBlock {
@@ -1533,10 +1657,21 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         let mut frames: Vec<ParseFrame<A, B>, A> = Vec::new_in(self.allocator.clone());
         let mut root = None;
         let mut need_value = true;
+        // Cursor position at which trivia was most recently skipped. A state
+        // transition that does not advance the cursor — an array element moving
+        // from "value required" to "parse a value" is the hot one — would
+        // otherwise rescan the same whitespace. Skipping again at an unmoved
+        // cursor is a no-op by construction, so memoizing it changes nothing
+        // observable, including comment collection and the newline flag.
+        // `usize::MAX` means "nowhere", since it is never a valid position.
+        let mut trivia_skipped_at = usize::MAX;
 
         loop {
             if need_value {
-                self.skip_trivia()?;
+                if self.position != trivia_skipped_at {
+                    self.skip_trivia()?;
+                    trivia_skipped_at = self.position;
+                }
                 self.reserve_node()?;
                 match self.peek() {
                     Some(b'[') => {
@@ -1572,7 +1707,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     state: ArrayState::FirstValueOrEnd | ArrayState::ValueRequired,
                     ..
                 } => {
-                    self.skip_trivia()?;
+                    if self.position != trivia_skipped_at {
+                        self.skip_trivia()?;
+                        trivia_skipped_at = self.position;
+                    }
                     let permits_end = matches!(
                         frames.last(),
                         Some(ParseFrame::Array {
@@ -1655,7 +1793,15 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                         _ => return self.fault(),
                     };
                     let key = B::key(self.source, key_span, &self.allocator)?;
-                    if let ParseFrame::Object { key: slot, state, .. } = frames.last_mut().expect("checked above") {
+                    let key_escaped = self.scanned_escape;
+                    if let ParseFrame::Object {
+                        key: slot,
+                        state,
+                        keys_plain,
+                        ..
+                    } = frames.last_mut().expect("checked above")
+                    {
+                        *keys_plain &= !key_escaped;
                         *slot = Some(key);
                         *state = ObjectState::ColonRequired;
                     }
@@ -1726,6 +1872,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             trivia: None,
             key: None,
             state: ObjectState::FirstKeyOrEnd,
+            keys_plain: true,
         });
         Ok(())
     }
@@ -1807,9 +1954,14 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     trivia.take(),
                 )
             }
-            ParseFrame::Object { entries, trivia, .. } => {
+            ParseFrame::Object {
+                entries,
+                trivia,
+                keys_plain,
+                ..
+            } => {
                 self.drain_pending(entries.len(), trivia)?;
-                self.dedup_object(entries)?;
+                self.dedup_object(entries, *keys_plain)?;
                 B::object(
                     core::mem::replace(entries, Vec::new_in(self.allocator.clone())),
                     trivia.take(),
@@ -1885,6 +2037,12 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 
         let mut is_float = false;
         let mut has_integer_digits = false;
+        // The integer part's magnitude, accumulated while scanning so the common
+        // integer case never re-walks the token through `str::parse`. Set when
+        // the value outgrows 64 bits, which hands it to the lossless big-number
+        // path exactly as the parse-based route did.
+        let mut magnitude: u64 = 0;
+        let mut magnitude_overflowed = false;
 
         // Integer part: a lone zero, or a non-zero digit run with no leading zeros.
         // JSON5 may also open with a decimal point and no integer digits at all.
@@ -1895,7 +2053,19 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
             Some(b'1'..=b'9') => {
                 has_integer_digits = true;
-                self.advance_while(DECIMAL_DIGITS);
+                while let Some(byte) = self.peek() {
+                    let Some(digit) = byte.checked_sub(b'0').filter(|&digit| digit <= 9) else {
+                        break;
+                    };
+                    match magnitude
+                        .checked_mul(10)
+                        .and_then(|scaled| scaled.checked_add(digit as u64))
+                    {
+                        Some(next) => magnitude = next,
+                        None => magnitude_overflowed = true,
+                    }
+                    self.position += 1;
+                }
             }
             Some(b'.') if self.options.allow_leading_decimal => {}
             _ => {
@@ -1948,14 +2118,17 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             self.advance_while(DECIMAL_DIGITS);
         }
 
-        let token = &self.source[start..self.position];
-        // The token is all ASCII, so this never fails.
-        let text = core::str::from_utf8(token).map_err(|_| JsonError::Syntax {
-            offset: start,
-            kind: SyntaxKind::InvalidNumber,
-        })?;
-
         if is_float {
+            // Only the float lane needs the token as text: correctly-rounded
+            // `f64` parsing is worth keeping in `str::parse`. The integer lane
+            // below was accumulated during the scan and never comes back here,
+            // so it pays for neither this UTF-8 pass nor a second walk.
+            let token = &self.source[start..self.position];
+            // The token is all ASCII, so this never fails.
+            let text = core::str::from_utf8(token).map_err(|_| JsonError::Syntax {
+                offset: start,
+                kind: SyntaxKind::InvalidNumber,
+            })?;
             let value = text.parse::<f64>().map_err(|_| JsonError::Syntax {
                 offset: start,
                 kind: SyntaxKind::InvalidNumber,
@@ -1969,12 +2142,18 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
             return self.big_number(start);
         }
-        if token[0] == b'-' {
-            if let Ok(value) = text.parse::<i64>() {
-                return Ok(Scalar::Integer(value));
+        // A plain integer: the magnitude was accumulated during the scan, so the
+        // token needs no second pass. Anything that outgrew 64 bits keeps its
+        // exact lexeme instead.
+        if !magnitude_overflowed {
+            if !negative {
+                return Ok(Scalar::Unsigned(magnitude));
             }
-        } else if let Ok(value) = text.parse::<u64>() {
-            return Ok(Scalar::Unsigned(value));
+            // Negate through i128 so the `i64::MIN` magnitude (2^63) is representable.
+            let signed = -(magnitude as i128);
+            if signed >= i64::MIN as i128 {
+                return Ok(Scalar::Integer(signed as i64));
+            }
         }
         // Integer too wide for a 64-bit lane; keep the exact lexeme losslessly.
         self.big_number(start)
@@ -2054,12 +2233,15 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         // Track non-ASCII so a pure-ASCII body (the common case) skips the second
         // UTF-8 validation pass — ASCII is always valid UTF-8.
         let mut has_non_ascii = false;
-        let interesting = ByteMask::with(delimiter).union(BACKSLASH).union(ASCII_CONTROLS);
+        // Recorded for the caller: an escape-free body can be compared as raw
+        // source bytes later, with no decoding.
+        self.scanned_escape = false;
         loop {
+            // One SWAR pass finds the run's end and reports whether it held any
+            // non-ASCII byte, so the ASCII question costs nothing extra.
             let remaining = &self.source[self.position..];
-            let run_len = interesting.find_in(remaining).unwrap_or(remaining.len());
-            let run = &remaining[..run_len];
-            has_non_ascii |= !run.is_ascii();
+            let (run_len, run_non_ascii) = find_string_stop(remaining, delimiter);
+            has_non_ascii |= run_non_ascii;
             self.position += run_len;
             match self.peek() {
                 None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
@@ -2085,6 +2267,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     return Ok(span);
                 }
                 Some(b'\\') => {
+                    self.scanned_escape = true;
                     self.position += 1;
                     self.scan_escape()?;
                 }
@@ -2192,6 +2375,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     /// Scans an unquoted JSON5 identifier key, returning its raw span. Version one
     /// accepts ASCII identifier characters only, with no `\u` escapes.
     fn scan_identifier(&mut self) -> Result<Span, JsonError> {
+        // An identifier is ASCII letters, digits, `_` and `$`; no escapes exist.
+        self.scanned_escape = false;
         let start = self.position;
         match self.peek() {
             Some(byte) if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' => {
@@ -2219,22 +2404,48 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     /// `Reject` faulting. Small objects dedup with a linear scan; larger ones sort
     /// a permutation of key positions, so the work stays `O(n log n)` on any
     /// input — no hash, so no hash-collision denial of service.
-    fn dedup_object(&self, entries: &mut Vec<(B::Key, B::Value), A>) -> Result<(), JsonError> {
+    /// `keys_plain` says no key in this object contained an escape sequence, in
+    /// which case keys compare as raw bytes and no decoding is needed.
+    fn dedup_object(&self, entries: &mut Vec<(B::Key, B::Value), A>, keys_plain: bool) -> Result<(), JsonError> {
         if self.options.duplicate_keys == DuplicateKeys::KeepAll || entries.len() < 2 {
             return Ok(());
         }
         if entries.len() <= DEDUP_LINEAR_LIMIT {
-            self.dedup_linear(entries)
+            self.dedup_linear(entries, keys_plain)
         } else {
-            self.dedup_sorted(entries)
+            self.dedup_sorted(entries, keys_plain)
         }
     }
 
-    fn dedup_linear(&self, entries: &mut Vec<(B::Key, B::Value), A>) -> Result<(), JsonError> {
+    /// Orders two keys of the object being deduplicated. Deduplication is the
+    /// parser's hottest quadratic-ish inner loop, and on the zero-copy builder
+    /// the general comparison decodes both keys byte by byte through
+    /// [`UnescapeBytes`]. When the scanner saw no escape in any of this object's
+    /// keys — nearly always — the raw bytes are the decoded bytes, so the
+    /// comparison collapses to a length check and a `memcmp`.
+    #[inline]
+    fn compare_keys(&self, plain: bool, left: &B::Key, right: &B::Key) -> Ordering {
+        if plain {
+            B::key_compare_plain(self.source, left, right)
+        } else {
+            B::key_compare(self.source, left, right)
+        }
+    }
+
+    /// Whether two keys of the object being deduplicated are equal.
+    #[inline]
+    fn keys_equal(&self, plain: bool, left: &B::Key, right: &B::Key) -> bool {
+        if plain {
+            B::key_equals_plain(self.source, left, right)
+        } else {
+            B::key_compare(self.source, left, right) == Ordering::Equal
+        }
+    }
+
+    fn dedup_linear(&self, entries: &mut Vec<(B::Key, B::Value), A>, plain: bool) -> Result<(), JsonError> {
         let mut current = 1;
         while current < entries.len() {
-            let earlier = (0..current)
-                .find(|&j| B::key_compare(self.source, &entries[j].0, &entries[current].0) == Ordering::Equal);
+            let earlier = (0..current).find(|&j| self.keys_equal(plain, &entries[j].0, &entries[current].0));
             match earlier {
                 None => current += 1,
                 Some(first) => match self.options.duplicate_keys {
@@ -2253,8 +2464,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(())
     }
 
-    #[allow(clippy::type_complexity)] // the take-by-index slot buffer is local
-    fn dedup_sorted(&self, entries: &mut Vec<(B::Key, B::Value), A>) -> Result<(), JsonError> {
+    fn dedup_sorted(&self, entries: &mut Vec<(B::Key, B::Value), A>, plain: bool) -> Result<(), JsonError> {
         let count = entries.len();
 
         // Sort a permutation of positions by decoded key, so equal keys are adjacent.
@@ -2263,26 +2473,25 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         for position in 0..count {
             order.push(position);
         }
-        order.sort_unstable_by(|&a, &b| B::key_compare(self.source, &entries[a].0, &entries[b].0));
+        order.sort_unstable_by(|&a, &b| self.compare_keys(plain, &entries[a].0, &entries[b].0));
 
-        // Decide each position's fate: kept positions take their own value unless a
-        // later duplicate overrides it (`LastWins`); others are removed.
-        let mut removed: Vec<bool, A> = Vec::new_in(self.allocator.clone());
-        let mut value_from: Vec<usize, A> = Vec::new_in(self.allocator.clone());
-        removed.try_reserve(count).map_err(|_| JsonError::Allocation)?;
-        value_from.try_reserve(count).map_err(|_| JsonError::Allocation)?;
+        // Decide each position's fate in one buffer: `REMOVED` for a position that
+        // loses, otherwise the position whose value it should end up holding —
+        // itself, unless a later duplicate overrides it under `LastWins`. Folding
+        // the removal flag and the source index together halves this scratch
+        // space, which matters because every byte of it is arena garbage that
+        // outlives the call.
+        const REMOVED: usize = usize::MAX;
+        let mut fate: Vec<usize, A> = Vec::new_in(self.allocator.clone());
+        fate.try_reserve(count).map_err(|_| JsonError::Allocation)?;
         for position in 0..count {
-            removed.push(false);
-            value_from.push(position);
+            fate.push(position);
         }
 
         let mut run_start = 0;
         while run_start < count {
             let mut run_end = run_start + 1;
-            while run_end < count
-                && B::key_compare(self.source, &entries[order[run_end]].0, &entries[order[run_start]].0)
-                    == Ordering::Equal
-            {
+            while run_end < count && self.keys_equal(plain, &entries[order[run_end]].0, &entries[order[run_start]].0) {
                 run_end += 1;
             }
             if run_end - run_start > 1 {
@@ -2301,37 +2510,41 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 for slot in run_start..run_end {
                     let position = order[slot];
                     if position != first {
-                        removed[position] = true;
+                        fate[position] = REMOVED;
                     }
                 }
                 if self.options.duplicate_keys == DuplicateKeys::LastWins {
-                    value_from[first] = last;
+                    fate[first] = last;
                 }
             }
             run_start = run_end;
         }
 
-        // Rebuild in original order, moving a winning later value into its keeper.
-        let old = core::mem::replace(entries, Vec::new_in(self.allocator.clone()));
-        let mut slots: Vec<Option<(B::Key, B::Value)>, A> = Vec::new_in(self.allocator.clone());
-        slots.try_reserve(count).map_err(|_| JsonError::Allocation)?;
-        for entry in old {
-            slots.push(Some(entry));
-        }
+        // Pull each winning value back to its keeper. A keeper and the duplicate
+        // it takes from hold equal keys by construction, so swapping whole
+        // entries is the same as moving just the value — and it needs no spare
+        // storage, where taking values out by index would.
         for position in 0..count {
-            if removed[position] {
+            let source = fate[position];
+            if source != REMOVED && source != position {
+                entries.swap(position, source);
+            }
+        }
+
+        // Compact the survivors forward in place; the losers collect in the tail
+        // and are dropped by the truncate. Deduplication only ever shrinks the
+        // object, so no entry limit can be newly exceeded here.
+        let mut kept = 0;
+        for position in 0..count {
+            if fate[position] == REMOVED {
                 continue;
             }
-            let source = value_from[position];
-            let entry = if source == position {
-                slots[position].take().unwrap()
-            } else {
-                let key = slots[position].take().unwrap().0;
-                let value = slots[source].take().unwrap().1;
-                (key, value)
-            };
-            self.try_push(entries, entry)?;
+            if kept != position {
+                entries.swap(kept, position);
+            }
+            kept += 1;
         }
+        entries.truncate(kept);
         Ok(())
     }
 }
@@ -2418,6 +2631,18 @@ impl<A: Allocator + Clone> DomBuilder<A> for ViewBuilder {
     }
     fn key_compare(source: &[u8], left: &Span, right: &Span) -> Ordering {
         escaped_span_compare(source, *left, *right)
+    }
+    fn key_compare_plain(source: &[u8], left: &Span, right: &Span) -> Ordering {
+        // No escapes, so the raw span *is* the decoded text and a slice compare
+        // settles it — no decoding at all.
+        left.bytes(source)
+            .unwrap_or(&[])
+            .cmp(right.bytes(source).unwrap_or(&[]))
+    }
+    fn key_equals_plain(source: &[u8], left: &Span, right: &Span) -> bool {
+        // Spans of different length cannot be equal, and slice equality checks
+        // that before touching the bytes.
+        left.bytes(source).unwrap_or(&[]) == right.bytes(source).unwrap_or(&[])
     }
 }
 
@@ -2770,7 +2995,30 @@ pub struct JsonString<A: Allocator = Global>(Vec<u8, A>);
 type ObjectEntries<A> = Vec<(JsonString<A>, Json<A>), A>;
 
 impl<A: Allocator> JsonString<A> {
-    /// Decodes a validated JSON string `span` into a fresh owned string.
+    /// Decodes a JSON string `span` the parser itself produced, from the very
+    /// source it was scanned against, into a fresh owned string.
+    ///
+    /// Skips both validation passes [`from_span`](JsonString::from_span) makes,
+    /// which is sound only under those two conditions. [`Parser::scan_string`]
+    /// has already rejected invalid UTF-8, unescaped control bytes, and
+    /// malformed escapes, and decoding preserves well-formedness: literal bytes
+    /// are copied out of a valid-UTF-8 span, and every escape yields either
+    /// ASCII or a `char` encoded through `encode_utf8`. So the result is valid
+    /// UTF-8 by construction and re-checking it is pure overhead — measurably
+    /// so, since it runs once per string and once per key.
+    fn from_span_trusted(source: &[u8], span: Span, allocator: A) -> Result<Self, JsonError> {
+        let content = span.bytes(source).ok_or(JsonError::Syntax {
+            offset: span.start,
+            kind: SyntaxKind::InvalidString,
+        })?;
+        let mut bytes = Vec::new_in(allocator);
+        unescape_validated(content, span.start, &mut bytes)?;
+        Ok(JsonString(bytes))
+    }
+
+    /// Decodes a JSON string `span` into a fresh owned string, validating it
+    /// first. Used where the span may not have come from this parser, or may be
+    /// resolved against different bytes than it was scanned against.
     fn from_span(source: &[u8], span: Span, allocator: A) -> Result<Self, JsonError> {
         let mut bytes = Vec::new_in(allocator);
         unescape_into(source, span, &mut bytes)?;
@@ -2792,12 +3040,18 @@ impl<A: Allocator> JsonString<A> {
     }
 
     /// Copies raw `bytes` verbatim, without unescaping. Used for comment text,
-    /// which is not a JSON-escaped string. Falls back to allocation abort like
-    /// the other build-from-code paths. Non-UTF-8 bytes leave `as_str` empty.
-    fn from_bytes_in(bytes: &[u8], allocator: A) -> Self {
+    /// which is not a JSON-escaped string. This runs on the parse path, so it
+    /// allocates fallibly rather than aborting. Non-UTF-8 bytes leave `as_str`
+    /// empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JsonError::Allocation`] if the copy cannot be allocated.
+    fn try_from_bytes_in(bytes: &[u8], allocator: A) -> Result<Self, JsonError> {
         let mut buffer = Vec::new_in(allocator);
+        buffer.try_reserve(bytes.len()).map_err(|_| JsonError::Allocation)?;
         buffer.extend_from_slice(bytes);
-        JsonString(buffer)
+        Ok(JsonString(buffer))
     }
 
     /// The decoded string.
@@ -3167,15 +3421,26 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
     fn float(value: f64) -> Json<A> {
         Json::Float(value)
     }
+    // Every span reaching these three came from this parse, scanned against this
+    // very `source`, so they take the trusted decode and skip re-validating what
+    // the scanner already proved.
     fn string(source: &[u8], span: Span, allocator: &A) -> Result<Json<A>, JsonError> {
-        Ok(Json::String(JsonString::from_span(source, span, allocator.clone())?))
+        Ok(Json::String(JsonString::from_span_trusted(
+            source,
+            span,
+            allocator.clone(),
+        )?))
     }
     fn big_number(source: &[u8], span: Span, allocator: &A) -> Result<Json<A>, JsonError> {
-        // The number token has no escapes, so `from_span` copies it verbatim.
-        Ok(Json::BigNumber(JsonString::from_span(source, span, allocator.clone())?))
+        // The number token has no escapes, so this copies it verbatim.
+        Ok(Json::BigNumber(JsonString::from_span_trusted(
+            source,
+            span,
+            allocator.clone(),
+        )?))
     }
     fn key(source: &[u8], span: Span, allocator: &A) -> Result<JsonString<A>, JsonError> {
-        JsonString::from_span(source, span, allocator.clone())
+        JsonString::from_span_trusted(source, span, allocator.clone())
     }
     fn array(items: Vec<Json<A>, A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Json<A> {
         Json::Array(ArrayBody::from_parts(items, trivia))
@@ -3185,6 +3450,9 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
     }
     fn key_compare(_source: &[u8], left: &JsonString<A>, right: &JsonString<A>) -> Ordering {
         left.as_bytes().cmp(right.as_bytes())
+    }
+    fn key_equals_plain(_source: &[u8], left: &JsonString<A>, right: &JsonString<A>) -> bool {
+        left.as_bytes() == right.as_bytes()
     }
 }
 
@@ -5111,6 +5379,7 @@ pub use serde_impls::{from_value, to_value};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
 
     #[cfg(not(feature = "std"))]
     use alloc::string::{String, ToString};
@@ -5761,6 +6030,128 @@ mod tests {
         assert_eq!(root.get("a").get("b").elements().count(), 2);
     }
 
+    /// The scalar definition of the string-body stop, kept here purely as the
+    /// reference the SWAR scanner is checked against.
+    fn find_string_stop_scalar(bytes: &[u8], delimiter: u8) -> (usize, bool) {
+        let mut non_ascii = false;
+        for (index, &byte) in bytes.iter().enumerate() {
+            if byte == delimiter || byte == b'\\' || byte < 0x20 {
+                return (index, non_ascii);
+            }
+            non_ascii |= byte >= 0x80;
+        }
+        (bytes.len(), non_ascii)
+    }
+
+    #[test]
+    fn swar_string_scan_matches_the_scalar_definition() {
+        // Every stop byte at every offset within and past a word, against a
+        // filler that is ASCII, high-bit, or itself near a boundary value.
+        for &filler in &[b'a', 0x7f, 0x80, 0xff, 0x20, 0x21] {
+            for &stop in &[b'"', b'\'', b'\\', 0x00, 0x1f, 0x19] {
+                for length in 0..40usize {
+                    for position in 0..=length {
+                        let mut bytes = Vec::new();
+                        for _ in 0..length {
+                            bytes.push(filler);
+                        }
+                        if position < length {
+                            bytes[position] = stop;
+                        }
+                        for &delimiter in b"\"'" {
+                            assert_eq!(
+                                find_string_stop(&bytes, delimiter),
+                                find_string_stop_scalar(&bytes, delimiter),
+                                "filler={filler:#04x} stop={stop:#04x} len={length} pos={position} delim={delimiter:#04x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swar_string_scan_matches_scalar_on_pseudorandom_bytes() {
+        // A deterministic xorshift walk over arbitrary byte soup, which mixes
+        // stop bytes, high bytes and control bytes at unpredictable offsets.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for length in 0..64usize {
+            for _ in 0..64 {
+                let mut bytes = Vec::new();
+                for _ in 0..length {
+                    bytes.push(0u8);
+                }
+                for slot in bytes.iter_mut() {
+                    // Bias toward the interesting byte values.
+                    let value = next();
+                    *slot = match value % 4 {
+                        0 => (value >> 8) as u8,
+                        1 => b'"',
+                        2 => b'\\',
+                        _ => (value >> 16) as u8 | 0x80,
+                    };
+                }
+                for &delimiter in b"\"'" {
+                    assert_eq!(
+                        find_string_stop(&bytes, delimiter),
+                        find_string_stop_scalar(&bytes, delimiter),
+                        "bytes={bytes:?} delim={delimiter:#04x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dedup_sees_through_escapes_that_decode_equal() {
+        // The parser tracks whether any key in an object was escaped so that the
+        // common all-plain object can deduplicate on raw bytes. These keys are
+        // textually different but decode to the same string, so they must still
+        // collapse — the raw-byte shortcut would wrongly keep both.
+        // The first key is written as a `\\u` escape, the second literally.
+        let source = r#"{"na\u00efve":1,"naïve":2}"#.as_bytes();
+        let document = view(source).unwrap();
+        assert_eq!(document.len(), 1, "escaped and literal keys must deduplicate");
+        assert_eq!(document.get(source, "naïve").and_then(|value| value.as_u64()), Some(2));
+
+        let owned = parse(source).unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned["naïve"].as_u64(), Some(2));
+
+        // The same, past the linear-scan threshold so the sorted path runs.
+        let mut wide = Vec::new();
+        wide.extend_from_slice(r#"{"na\u00efve":1,"naïve":2"#.as_bytes());
+        for key in 0..(DEDUP_LINEAR_LIMIT + 4) {
+            wide.extend_from_slice(br#","filler_"#);
+            wide.push(b'0' + (key / 10) as u8);
+            wide.push(b'0' + (key % 10) as u8);
+            wide.extend_from_slice(b"\":0");
+        }
+        wide.push(b'}');
+        let document = view(&wide).unwrap();
+        assert_eq!(document.len(), DEDUP_LINEAR_LIMIT + 5);
+        assert_eq!(document.get(&wide, "naïve").and_then(|value| value.as_u64()), Some(2));
+    }
+
+    #[test]
+    fn dedup_still_collapses_plain_duplicate_keys() {
+        // The escape-free path, which is the one the fast comparison takes.
+        let source = br#"{"a":1,"b":2,"a":3}"#;
+        assert_eq!(view(source).unwrap().len(), 2);
+        assert_eq!(
+            view(source).unwrap().get(source, "a").and_then(|value| value.as_u64()),
+            Some(3)
+        );
+        assert_eq!(parse(source).unwrap()["a"].as_u64(), Some(3));
+    }
+
     #[test]
     fn bound_view_carries_its_source() {
         let document = view_bound(br#"{"a":{"b":[10,20]}}"#).unwrap();
@@ -5823,6 +6214,131 @@ mod tests {
         unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: core::alloc::Layout) {
             Global.deallocate(ptr, layout)
         }
+    }
+
+    /// An allocator with a byte budget: it forwards to the global heap until
+    /// `remaining` is exhausted, then fails every further request. Parsing under
+    /// it must surface [`JsonError::Allocation`] rather than aborting, which is
+    /// the only way to exercise the parser's fallible-allocation paths.
+    struct Budget {
+        remaining: Cell<usize>,
+    }
+
+    impl Budget {
+        fn new(bytes: usize) -> Self {
+            Budget {
+                remaining: Cell::new(bytes),
+            }
+        }
+    }
+
+    // Implemented for the shared reference so `&Budget` is `Copy` and satisfies
+    // the parser's `Allocator + Clone` bound directly.
+    unsafe impl Allocator for &Budget {
+        fn allocate(
+            &self,
+            layout: core::alloc::Layout,
+        ) -> Result<core::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+            let size = layout.size();
+            if size > self.remaining.get() {
+                return Err(allocator_api2::alloc::AllocError);
+            }
+            let block = Global.allocate(layout)?;
+            self.remaining.set(self.remaining.get() - size);
+            Ok(block)
+        }
+        unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: core::alloc::Layout) {
+            Global.deallocate(ptr, layout)
+        }
+    }
+
+    /// Parses `source` under every budget from 0 up to the amount a full parse
+    /// needs, asserting that each attempt either succeeds or reports
+    /// [`JsonError::Allocation`] — never a panic, an abort, or a bogus syntax
+    /// fault. Sweeping the whole range walks the failure point across every
+    /// allocation site the document reaches.
+    fn sweep_allocation_failures(source: &[u8], options: &ParseOptions) {
+        // Establish the high-water mark with an effectively unlimited budget.
+        let generous = Budget::new(usize::MAX);
+        assert!(
+            parse_in_with(source, &generous, options).is_ok(),
+            "the document should parse when memory is plentiful"
+        );
+        let needed = usize::MAX - generous.remaining.get();
+        assert!(needed > 0, "parsing should have allocated something");
+
+        for budget in 0..=needed {
+            {
+                let limited = Budget::new(budget);
+                // Bound after the allocator so the borrowing document drops first.
+                let outcome = parse_in_with(source, &limited, options);
+                match outcome {
+                    Ok(_) | Err(JsonError::Allocation) => {}
+                    Err(other) => panic!("budget {budget} produced {other:?} rather than an allocation failure"),
+                }
+            }
+            // The zero-copy builder shares the same parser and must behave alike.
+            {
+                let limited = Budget::new(budget);
+                let outcome = view_in_with(source, &limited, options);
+                match outcome {
+                    Ok(_) | Err(JsonError::Allocation) => {}
+                    Err(other) => panic!("budget {budget} produced {other:?} on the view path"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_failure_is_reported_not_aborted() {
+        // Exercises container frames, entry pushes, decoded keys and strings, and
+        // the big-number path.
+        sweep_allocation_failures(
+            br#"{"key":"value","nested":[1,2,{"deep":"text"}],"big":123456789012345678901234567890}"#,
+            &ParseOptions::default(),
+        );
+    }
+
+    #[test]
+    fn allocation_failure_is_reported_for_escaped_strings() {
+        // Escaped bodies take the decoding branch of `unescape_into` rather than
+        // the verbatim copy.
+        sweep_allocation_failures(
+            r#"{"naïve":"a\tb\nc","emoji":"😀"}"#.as_bytes(),
+            &ParseOptions::default(),
+        );
+    }
+
+    #[test]
+    fn allocation_failure_is_reported_while_preserving_comments() {
+        // Regression test for the comment-text allocation, which previously used
+        // an infallible copy and would abort instead of returning an error.
+        let options = ParseOptions::json5().preserve_comments(true);
+        sweep_allocation_failures(
+            b"{\n  // leading\n  a: 1, /* trailing */\n  b: [2], // tail\n}",
+            &options,
+        );
+    }
+
+    #[test]
+    fn allocation_failure_is_reported_for_wide_objects() {
+        // More than `DEDUP_LINEAR_LIMIT` entries, so the sorted dedup path and its
+        // scratch buffers are the ones that run out of memory.
+        // Built without `format!`, which needs `alloc::format` under `no_std`.
+        let mut source = Vec::new();
+        source.push(b'{');
+        for key in 0..(DEDUP_LINEAR_LIMIT + 8) {
+            if key > 0 {
+                source.push(b',');
+            }
+            source.extend_from_slice(b"\"field_");
+            source.push(b'0' + (key / 10) as u8);
+            source.push(b'0' + (key % 10) as u8);
+            source.extend_from_slice(b"\":");
+            source.push(b'0' + (key % 10) as u8);
+        }
+        source.push(b'}');
+        sweep_allocation_failures(&source, &ParseOptions::default());
     }
 
     #[test]

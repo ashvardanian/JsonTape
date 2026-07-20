@@ -5,11 +5,26 @@ edition = "2021"
 authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
 description = "A minimalistic allocator-aware, zero-copy JSON & JSON5 parser in pure Rust"
 license = "Apache-2.0"
-keywords = ["json", "parser", "no-std", "allocator", "zero-copy"]
-categories = ["parser-implementations", "no-std"]
+readme = "README.md"
+repository = "https://github.com/ashvardanian/JsonTape"
+documentation = "https://docs.rs/jsontape"
+homepage = "https://github.com/ashvardanian/JsonTape"
+# 1.70 is the floor: `Option::is_some_and` stabilized there. Verified by building
+# the library with 1.70 and confirming 1.65 fails.
+rust-version = "1.70"
+keywords = ["json", "json5", "parser", "no-std", "zero-copy"]
+categories = ["parser-implementations", "no-std", "encoding"]
+# `scripts/` holds the benchmark and fuzz harnesses, which are dev-only; the
+# published crate is the single library file.
+exclude = [".github/", "data/"]
 
 [lib]
 path = "jsontape.rs"
+
+# Without this, docs.rs builds only the default `std` feature and the entire
+# `serde` API would be missing from the published documentation.
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 allocator-api2 = { version = "0.4", default-features = false, features = [
@@ -31,6 +46,15 @@ simd-json = "0.14"
 name = "bench"
 path = "scripts/bench.rs"
 harness = false
+
+# The parser stress harness. An example rather than a `cargo-fuzz` target so the
+# repository keeps a flat layout and no extra crate, and an example rather than a
+# binary because only examples get `dev-dependencies` — which is what lets the
+# harness cross-check against `serde_json`. Run it with
+# `cargo run --release --example fuzz -- <cases> <max-length> [hex-seed]`.
+[[example]]
+name = "fuzz"
+path = "scripts/fuzz.rs"
 
 [features]
 default = ["std"]

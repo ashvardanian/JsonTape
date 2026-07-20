@@ -1,3 +1,40 @@
+//! Criterion suite comparing JsonTape's parsers against `serde_json`,
+//! `simd-json`, and the `json5` crate.
+//!
+//! # Apples-to-apples notes
+//!
+//! Every configuration below fully parses and validates its input in one call —
+//! UTF-8 checked, escapes checked, structure checked — and produces a fully
+//! navigable document; none of them are lazy or defer syntax errors. All of
+//! them also deduplicate repeated object keys with last-wins semantics. Where
+//! they differ is the *shape* of the output, which the benchmark ids spell out:
+//!
+//! | id                              | DOM       | mutable | strings                        | key order   | numbers               |
+//! | ------------------------------- | --------- | ------- | ------------------------------ | ----------- | --------------------- |
+//! | `jsontape-owned-mut-dom`        | owned     | yes     | decoded at parse               | source      | i64/u64/f64 + lossless big |
+//! | `jsontape-view-imm-spans`       | zero-copy | no      | validated, decode deferred     | source      | i64/u64/f64 + lossless big |
+//! | `jsontape-bound-view-imm-spans` | zero-copy | no      | validated, decode deferred     | source      | i64/u64/f64 + lossless big |
+//! | `serde-json-owned-mut-dom`      | owned     | yes     | decoded at parse               | sorted (BTreeMap) | i64/u64/f64     |
+//! | `simd-json-owned-mut-dom`       | owned     | yes     | decoded at parse               | hashed      | i64/u64/f64           |
+//! | `simd-json-borrowed-cow-dom`    | borrows input | yes | decoded in place, `Cow` spans  | hashed      | i64/u64/f64           |
+//! | `json5-crate-serde-mut-dom`     | owned     | yes     | decoded at parse               | sorted (BTreeMap) | everything as f64 |
+//!
+//! So `jsontape-owned-mut-dom` reads against the other owned rows, and
+//! `jsontape-view-imm-spans` against `simd-json-borrowed-cow-dom` — with the
+//! caveat that the view keeps strings still-escaped (validation done, decoding
+//! deferred to first use) while simd-json unescapes into the input buffer.
+//! The `json5` crate accepts strict JSON too (JSON5 is a superset), so it runs
+//! in the strict group as well; note it funnels every number through `f64`, so
+//! integers past 2^53 are approximated where the others keep exact lanes.
+//!
+//! simd-json requires a mutable input buffer, so its rows re-memcpy the
+//! pristine source into one reused buffer each iteration — no per-iteration
+//! allocation, just the copy an in-place parser inherently needs when the
+//! source must be kept — and reuse one set of scratch `Buffers` across runs
+//! (its analogue to JsonTape reusing an arena). Every row times parsing plus
+//! the drop of that iteration's document, which is exactly where the `-arena`
+//! rows' O(1) teardown shows up.
+
 use allocator_api2::alloc::{AllocError, Allocator, Layout};
 use core::cell::Cell;
 use core::ops::Range;
@@ -5,6 +42,36 @@ use core::ptr::NonNull;
 use criterion::measurement::WallTime;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion, Throughput};
 use jsontape::{parse, parse_in, parse_with, view, view_bound, view_in, view_in_bound_with, view_with, ParseOptions};
+
+/// `jsontape::parse`: owned, mutable DOM; strings decoded into the document's
+/// allocator at parse time, keys deduped in source order.
+const JSONTAPE_OWNED: &str = "jsontape-owned-mut-dom";
+/// `jsontape::view`: immutable zero-copy DOM of spans into the source; strings
+/// validated at parse but kept escaped, decode deferred to first use.
+const JSONTAPE_VIEW: &str = "jsontape-view-imm-spans";
+/// `jsontape::view_bound`: the same zero-copy DOM, permanently paired with its
+/// source so navigation cannot receive mismatched bytes.
+const JSONTAPE_BOUND_VIEW: &str = "jsontape-bound-view-imm-spans";
+/// `jsontape::parse_in` into a reused bump arena, reset between documents.
+const JSONTAPE_OWNED_ARENA: &str = "jsontape-owned-mut-dom-arena";
+/// `jsontape::view_in` into a reused bump arena, reset between documents.
+const JSONTAPE_VIEW_ARENA: &str = "jsontape-view-imm-spans-arena";
+/// `jsontape::parse_with` and `preserve_comments(true)`: the owned DOM plus
+/// round-trippable comments — the feature the peer crates drop.
+const JSONTAPE_OWNED_COMMENTS: &str = "jsontape-owned-mut-dom-comments";
+/// `serde_json::from_slice::<Value>`: owned, mutable DOM; its object is a
+/// `BTreeMap`, so source key order is replaced by sorted order.
+const SERDE_JSON_OWNED: &str = "serde-json-owned-mut-dom";
+/// `simd_json::to_owned_value_with_buffers`: owned, mutable DOM; hashed object,
+/// input rewritten in place from a reused buffer.
+const SIMD_JSON_OWNED: &str = "simd-json-owned-mut-dom";
+/// `simd_json::to_borrowed_value_with_buffers`: mutable DOM of `Cow` strings
+/// borrowing the (in-place unescaped) input buffer — the closest peer to the
+/// JsonTape views.
+const SIMD_JSON_BORROWED: &str = "simd-json-borrowed-cow-dom";
+/// `json5::from_str::<serde_json::Value>`: owned, mutable DOM via the PEG-based
+/// json5 crate; every number becomes an `f64`.
+const JSON5_CRATE: &str = "json5-crate-serde-mut-dom";
 
 const SMALL: usize = 256;
 const KIB_4: usize = 4 * 1024;
@@ -149,7 +216,9 @@ fn nested_document() -> Vec<u8> {
         source.extend_from_slice(format!(r#"{{"level_{level}":"#).as_bytes());
     }
     source.extend_from_slice(br#"[0,1,2,{"leaf":true}]"#);
-    source.extend(core::iter::repeat_n(b'}', 32));
+    // `repeat().take()` rather than `repeat_n`, which needs Rust 1.82 and would
+    // push the crate's declared MSRV up for a dev-only benchmark.
+    source.extend(core::iter::repeat(b'}').take(32));
     source
 }
 
@@ -187,31 +256,57 @@ fn json5_workloads() -> Vec<Workload> {
 /// JsonTape's global-allocator parses: decoded owned DOM, zero-copy view, and
 /// source-bound view. Shared by every whole-document parse group.
 fn bench_jsontape_global(group: &mut BenchmarkGroup<'_, WallTime>, name: &str, source: &[u8]) {
-    group.bench_function(BenchmarkId::new("owned", name), |bench| {
+    group.bench_function(BenchmarkId::new(JSONTAPE_OWNED, name), |bench| {
         bench.iter(|| black_box(parse(black_box(source)).unwrap()))
     });
-    group.bench_function(BenchmarkId::new("view", name), |bench| {
+    group.bench_function(BenchmarkId::new(JSONTAPE_VIEW, name), |bench| {
         bench.iter(|| black_box(view(black_box(source)).unwrap()))
     });
-    group.bench_function(BenchmarkId::new("bound-view", name), |bench| {
+    group.bench_function(BenchmarkId::new(JSONTAPE_BOUND_VIEW, name), |bench| {
         bench.iter(|| black_box(view_bound(black_box(source)).unwrap()))
     });
 }
 
-/// The fully-owned-DOM peers: `serde_json` and `simd-json`. Both eagerly decode
-/// every number and string into owned storage, so they are same-output-shape
-/// comparisons to `owned`. simd-json rewrites its input in place, so it clones a
-/// fresh buffer each run, and reuses one set of scratch `Buffers` across runs (its
-/// analogue to JsonTape reusing an arena).
+/// The `serde_json` and `simd-json` peers. `serde_json` and the owned simd-json
+/// row eagerly decode every number and string into owned storage, so they are
+/// same-output-shape comparisons to `jsontape-owned-mut-dom`; the borrowed
+/// simd-json row keeps `Cow` spans into the input and reads against the views.
+/// simd-json rewrites its input in place, so both its rows re-memcpy the
+/// pristine source into one reused buffer per iteration and share one set of
+/// scratch `Buffers` across runs.
 fn bench_dom_peers(group: &mut BenchmarkGroup<'_, WallTime>, name: &str, source: &[u8]) {
-    group.bench_function(BenchmarkId::new("serde-json-owned", name), |bench| {
+    group.bench_function(BenchmarkId::new(SERDE_JSON_OWNED, name), |bench| {
         bench.iter(|| black_box(serde_json::from_slice::<serde_json::Value>(black_box(source)).unwrap()))
     });
-    group.bench_function(BenchmarkId::new("simd-json-owned", name), |bench| {
+    group.bench_function(BenchmarkId::new(SIMD_JSON_OWNED, name), |bench| {
         let mut buffers = simd_json::Buffers::new(source.len());
+        let mut buffer = source.to_vec();
         bench.iter(|| {
-            let mut buffer = source.to_vec();
-            black_box(simd_json::to_owned_value_with_buffers(black_box(&mut buffer), &mut buffers).unwrap())
+            buffer.copy_from_slice(black_box(source));
+            black_box(simd_json::to_owned_value_with_buffers(buffer.as_mut_slice(), &mut buffers).unwrap())
+        })
+    });
+    group.bench_function(BenchmarkId::new(SIMD_JSON_BORROWED, name), |bench| {
+        let mut buffers = simd_json::Buffers::new(source.len());
+        let mut buffer = source.to_vec();
+        bench.iter(|| {
+            buffer.copy_from_slice(black_box(source));
+            black_box(simd_json::to_borrowed_value_with_buffers(buffer.as_mut_slice(), &mut buffers).unwrap());
+        })
+    });
+}
+
+/// The `json5` crate parsing from a `&str` into `serde_json::Value`. JSON5 is a
+/// superset of JSON, so this peer joins both the strict and the json5 groups.
+///
+/// Its API takes a `&str`, so the UTF-8 validation the other rows perform on
+/// their `&[u8]` inputs happens here in `from_utf8` — timed, to keep the
+/// validation work identical across rows.
+fn bench_json5_crate(group: &mut BenchmarkGroup<'_, WallTime>, name: &str, source: &[u8]) {
+    group.bench_function(BenchmarkId::new(JSON5_CRATE, name), |bench| {
+        bench.iter(|| {
+            let text = core::str::from_utf8(black_box(source)).unwrap();
+            black_box(json5::from_str::<serde_json::Value>(text).unwrap())
         })
     });
 }
@@ -223,28 +318,37 @@ fn bench_strict_parse(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(workload.source.len() as u64));
         bench_jsontape_global(&mut group, &workload.name, &workload.source);
         bench_dom_peers(&mut group, &workload.name, &workload.source);
+        bench_json5_crate(&mut group, &workload.name, &workload.source);
     }
     group.finish();
 }
 
 fn bench_json5_parse(c: &mut Criterion) {
     let options = ParseOptions::json5();
+    let comment_options = ParseOptions::json5().preserve_comments(true);
     let workloads = json5_workloads();
     let mut group = c.benchmark_group("parse-json5");
     for workload in &workloads {
         group.throughput(Throughput::Bytes(workload.source.len() as u64));
         group.bench_with_input(
-            BenchmarkId::new("owned", &workload.name),
+            BenchmarkId::new(JSONTAPE_OWNED, &workload.name),
             &workload.source,
             |bench, source| bench.iter(|| black_box(parse_with(black_box(source), &options).unwrap())),
         );
+        // The comment-preserving round trip — the one output shape no peer here
+        // can produce — priced against the comment-dropping rows above.
         group.bench_with_input(
-            BenchmarkId::new("view", &workload.name),
+            BenchmarkId::new(JSONTAPE_OWNED_COMMENTS, &workload.name),
+            &workload.source,
+            |bench, source| bench.iter(|| black_box(parse_with(black_box(source), &comment_options).unwrap())),
+        );
+        group.bench_with_input(
+            BenchmarkId::new(JSONTAPE_VIEW, &workload.name),
             &workload.source,
             |bench, source| bench.iter(|| black_box(view_with(black_box(source), &options).unwrap())),
         );
         group.bench_with_input(
-            BenchmarkId::new("bound-view", &workload.name),
+            BenchmarkId::new(JSONTAPE_BOUND_VIEW, &workload.name),
             &workload.source,
             |bench, source| {
                 bench.iter(|| {
@@ -252,19 +356,17 @@ fn bench_json5_parse(c: &mut Criterion) {
                 })
             },
         );
-        // The json5 crate is the natural JSON5 peer; it parses from a &str.
-        group.bench_with_input(
-            BenchmarkId::new("json5-crate", &workload.name),
-            &workload.source,
-            |bench, source| {
-                let text = core::str::from_utf8(source).unwrap();
-                bench.iter(|| black_box(json5::from_str::<serde_json::Value>(black_box(text)).unwrap()))
-            },
-        );
+        // The json5 crate is the natural JSON5 peer; serde_json and simd-json
+        // cannot parse these documents at all.
+        bench_json5_crate(&mut group, &workload.name, &workload.source);
     }
     group.finish();
 }
 
+/// Compact serialization from an already-parsed document to a fresh `String`.
+/// Every row renders the same document, so these are directly comparable; the
+/// JsonTape view rows re-emit their still-escaped source spans verbatim where
+/// the owned rows re-escape decoded strings.
 fn bench_serialize(c: &mut Criterion) {
     let cases = [
         ("object-4k", object_keys(KIB_4)),
@@ -276,16 +378,33 @@ fn bench_serialize(c: &mut Criterion) {
         let owned = parse(source).unwrap();
         let borrowed = view(source).unwrap();
         let bound = view_bound(source).unwrap();
+        let serde_value: serde_json::Value = serde_json::from_slice(source).unwrap();
+        let simd_value = {
+            let mut buffer = source.to_vec();
+            simd_json::to_owned_value(&mut buffer).unwrap()
+        };
         group.throughput(Throughput::Bytes(source.len() as u64));
-        group.bench_with_input(BenchmarkId::new("owned", name), &owned, |bench, document| {
+        group.bench_with_input(BenchmarkId::new(JSONTAPE_OWNED, name), &owned, |bench, document| {
             bench.iter(|| black_box(document.to_string()))
         });
-        group.bench_with_input(BenchmarkId::new("view", name), &borrowed, |bench, document| {
+        group.bench_with_input(BenchmarkId::new(JSONTAPE_VIEW, name), &borrowed, |bench, document| {
             bench.iter(|| black_box(document.to_json_string(black_box(source))))
         });
-        group.bench_with_input(BenchmarkId::new("bound-view", name), &bound, |bench, document| {
-            bench.iter(|| black_box(document.to_json_string()))
-        });
+        group.bench_with_input(
+            BenchmarkId::new(JSONTAPE_BOUND_VIEW, name),
+            &bound,
+            |bench, document| bench.iter(|| black_box(document.to_json_string())),
+        );
+        group.bench_with_input(
+            BenchmarkId::new(SERDE_JSON_OWNED, name),
+            &serde_value,
+            |bench, document| bench.iter(|| black_box(serde_json::to_string(document).unwrap())),
+        );
+        group.bench_with_input(
+            BenchmarkId::new(SIMD_JSON_OWNED, name),
+            &simd_value,
+            |bench, document| bench.iter(|| black_box(simd_json::to_string(document).unwrap())),
+        );
     }
     group.finish();
 }
@@ -376,21 +495,25 @@ fn bench_data(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(source.len() as u64));
         bench_jsontape_global(&mut group, &workload.name, source);
         // The flagship configurations: parse into a reused bump arena, so no run
-        // touches the global allocator. `owned-arena` is a decoded DOM in the
-        // arena; `view-arena` keeps zero-copy spans in the arena.
-        group.bench_function(BenchmarkId::new("owned-arena", &workload.name), |bench| {
+        // touches the global allocator. `owned-mut-dom-arena` is a decoded DOM in
+        // the arena; `view-imm-spans-arena` keeps zero-copy spans in the arena.
+        group.bench_function(BenchmarkId::new(JSONTAPE_OWNED_ARENA, &workload.name), |bench| {
             bench.iter(|| {
                 arena.reset();
                 black_box(parse_in(black_box(source), &arena).unwrap())
             })
         });
-        group.bench_function(BenchmarkId::new("view-arena", &workload.name), |bench| {
+        group.bench_function(BenchmarkId::new(JSONTAPE_VIEW_ARENA, &workload.name), |bench| {
             bench.iter(|| {
                 arena.reset();
                 black_box(view_in(black_box(source), &arena).unwrap())
             })
         });
         bench_dom_peers(&mut group, &workload.name, source);
+        // JSON5 is a superset of JSON, so the json5 crate parses these strict
+        // documents too — the row that prices JsonTape's JSON5 support against
+        // the only other JSON5 parser in the ecosystem.
+        bench_json5_crate(&mut group, &workload.name, source);
     }
     group.finish();
 }
@@ -409,21 +532,21 @@ fn bench_ndjson(c: &mut Criterion) {
         let records = &workload.records;
         let total: usize = records.iter().map(|record| record.len()).sum();
         group.throughput(Throughput::Bytes(total as u64));
-        group.bench_function(BenchmarkId::new("owned", &workload.name), |bench| {
+        group.bench_function(BenchmarkId::new(JSONTAPE_OWNED, &workload.name), |bench| {
             bench.iter(|| {
                 for record in records {
                     black_box(parse(black_box(&source[record.clone()])).unwrap());
                 }
             })
         });
-        group.bench_function(BenchmarkId::new("view", &workload.name), |bench| {
+        group.bench_function(BenchmarkId::new(JSONTAPE_VIEW, &workload.name), |bench| {
             bench.iter(|| {
                 for record in records {
                     black_box(view(black_box(&source[record.clone()])).unwrap());
                 }
             })
         });
-        group.bench_function(BenchmarkId::new("owned-arena", &workload.name), |bench| {
+        group.bench_function(BenchmarkId::new(JSONTAPE_OWNED_ARENA, &workload.name), |bench| {
             bench.iter(|| {
                 for record in records {
                     arena.reset();
@@ -431,7 +554,7 @@ fn bench_ndjson(c: &mut Criterion) {
                 }
             })
         });
-        group.bench_function(BenchmarkId::new("view-arena", &workload.name), |bench| {
+        group.bench_function(BenchmarkId::new(JSONTAPE_VIEW_ARENA, &workload.name), |bench| {
             bench.iter(|| {
                 for record in records {
                     arena.reset();
@@ -439,24 +562,38 @@ fn bench_ndjson(c: &mut Criterion) {
                 }
             })
         });
-        group.bench_function(BenchmarkId::new("serde-json-owned", &workload.name), |bench| {
+        group.bench_function(BenchmarkId::new(SERDE_JSON_OWNED, &workload.name), |bench| {
             bench.iter(|| {
                 for record in records {
                     black_box(serde_json::from_slice::<serde_json::Value>(black_box(&source[record.clone()])).unwrap());
                 }
             })
         });
-        group.bench_function(BenchmarkId::new("simd-json-owned", &workload.name), |bench| {
+        // simd-json mutates its input in place, so both rows restore the whole
+        // file into one reused buffer per iteration, then parse each record's
+        // slice in place while sharing one set of scratch buffers across the
+        // stream — the fair analogue to arena reuse.
+        group.bench_function(BenchmarkId::new(SIMD_JSON_OWNED, &workload.name), |bench| {
             let capacity = records.iter().map(|record| record.len()).max().unwrap_or(0);
             let mut buffers = simd_json::Buffers::new(capacity + 64);
+            let mut whole = source.to_vec();
             bench.iter(|| {
-                // simd-json mutates its input in place, so clone the file once, then
-                // parse each record's slice in place while reusing one set of scratch
-                // buffers across the whole stream — the fair analogue to arena reuse.
-                let mut whole = source.to_vec();
+                whole.copy_from_slice(black_box(source));
                 for record in records {
                     let slice = &mut whole[record.clone()];
-                    black_box(simd_json::to_owned_value_with_buffers(black_box(slice), &mut buffers).unwrap());
+                    black_box(simd_json::to_owned_value_with_buffers(slice, &mut buffers).unwrap());
+                }
+            })
+        });
+        group.bench_function(BenchmarkId::new(SIMD_JSON_BORROWED, &workload.name), |bench| {
+            let capacity = records.iter().map(|record| record.len()).max().unwrap_or(0);
+            let mut buffers = simd_json::Buffers::new(capacity + 64);
+            let mut whole = source.to_vec();
+            bench.iter(|| {
+                whole.copy_from_slice(black_box(source));
+                for record in records {
+                    let slice = &mut whole[record.clone()];
+                    black_box(simd_json::to_borrowed_value_with_buffers(slice, &mut buffers).unwrap());
                 }
             })
         });

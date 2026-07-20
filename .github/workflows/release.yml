@@ -1,7 +1,12 @@
 name: Release
 
+# Pull requests run the `test` and `fuzz` jobs only, so a merge is gated by the
+# same checks that gate a release. `versioning` and `publish_rust` are guarded on
+# the event so a pull request never bumps a version or publishes.
 on:
   push:
+    branches: ["main"]
+  pull_request:
     branches: ["main"]
 
 env:
@@ -15,6 +20,7 @@ jobs:
   versioning:
     name: Update Version
     runs-on: ubuntu-24.04
+    if: github.event_name == 'push'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -44,21 +50,41 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-      - name: Test `std`
-        run: cargo test
-      - name: Test `no_std`
-        run: cargo test --no-default-features
-      - name: Test `serde`
-        run: cargo test --features serde
-      - name: Test `serde` on `no_std`
-        run: cargo test --no-default-features --features serde
+          components: clippy, rustfmt
+          # A genuinely `std`-free target: `cargo test --no-default-features`
+          # still links `std` through libtest, so only a cross build proves the
+          # `no_std` claim.
+          targets: thumbv7em-none-eabihf
+      - name: Format
+        run: cargo fmt --check
+      - name: Test feature permutations
+        run: |
+          for features in \
+            "" \
+            "--no-default-features" \
+            "--features serde" \
+            "--no-default-features --features serde"; do
+            echo "::group::cargo test --locked $features"
+            cargo test --locked $features
+            echo "::endgroup::"
+          done
+      - name: Build for a `no_std` target
+        run: |
+          for features in "--no-default-features" "--no-default-features --features serde"; do
+            echo "::group::cargo build --target thumbv7em-none-eabihf $features"
+            cargo build --locked --lib --target thumbv7em-none-eabihf $features
+            echo "::endgroup::"
+          done
       - name: Test docs
-        run: cargo test --doc
+        run: cargo test --locked --doc
+      - name: Check documentation
+        run: cargo doc --locked --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Compile benches
-        run: cargo bench --no-run
+        run: cargo bench --locked --no-run
 
   fuzz:
     name: Fuzz
@@ -68,18 +94,19 @@ jobs:
         uses: actions/checkout@v5
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+      # Seeded from the run id rather than the harness default, so each run
+      # explores fresh inputs instead of replaying one fixed set forever. The
+      # seed is printed on failure, so any finding replays exactly.
       - name: Fuzz the parser
-        run: |
-          cargo build
-          rustc --edition=2021 scripts/fuzz.rs \
-            --extern jsontape=target/debug/libjsontape.rlib \
-            -L dependency=target/debug/deps -o fuzz
-          ./fuzz 100000 512
+        run: cargo run --locked --release --example fuzz -- 200000 512 "$(printf '%x' ${{ github.run_id }})"
 
   publish_rust:
     name: Publish to crates.io
     runs-on: ubuntu-24.04
     needs: [versioning, test, fuzz]
+    # A skipped `versioning` would already skip this job, but state the condition
+    # outright so removing that guard cannot start publishing from pull requests.
+    if: github.event_name == 'push'
     steps:
       - name: Checkout
         uses: actions/checkout@v5

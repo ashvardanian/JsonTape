@@ -177,6 +177,7 @@ JsonTape is positioned on its memory model and safety, not on raw SIMD throughpu
 
 - __Embedded and `no_std`__ — a full mutable DOM in a bump arena, where `serde_json`'s `Value` cannot follow and SIMD parsers need `std`.
   The parse path uses fallible allocation and returns an error instead of aborting, and never panics on hostile input.
+  The library contains no `unsafe` at all, enforced by `forbid(unsafe_code)` rather than by convention, and CI builds it for a bare-metal `thumbv7em-none-eabihf` target so the `no_std` claim is checked and not merely asserted.
 - __WASM and the edge__ — small and dependency-free beyond the allocator shim, and deterministic, with a configurable depth limit that bounds the stack on adversarial nesting.
 - __Blockchain and financial__ — integer amounts wider than `u64` and decimals outside the `f64` range survive verbatim, so money never silently rounds, under deterministic `no_std` execution.
 - __Per-request arenas and telemetry__ — parse a payload into an arena, read it, and reclaim it all in one `O(1)` teardown; or take the zero-copy `JsonView` and never decode at all.
@@ -189,18 +190,21 @@ A blunt, honest comparison, where ● is first-class, ◐ is partial or behind a
 | JSON5 leniency, opt-in              |            ○ |       ● |          ● |
 | Comment-preserving round trip       |            ○ |       ○ |          ● |
 | Configurable duplicate-key policy   |            ○ |       ○ |          ● |
+| Source key order preserved          |            ◐ |       ○ |          ● |
 | Zero-copy borrowed DOM              |            ○ |       ○ |          ● |
 | Custom [`allocator_api2`] allocator |            ○ |       ○ |          ● |
 | `O(1)` arena teardown               |            ○ |       ○ |          ● |
 | `no_std` with `alloc`               |            ◐ |       ○ |          ● |
 | Fallible allocation on parse        |            ○ |       ○ |          ● |
+| No `unsafe` anywhere in the library |            ○ |       ● |          ● |
 | Lossless numbers past 64 bits       |            ◐ |       ○ |          ● |
 | Width-based pretty-printing         |            ○ |       ○ |          ● |
 | Serde derive to and from user types |            ● |       ● |          ◐ |
 | Streaming reader and writer         |            ● |       ○ |          ○ |
 | Ecosystem maturity and adoption     |            ● |       ◐ |          ○ |
 
-Peak SIMD throughput belongs to parsers like [`simd-json`]; JsonTape trades that for its memory model, safety, and `no_std` reach.
+Peak throughput on string-dense documents still belongs to SIMD parsers like [`simd-json`], and JsonTape trades that for its memory model, safety, and `no_std` reach.
+It is worth knowing how narrow the gap is, though: on number-dense and object-key-dense documents the arena configurations measured below come out ahead, and on an NDJSON stream the zero-copy view lands within a few percent.
 
 ## Allocators
 
@@ -226,8 +230,9 @@ Because `reset` takes `&mut self` and every allocation borrows the arena with `&
 
 ## JSON5 Support and Its Boundary
 
-JsonTape implements the widely-used JSON5 extensions, each a separate `ParseOptions` flag under the `strict`, `jsonc`, and `json5` presets:
-line and block comments, trailing commas, unquoted keys, single-quoted strings, the string escapes `\'` `\v` `\0` `\xHH` and line continuations, hexadecimal integers, a leading plus, leading and trailing decimal points, and the `Infinity` and `NaN` literals.
+JsonTape implements the widely-used JSON5 extensions as `ParseOptions` flags under the `strict`, `jsonc`, and `json5` presets:
+line and block comments, trailing commas, unquoted keys, single-quoted strings, hexadecimal integers, a leading plus, leading and trailing decimal points, and the `Infinity` and `NaN` literals.
+The extended string escapes — `\'`, `\v`, `\0`, `\xHH`, and backslash-newline line continuations — do not have a flag of their own; they ride on `allow_single_quotes`, so enabling that also accepts them inside double-quoted strings.
 
 A few edges are deliberately out of scope, so the crate stays a single strict-scanner file:
 
@@ -236,13 +241,31 @@ A few edges are deliberately out of scope, so the crate stays a single strict-sc
 - An unknown escape is rejected rather than passed through as its own character.
 - `Infinity` and `NaN` parse as non-finite floats and serialize back to `null`, since strict JSON has no literal for them, while big numbers round-trip losslessly.
 - A decimal-point number beyond the `f64` range is rejected rather than emitted in a form that would not be valid strict JSON.
+- A hexadecimal integer wider than 64 bits is rejected rather than preserved. Decimal integers of any width round-trip losslessly; only the `0x` form is capped, so nothing is silently rounded — it errors instead.
 - Comment fidelity is leading, trailing, and tail placement; blank lines, comment indentation, and interior comments between a key and its value are not preserved.
 
 ## Benchmarks
 
-A criterion suite lives at [`scripts/bench.rs`], comparing the owned, view, source-bound, and reused-arena parsers against `serde_json` and [`simd-json`] across string, number, object, and nested workloads.
+A criterion suite lives at [`scripts/bench.rs`], comparing the owned, view, source-bound, and reused-arena parsers against `serde_json`, [`simd-json`], and the [`json5`] crate across string, number, object, and nested workloads.
 Run it with `cargo bench`; [`simd-json`] is always included as a fully-owned-DOM throughput ceiling.
 The table below is indicative — one machine, one run — so read it as relative, not absolute, and re-run on your own hardware.
+
+Every benchmark id names the output shape it produces, because the peers do not all build the same thing.
+Each row fully parses and validates its input — UTF-8, escapes, structure — and produces a fully navigable, non-lazy document with last-wins duplicate keys; what differs is what comes out the other side:
+
+| id                           | DOM           | mutable | strings                    | key order         | numbers                    |
+| :--------------------------- | :------------ | :------ | :------------------------- | :---------------- | :------------------------- |
+| `jsontape-owned-mut-dom`     | owned         | yes     | decoded at parse           | source            | i64/u64/f64 + lossless big |
+| `jsontape-view-imm-spans`    | zero-copy     | no      | validated, decode deferred | source            | i64/u64/f64 + lossless big |
+| `serde-json-owned-mut-dom`   | owned         | yes     | decoded at parse           | sorted (BTreeMap) | i64/u64/f64                |
+| `simd-json-owned-mut-dom`    | owned         | yes     | decoded at parse           | hashed            | i64/u64/f64                |
+| `simd-json-borrowed-cow-dom` | borrows input | yes     | decoded in place, `Cow`    | hashed            | i64/u64/f64                |
+| `json5-crate-serde-mut-dom`  | owned         | yes     | decoded at parse           | sorted (BTreeMap) | everything as `f64`        |
+
+So the owned rows read against each other, and `jsontape-view-imm-spans` reads against `simd-json-borrowed-cow-dom`.
+Two asymmetries are worth holding in mind.
+JsonTape is alone in preserving source key order — `serde_json` sorts and `simd-json` hashes — so it runs an explicit dedup pass where the peers get deduplication free as a side effect of their map insert; the matching comparison would be `serde_json` with its `preserve_order` feature, which is slower than the `BTreeMap` default measured here.
+And the JsonTape views validate escapes at parse but keep strings escaped, deferring the decode to first use, where `simd-json` unescapes into its input buffer eagerly.
 
 To benchmark real-world documents, download the canonical datasets into a `data/` directory and point the suite at it with the `JSONTAPE_DATA` variable.
 Single JSON documents (`*.json`) and NDJSON / JSON Lines streams (`*.ndjson`, `*.jsonl`) are both recognized:
@@ -262,22 +285,35 @@ JSONTAPE_DATA=data cargo bench --bench bench -- parse-data parse-ndjson
 Any other `.ndjson`/`.jsonl` works too — for a larger real stream, a GitHub Archive hour: `curl -L https://data.gharchive.org/2015-01-01-15.json.gz | gunzip > data/gharchive.ndjson`.
 The `data` directory is git-ignored.
 
-Parse throughput in MiB/s (higher is better), Apple silicon, `float_roundtrip` on `serde_json` for a fair number comparison, and `simd-json` reusing its `Buffers` (its analogue to arena reuse).
+Parse throughput in MiB/s (higher is better) on an Intel Xeon Platinum 8468, criterion defaults pinned to one core, with `float_roundtrip` on `serde_json` for a fair number comparison and `simd-json` reusing its `Buffers` (its analogue to arena reuse).
 The `-arena` rows reuse one bump arena; on the NDJSON stream they reset between records, the true one-arena-many-documents case, and `amazon` throughput counts record bytes only.
+Rows are split by output shape, because comparing across shapes is not meaningful — bold marks the winner within each class.
 
-| Parser · output shape                     |  canada |    citm | twitter | amazon (ndjson) |
-| ----------------------------------------- | ------: | ------: | ------: | --------------: |
-| JsonTape `owned` · owned DOM              |     239 |     413 |     205 |             265 |
-| JsonTape `view` · zero-copy               |     248 |     609 |     257 |             669 |
-| JsonTape `bound-view` · zero-copy+source  |     248 |     609 |     258 |               — |
-| JsonTape `owned-arena` · owned, reused    |     268 |     533 |     241 |             318 |
-| JsonTape `view-arena` · zero-copy, reused |     285 |     704 |     270 |         __830__ |
-| `serde_json` · owned DOM                  |     342 |     553 |     364 |             532 |
-| `simd-json` · owned DOM                   | __370__ | __723__ | __642__ |             721 |
+Owned, mutable DOM — strings decoded into owned storage, document independent of the input:
 
-Among owned-DOM parsers `simd-json` leads everywhere, as a SIMD parser should.
-JsonTape's zero-copy `view-arena` is its fastest configuration and tops the raw column on `citm` and the NDJSON stream — but it builds borrowed spans, not an owned tree, so read it against the other JsonTape rows, not as an owned-DOM win.
-The weak spots are JsonTape's owned paths: number-dense `canada` (scalar `f64` parsing is the bound) and the small-record NDJSON stream (per-record duplicate-key dedup dominates).
+| Parser                         |  canada |    citm | twitter | amazon (ndjson) |
+| :----------------------------- | ------: | ------: | ------: | --------------: |
+| `jsontape-owned-mut-dom`       |     138 |     348 |     191 |             379 |
+| `jsontape-owned-mut-dom-arena` | __213__ | __573__ |     299 |             419 |
+| `serde-json-owned-mut-dom`     |     158 |     382 |     208 |             583 |
+| `simd-json-owned-mut-dom`      |     208 |     360 | __320__ |         __758__ |
+| `json5-crate-serde-mut-dom`    |      27 |      17 |      10 |               — |
+
+Borrowed, zero-copy DOM — the document borrows the input buffer:
+
+| Parser                          |  canada |    citm | twitter | amazon (ndjson) |
+| :------------------------------ | ------: | ------: | ------: | --------------: |
+| `jsontape-view-imm-spans`       |     146 |     556 |     361 |             738 |
+| `jsontape-view-imm-spans-arena` | __235__ | __710__ |     426 |             854 |
+| `jsontape-bound-view-imm-spans` |     143 |     560 |     358 |               — |
+| `simd-json-borrowed-cow-dom`    |     208 |     471 | __617__ |         __889__ |
+
+The arena rows are the configuration this crate is built for, and they take `canada` and `citm` in both classes — a scalar parser in safe Rust ahead of a SIMD one on number-dense and object-key-dense documents, because the memory model does more work here than vectorized scanning does.
+`twitter` remains the column where SIMD pulls away: it is 58% string bytes across 18k short strings, which is precisely what vector compares are best at.
+On the `amazon` NDJSON stream the zero-copy view now runs within a few percent of `simd-json`'s borrowed value.
+
+The `json5` crate row is worth reading twice.
+It parses the same strict documents 6–23x slower than `serde_json`, which is the honest measure of what JSON5 support usually costs — and JsonTape offers the same leniency at full speed.
 
 ## Strictness
 
@@ -285,6 +321,12 @@ Even in lenient mode, the scanner stays strict about what it accepts and re-emit
 Unescaped control characters, invalid `\u` escapes, and lone surrogates are always rejected, and surrogate pairs are combined.
 Both flavors validate UTF-8 and escapes at parse time; `JsonView` then keeps the raw spans while `Json` stores the decoded strings.
 Parsing untrusted input uses fallible allocation and returns a `JsonError` rather than aborting, while the build-from-code mutators allocate infallibly, like the standard collections.
+
+A leading UTF-8 byte order mark is rejected rather than skipped.
+RFC 8259 §8.1 permits either choice, but plenty of tools emit one, so strip it before parsing if your input may carry it.
+
+The default nesting limit of 128 bounds the stack, but note where the bound actually comes from: parsing itself is iterative over an explicit frame stack and never recurses, so it is dropping, formatting, and comparing a document that recurse.
+Raising `max_depth` far above the default therefore moves the risk out of the parser and into those operations.
 
 ## License
 
@@ -295,5 +337,6 @@ Apache-2.0.
 [`allocator_api2`]: https://docs.rs/allocator-api2
 [`parse_in`]: https://docs.rs/jsontape/latest/jsontape/fn.parse_in.html
 [`simd-json`]: https://docs.rs/simd-json
+[`json5`]: https://docs.rs/json5
 [`bump-scope`]: https://docs.rs/bump-scope
 [`blink-alloc`]: https://docs.rs/blink-alloc

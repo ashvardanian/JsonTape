@@ -3,14 +3,12 @@
 //! Build and run it from the repository root:
 //!
 //! ```text
-//! cargo build
-//! rustc --edition=2021 scripts/fuzz.rs --extern jsontape=target/debug/libjsontape.rlib \
-//!     -L dependency=target/debug/deps -o /tmp/jsontape-fuzz
-//! /tmp/jsontape-fuzz 100000 512 0x9E3779B97F4A7C15
+//! cargo run --release --example fuzz -- 100000 512 0x9E3779B97F4A7C15
 //! ```
 //!
 //! Arguments are `cases`, `maximum input length`, and an optional hexadecimal
-//! seed.
+//! seed. The seed is printed on completion and on failure, so any run that finds
+//! something can be replayed exactly by passing it back.
 //!
 //! Every accepted input is checked against several invariants, needing no
 //! external oracle: the owned and zero-copy parsers must agree on acceptance and
@@ -19,13 +17,14 @@
 //! JSON5 parse must round-trip its comments. The harness fails on any panic or
 //! violated invariant.
 //!
-//! An optional strict-mode cross-check against `serde_json` compiles only under
-//! `--cfg 'feature="fuzz_differential"'` with `--extern serde_json=...`, so the
-//! standalone build above stays dependency-free. It is a signal, not an oracle:
-//! the two libraries differ on some edges such as nesting limits.
+//! A strict-mode acceptance cross-check against `serde_json` runs alongside
+//! those invariants. It is a signal, not an oracle: the two libraries differ on
+//! some edges such as nesting limits, so divergences are printed rather than
+//! treated as failures.
 
 use std::env;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use jsontape::{parse, parse_with, view, view_with, FormatOptions, ParseOptions};
 
@@ -173,20 +172,32 @@ fn check_comment_round_trip(source: &[u8]) {
     }
 }
 
-/// Optional strict-acceptance cross-check against `serde_json`. A signal only:
-/// mismatches are reported, not fatal, since the two libraries differ on edges
-/// like nesting depth. Compiled only under the `fuzz_differential` cfg.
-#[cfg(feature = "fuzz_differential")]
+/// How many divergences to print in full before falling back to counting them.
+/// The two libraries disagree by design on whole classes of input — numbers
+/// outside the `f64` range, which JsonTape preserves losslessly and `serde_json`
+/// rejects, are the common one — and the seed corpus contains such a case, so an
+/// uncapped report would bury the run's real output.
+const DIVERGENCE_REPORT_LIMIT: usize = 20;
+
+static DIVERGENCES: AtomicUsize = AtomicUsize::new(0);
+
+/// Strict-acceptance cross-check against `serde_json`. A signal only: mismatches
+/// are reported, not fatal, since the two libraries differ on edges like nesting
+/// depth and out-of-range numbers. Always compiled — the harness builds as a
+/// Cargo example, so `serde_json` is available from `dev-dependencies`.
 fn report_serde_json_divergence(source: &[u8]) {
     let ours = parse(source).is_ok();
     let theirs = serde_json::from_slice::<serde_json::Value>(source).is_ok();
-    if ours != theirs {
+    if ours == theirs {
+        return;
+    }
+    let seen = DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+    if seen < DIVERGENCE_REPORT_LIMIT {
         eprintln!("differential: jsontape={ours}, serde_json={theirs}, input={source:?}");
+    } else if seen == DIVERGENCE_REPORT_LIMIT {
+        eprintln!("differential: further divergences suppressed; a total is printed on completion");
     }
 }
-
-#[cfg(not(feature = "fuzz_differential"))]
-fn report_serde_json_divergence(_source: &[u8]) {}
 
 fn check_case(source: &[u8], strict: &ParseOptions, json5: &ParseOptions) {
     check_consistency(source, strict, "strict");
@@ -221,5 +232,6 @@ fn main() {
     // Keep the default strict entry points exercised too.
     assert!(parse(br#"{"complete":true}"#).is_ok());
     assert!(view(br#"{"complete":true}"#).is_ok());
-    eprintln!("completed {cases} cases with seed 0x{seed:016X}");
+    let divergences = DIVERGENCES.load(Ordering::Relaxed);
+    eprintln!("completed {cases} cases with seed 0x{seed:016X}, {divergences} serde_json divergences");
 }
