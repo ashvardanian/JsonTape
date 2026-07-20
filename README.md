@@ -99,7 +99,10 @@ Most JSON parsers treat comments as trivia and discard them, so a document that 
 ```rust
 use jsontape::{parse_with, FormatOptions, ParseOptions};
 
-let source = b"{\n  // the service port\n  \"port\": 8080 // default\n}";
+let source = br#"{
+  // the service port
+  "port": 8080 // default
+}"#;
 let options = ParseOptions::json5().preserve_comments(true);
 let document = parse_with(source, &options).unwrap();
 
@@ -111,6 +114,13 @@ let formatted = document.to_string_with(FormatOptions::pretty().with_comments(tr
 assert_eq!(formatted.as_bytes(), source);
 ```
 
+`formatted` is the input again, byte for byte — both comments back in their original places, one leading and one trailing.
+Drop `.with_comments(true)` and the same tree serializes to plain strict JSON instead:
+
+```json
+{"port":8080}
+```
+
 ### Formatting
 
 `FormatOptions` drives serialization, from compact to width-aware wrapping:
@@ -118,14 +128,37 @@ assert_eq!(formatted.as_bytes(), source);
 ```rust
 use jsontape::{parse, FormatOptions};
 
-let document = parse(br#"{"a":[1,2],"b":{}}"#).unwrap();
+let source = br#"{ "name": "tape", "tags": ["json", "json5"],
+    "limits": { "depth": 128, "nodes": null },
+    "ratios": [0.5, 0.25, 0.125, 0.0625] }"#;
+let document = parse(source).unwrap();
 
-assert_eq!(document.to_string(), r#"{"a":[1,2],"b":{}}"#);
-assert_eq!(
-    document.to_string_with(FormatOptions::pretty_width(20)),
-    "{\n  \"a\": [1, 2],\n  \"b\": {}\n}",
-);
+let compact = document.to_string();
+let wrapped = document.to_string_with(FormatOptions::pretty_width(40));
 ```
+
+`compact` carries no insignificant whitespace at all:
+
+```json
+{"name":"tape","tags":["json","json5"],"limits":{"depth":128,"nodes":null},"ratios":[0.5,0.25,0.125,0.0625]}
+```
+
+`wrapped` keeps each container on one line for as long as it fits the column budget, and expands only the ones that do not.
+That is why `limits` breaks across lines here while `tags` and `ratios` stay inline:
+
+```json
+{
+  "name": "tape",
+  "tags": ["json", "json5"],
+  "limits": {
+    "depth": 128,
+    "nodes": null
+  },
+  "ratios": [0.5, 0.25, 0.125, 0.0625]
+}
+```
+
+`FormatOptions::pretty()` is the familiar unconditional form, one element per line, and `FormatOptions::compact()` is the default.
 
 ### Errors With a Location
 
@@ -134,11 +167,17 @@ A syntax fault carries a byte offset, resolved to a line and column on demand:
 ```rust
 use jsontape::parse;
 
-let source = b"{\n  \"a\": ,\n}";
+let source = br#"{
+  "a": ,
+}"#;
 let error = parse(source).unwrap_err();
+assert_eq!(error.to_string(), "unexpected byte at byte offset 9");
+
 let location = error.location(source).unwrap();
 assert_eq!((location.line, location.column), (2, 8));
 ```
+
+Line and column are computed only when asked for, so the common path of discarding the error costs nothing beyond the offset.
 
 ### Lossless Numbers
 
