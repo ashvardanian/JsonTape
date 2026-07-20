@@ -1,6 +1,6 @@
 [package]
 name = "jsontape"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
 description = "A minimalistic allocator-aware, zero-copy JSON & JSON5 parser in pure Rust"
