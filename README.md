@@ -200,7 +200,7 @@ A blunt, honest comparison, where ● is first-class, ◐ is partial or behind a
 | Streaming reader and writer         |            ● |       ○ |          ○ |
 | Ecosystem maturity and adoption     |            ● |       ◐ |          ○ |
 
-Peak SIMD throughput belongs to [`simd-json`] and [`sonic-rs`]; JsonTape trades that for its memory model, safety, and `no_std` reach.
+Peak SIMD throughput belongs to parsers like [`simd-json`]; JsonTape trades that for its memory model, safety, and `no_std` reach.
 
 ## Allocators
 
@@ -208,7 +208,21 @@ Every container allocates through the `allocator` you pass to `parse_in` or `vie
 With the default global heap each array and object is a separate allocation scattered across the heap.
 Pass a bump or slab arena instead and the whole document is packed into one contiguous region that frees in `O(1)` when the arena is dropped — parse a large payload, read it, and reclaim it all at once.
 This is the closest the pointer-tree design gets to a flat tape; the per-node `Vec`s still grow by doubling, so an arena keeps some slack, but allocation and teardown are cheap and fragmentation-free.
-Bring any arena crate that implements `allocator_api2::Allocator` version 0.4; see the [`parse_in`] docs for a worked custom-allocator example.
+See the [`parse_in`] docs for a worked custom-allocator example.
+
+Bring any arena crate that implements `allocator_api2::Allocator`.
+To process a stream of documents through one arena, reset it between them:
+
+```rust
+let mut arena = bump_scope::Bump::new();
+for input in &documents {
+    let document = jsontape::parse_in(input, &arena)?;
+    consume(&document);   // last use of the document
+    arena.reset();        // takes &mut self, so the borrow checker proves the document is gone
+}
+```
+
+Because `reset` takes `&mut self` and every allocation borrows the arena with `&self`, the compiler forbids resetting while any document is still alive — arena reuse with no use-after-free footgun.
 
 ## JSON5 Support and Its Boundary
 
@@ -224,6 +238,47 @@ A few edges are deliberately out of scope, so the crate stays a single strict-sc
 - A decimal-point number beyond the `f64` range is rejected rather than emitted in a form that would not be valid strict JSON.
 - Comment fidelity is leading, trailing, and tail placement; blank lines, comment indentation, and interior comments between a key and its value are not preserved.
 
+## Benchmarks
+
+A criterion suite lives at [`scripts/bench.rs`], comparing the owned, view, source-bound, and reused-arena parsers against `serde_json` and [`simd-json`] across string, number, object, and nested workloads.
+Run it with `cargo bench`; [`simd-json`] is always included as a fully-owned-DOM throughput ceiling.
+The table below is indicative — one machine, one run — so read it as relative, not absolute, and re-run on your own hardware.
+
+To benchmark real-world documents, download the canonical datasets into a `data/` directory and point the suite at it with the `JSONTAPE_DATA` variable.
+Single JSON documents (`*.json`) and NDJSON / JSON Lines streams (`*.ndjson`, `*.jsonl`) are both recognized:
+
+```sh
+mkdir -p data
+# Single documents (serde-rs/json-benchmark, identical to simdjson's copies):
+for f in twitter canada citm_catalog; do
+  curl -sSL "https://raw.githubusercontent.com/serde-rs/json-benchmark/master/data/$f.json" -o "data/$f.json"
+done
+# NDJSON stream (simdjson's streaming-benchmark file):
+curl -sSL "https://raw.githubusercontent.com/simdjson/simdjson/master/jsonexamples/amazon_cellphones.ndjson" -o "data/amazon_cellphones.ndjson"
+JSONTAPE_DATA=data cargo bench --bench bench -- parse-data parse-ndjson
+```
+
+`canada.json` exercises the number path, `twitter.json` the zero-copy view over unicode strings, and `citm_catalog.json` object-key handling; the NDJSON `parse-ndjson` group streams every record through one reused bump arena, the flagship allocator-reuse case.
+Any other `.ndjson`/`.jsonl` works too — for a larger real stream, a GitHub Archive hour: `curl -L https://data.gharchive.org/2015-01-01-15.json.gz | gunzip > data/gharchive.ndjson`.
+The `data` directory is git-ignored.
+
+Parse throughput in MiB/s (higher is better), Apple silicon, `float_roundtrip` on `serde_json` for a fair number comparison, and `simd-json` reusing its `Buffers` (its analogue to arena reuse).
+The `-arena` rows reuse one bump arena; on the NDJSON stream they reset between records, the true one-arena-many-documents case, and `amazon` throughput counts record bytes only.
+
+| Parser · output shape                     |  canada |    citm | twitter | amazon (ndjson) |
+| ----------------------------------------- | ------: | ------: | ------: | --------------: |
+| JsonTape `owned` · owned DOM              |     239 |     413 |     205 |             265 |
+| JsonTape `view` · zero-copy               |     248 |     609 |     257 |             669 |
+| JsonTape `bound-view` · zero-copy+source  |     248 |     609 |     258 |               — |
+| JsonTape `owned-arena` · owned, reused    |     268 |     533 |     241 |             318 |
+| JsonTape `view-arena` · zero-copy, reused |     285 |     704 |     270 |         __830__ |
+| `serde_json` · owned DOM                  |     342 |     553 |     364 |             532 |
+| `simd-json` · owned DOM                   | __370__ | __723__ | __642__ |             721 |
+
+Among owned-DOM parsers `simd-json` leads everywhere, as a SIMD parser should.
+JsonTape's zero-copy `view-arena` is its fastest configuration and tops the raw column on `citm` and the NDJSON stream — but it builds borrowed spans, not an owned tree, so read it against the other JsonTape rows, not as an owned-DOM win.
+The weak spots are JsonTape's owned paths: number-dense `canada` (scalar `f64` parsing is the bound) and the small-record NDJSON stream (per-record duplicate-key dedup dominates).
+
 ## Strictness
 
 Even in lenient mode, the scanner stays strict about what it accepts and re-emits.
@@ -236,7 +291,9 @@ Parsing untrusted input uses fallible allocation and returns a `JsonError` rathe
 Apache-2.0.
 
 [StringTape]: https://github.com/ashvardanian/StringTape
+[`scripts/bench.rs`]: scripts/bench.rs
 [`allocator_api2`]: https://docs.rs/allocator-api2
 [`parse_in`]: https://docs.rs/jsontape/latest/jsontape/fn.parse_in.html
 [`simd-json`]: https://docs.rs/simd-json
-[`sonic-rs`]: https://docs.rs/sonic-rs
+[`bump-scope`]: https://docs.rs/bump-scope
+[`blink-alloc`]: https://docs.rs/blink-alloc
