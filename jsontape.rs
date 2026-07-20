@@ -495,15 +495,31 @@ impl ByteMask {
         ])
     }
 
+    const fn ascii_range(first: u8, last: u8) -> Self {
+        let mut mask = Self([0; 4]);
+        let mut byte = first;
+        loop {
+            mask.0[(byte / 64) as usize] |= 1u64 << (byte % 64);
+            if byte == last {
+                return mask;
+            }
+            byte += 1;
+        }
+    }
+
     #[inline]
     const fn contains(self, byte: u8) -> bool {
         self.0[(byte / 64) as usize] & (1u64 << (byte % 64)) != 0
     }
 }
 
-/// Private byte-search seam for scanner hot paths.
+/// Private byte-search seam for scanner hot paths. The two operations mirror
+/// `strcspn`/`strspn`: `find_first` stops on the first byte in the set, and
+/// `find_first_absent` stops on the first byte outside it. A SIMD backend maps
+/// them onto its byte-set search directly.
 trait ByteSearch {
     fn find_first(bytes: &[u8], mask: ByteMask) -> Option<usize>;
+    fn find_first_absent(bytes: &[u8], mask: ByteMask) -> Option<usize>;
 }
 
 struct PortableSearch;
@@ -513,12 +529,31 @@ impl ByteSearch for PortableSearch {
     fn find_first(bytes: &[u8], mask: ByteMask) -> Option<usize> {
         bytes.iter().position(|&byte| mask.contains(byte))
     }
+
+    #[inline]
+    fn find_first_absent(bytes: &[u8], mask: ByteMask) -> Option<usize> {
+        bytes.iter().position(|&byte| !mask.contains(byte))
+    }
 }
 
 type ActiveSearch = PortableSearch;
 
 const LINE_BREAKS: ByteMask = ByteMask::with(b'\n').union(ByteMask::with(b'\r'));
+const WHITESPACE: ByteMask = ByteMask::with(b' ')
+    .union(ByteMask::with(b'\t'))
+    .union(LINE_BREAKS);
 const ASTERISK: ByteMask = ByteMask::with(b'*');
+const BACKSLASH: ByteMask = ByteMask::with(b'\\');
+const ASCII_CONTROLS: ByteMask = ByteMask::ascii_range(0, 0x1f);
+const DECIMAL_DIGITS: ByteMask = ByteMask::ascii_range(b'0', b'9');
+const HEX_DIGITS: ByteMask = DECIMAL_DIGITS
+    .union(ByteMask::ascii_range(b'a', b'f'))
+    .union(ByteMask::ascii_range(b'A', b'F'));
+const IDENTIFIER_TAIL: ByteMask = ByteMask::ascii_range(b'a', b'z')
+    .union(ByteMask::ascii_range(b'A', b'Z'))
+    .union(DECIMAL_DIGITS)
+    .union(ByteMask::with(b'_'))
+    .union(ByteMask::with(b'$'));
 
 /// Decodes an RFC 6901 reference token, unescaping `~1` to `/` and `~0` to `~`.
 /// Allocates only when a `~` is present; the order matters so `~01` becomes `~1`.
@@ -746,9 +781,16 @@ fn validate_string_body(content: &[u8], offset: usize) -> Result<(), JsonError> 
     if core::str::from_utf8(content).is_err() {
         return Err(JsonError::Syntax { offset, kind: SyntaxKind::InvalidUtf8 });
     }
+    // The same interesting set the parser's string scanner uses, minus the
+    // delimiter: skip ordinary runs and stop only on a backslash or a control.
+    let stops = BACKSLASH.union(ASCII_CONTROLS);
     let mut index = 0;
-    while let Some(&byte) = content.get(index) {
-        if byte == b'\\' {
+    while index < content.len() {
+        match ActiveSearch::find_first(&content[index..], stops) {
+            None => break,
+            Some(run) => index += run,
+        }
+        if content[index] == b'\\' {
             let Some(&selector) = content.get(index + 1) else {
                 break;
             };
@@ -757,13 +799,12 @@ fn validate_string_body(content: &[u8], offset: usize) -> Result<(), JsonError> 
             if selector == b'\r' && content.get(index) == Some(&b'\n') {
                 index += 1;
             }
-        } else if byte < 0x20 {
+        } else {
+            // A control byte; the mask guarantees `content[index] < 0x20` here.
             return Err(JsonError::Syntax {
                 offset: offset + index,
                 kind: SyntaxKind::ControlCharacter,
             });
-        } else {
-            index += 1;
         }
     }
     Ok(())
@@ -1368,19 +1409,33 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             .copied()
     }
 
+    /// Advances through the maximal byte run accepted by `mask`.
+    ///
+    /// Scanner states use this as their one transition from an ordinary run to
+    /// an interesting byte, leaving the concrete search backend private.
+    #[inline]
+    fn advance_while(&mut self, mask: ByteMask) {
+        let remaining = &self.source[self.position..];
+        self.position += ActiveSearch::find_first_absent(remaining, mask)
+            .unwrap_or(remaining.len());
+    }
+
     /// Skips insignificant whitespace, and — when the matching options are
     /// enabled — `//` line and `/* */` block comments. A lone `/` that does not
     /// open an enabled comment is left in place for the caller to fault on.
     fn skip_trivia(&mut self) -> Result<(), JsonError> {
         loop {
+            // Skip the whitespace run in one search. A newline anywhere in it
+            // decides whether a following comment trails the last value or leads
+            // the next one.
+            let whitespace_start = self.position;
+            self.advance_while(WHITESPACE);
+            if ActiveSearch::find_first(&self.source[whitespace_start..self.position], LINE_BREAKS)
+                .is_some()
+            {
+                self.broke = true;
+            }
             match self.peek() {
-                // A newline decides whether a following comment trails the last
-                // value or leads the next one.
-                Some(b'\n' | b'\r') => {
-                    self.broke = true;
-                    self.position += 1;
-                }
-                Some(b' ' | b'\t') => self.position += 1,
                 Some(b'/') => match self.peek_at(1) {
                     Some(b'/') if self.options.allow_line_comments => {
                         let text_start = self.position + 2;
@@ -1818,11 +1873,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 has_integer_digits = true;
             }
             Some(b'1'..=b'9') => {
-                self.position += 1;
                 has_integer_digits = true;
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.position += 1;
-                }
+                self.advance_while(DECIMAL_DIGITS);
             }
             Some(b'.') if self.options.allow_leading_decimal => {}
             _ => {
@@ -1839,11 +1891,9 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         if self.peek() == Some(b'.') {
             is_float = true;
             self.position += 1;
-            let mut has_fraction_digits = false;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.position += 1;
-                has_fraction_digits = true;
-            }
+            let digits_start = self.position;
+            self.advance_while(DECIMAL_DIGITS);
+            let has_fraction_digits = self.position != digits_start;
             if !has_fraction_digits {
                 let trailing_ok = self.options.allow_trailing_decimal && has_integer_digits;
                 if !trailing_ok {
@@ -1874,9 +1924,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                     kind: SyntaxKind::InvalidNumber,
                 });
             }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.position += 1;
-            }
+            self.advance_while(DECIMAL_DIGITS);
         }
 
         let token = &self.source[start..self.position];
@@ -1942,9 +1990,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     fn scan_hex_integer(&mut self, start: usize, negative: bool) -> Result<Scalar, JsonError> {
         self.position += 2; // the "0x"
         let digits_start = self.position;
-        while matches!(self.peek(), Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')) {
-            self.position += 1;
-        }
+        self.advance_while(HEX_DIGITS);
         if self.position == digits_start {
             return Err(JsonError::Syntax {
                 offset: start,
@@ -1978,7 +2024,13 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         // Track non-ASCII so a pure-ASCII body (the common case) skips the second
         // UTF-8 validation pass — ASCII is always valid UTF-8.
         let mut has_non_ascii = false;
+        let interesting = ByteMask::with(delimiter).union(BACKSLASH).union(ASCII_CONTROLS);
         loop {
+            let remaining = &self.source[self.position..];
+            let run_len = ActiveSearch::find_first(remaining, interesting).unwrap_or(remaining.len());
+            let run = &remaining[..run_len];
+            has_non_ascii |= !run.is_ascii();
+            self.position += run_len;
             match self.peek() {
                 None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
                 Some(byte) if byte == delimiter => {
@@ -2008,10 +2060,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 }
                 // RFC 8259 forbids unescaped control characters in strings.
                 Some(byte) if byte < 0x20 => return self.fault_kind(SyntaxKind::ControlCharacter),
-                Some(byte) => {
-                    has_non_ascii |= byte >= 0x80;
-                    self.position += 1;
-                }
+                // `interesting` covers the delimiter, backslash, and controls, so
+                // the arms above are exhaustive. Fault defensively rather than
+                // panic if a future mask or arm edit ever desyncs the two.
+                Some(_) => return self.fault(),
             }
         }
     }
@@ -2117,10 +2169,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
             _ => return self.fault(),
         }
-        while matches!(self.peek(), Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$')
-        {
-            self.position += 1;
-        }
+        self.advance_while(IDENTIFIER_TAIL);
         Ok(Span {
             start,
             len: self.position - start,
