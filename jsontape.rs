@@ -1262,6 +1262,40 @@ trait DomBuilder<A: Allocator + Clone> {
     fn key_compare(source: &[u8], left: &Self::Key, right: &Self::Key) -> Ordering;
 }
 
+/// The explicit structural stack used by the parser.
+///
+/// Keeping container state here turns nesting into data rather than Rust call
+/// frames, making the depth limit independent of the host stack.
+enum ParseFrame<A: Allocator + Clone, B: DomBuilder<A>> {
+    Array {
+        items: Vec<B::Value, A>,
+        trivia: Option<Box<TriviaBlock<A>, A>>,
+        state: ArrayState,
+    },
+    Object {
+        entries: Vec<(B::Key, B::Value), A>,
+        trivia: Option<Box<TriviaBlock<A>, A>>,
+        key: Option<B::Key>,
+        state: ObjectState,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrayState {
+    FirstValueOrEnd,
+    ValueRequired,
+    DelimiterOrEnd,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectState {
+    FirstKeyOrEnd,
+    KeyRequired,
+    ColonRequired,
+    ValueRequired,
+    DelimiterOrEnd,
+}
+
 struct Parser<'a, A: Allocator + Clone, B: DomBuilder<A>> {
     source: &'a [u8],
     position: usize,
@@ -1465,28 +1499,192 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     /// Parses a single top-level document, requiring that nothing but
     /// trivia follows the value.
     fn parse_document(&mut self) -> Result<B::Value, JsonError> {
-        let value = self.value()?;
-        self.skip_trivia()?;
-        if self.position != self.source.len() {
-            return self.fault_kind(SyntaxKind::TrailingData);
+        let mut frames: Vec<ParseFrame<A, B>, A> = Vec::new_in(self.allocator.clone());
+        let mut root = None;
+        let mut need_value = true;
+
+        loop {
+            if need_value {
+                self.skip_trivia()?;
+                self.reserve_node()?;
+                match self.peek() {
+                    Some(b'[') => {
+                        self.open_array(&mut frames)?;
+                        need_value = false;
+                    }
+                    Some(b'{') => {
+                        self.open_object(&mut frames)?;
+                        need_value = false;
+                    }
+                    _ => {
+                        let value = self.scalar_value()?;
+                        self.finish_value(&mut frames, &mut root, value)?;
+                        need_value = false;
+                    }
+                }
+                continue;
+            }
+
+            let Some(frame) = frames.last() else {
+                self.skip_trivia()?;
+                if self.position != self.source.len() {
+                    return self.fault_kind(SyntaxKind::TrailingData);
+                }
+                return root.ok_or(JsonError::Syntax {
+                    offset: self.position,
+                    kind: SyntaxKind::UnexpectedEnd,
+                });
+            };
+
+            match frame {
+                ParseFrame::Array { state: ArrayState::FirstValueOrEnd | ArrayState::ValueRequired, .. } => {
+                    self.skip_trivia()?;
+                    let permits_end = matches!(frames.last(), Some(ParseFrame::Array { state: ArrayState::FirstValueOrEnd, .. }));
+                    let frame = frames.last_mut().expect("checked above");
+                    let ParseFrame::Array { items, trivia, .. } = frame else { unreachable!() };
+                    self.drain_pending(items.len(), trivia)?;
+                    if permits_end && self.peek() == Some(b']') {
+                        self.position += 1;
+                        self.close_frame(&mut frames, &mut root)?;
+                    } else {
+                        need_value = true;
+                    }
+                }
+                ParseFrame::Array { state: ArrayState::DelimiterOrEnd, .. } => {
+                    self.skip_trivia()?;
+                    match self.peek() {
+                        Some(b',') => {
+                            self.position += 1;
+                            if self.options.allow_trailing_commas {
+                                self.skip_trivia()?;
+                                if self.peek() == Some(b']') {
+                                    self.position += 1;
+                                    self.close_frame(&mut frames, &mut root)?;
+                                    continue;
+                                }
+                            }
+                            if let ParseFrame::Array { state, .. } = frames.last_mut().expect("checked above") {
+                                *state = ArrayState::ValueRequired;
+                            }
+                        }
+                        Some(b']') => {
+                            self.position += 1;
+                            self.close_frame(&mut frames, &mut root)?;
+                        }
+                        None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
+                        _ => return self.fault(),
+                    }
+                }
+                ParseFrame::Object { state: ObjectState::FirstKeyOrEnd | ObjectState::KeyRequired, .. } => {
+                    self.skip_trivia()?;
+                    let permits_end = matches!(frames.last(), Some(ParseFrame::Object { state: ObjectState::FirstKeyOrEnd, .. }));
+                    let frame = frames.last_mut().expect("checked above");
+                    let ParseFrame::Object { entries, trivia, .. } = frame else { unreachable!() };
+                    self.drain_pending(entries.len(), trivia)?;
+                    if permits_end && self.peek() == Some(b'}') {
+                        self.position += 1;
+                        self.close_frame(&mut frames, &mut root)?;
+                        continue;
+                    }
+                    let key_span = match self.peek() {
+                        Some(b'"') => self.scan_string(b'"')?,
+                        Some(b'\'') if self.options.allow_single_quotes => self.scan_string(b'\'')?,
+                        Some(byte) if self.options.allow_unquoted_keys
+                            && (byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$') => self.scan_identifier()?,
+                        None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
+                        _ => return self.fault(),
+                    };
+                    let key = B::key(self.source, key_span, &self.allocator)?;
+                    if let ParseFrame::Object { key: slot, state, .. } = frames.last_mut().expect("checked above") {
+                        *slot = Some(key);
+                        *state = ObjectState::ColonRequired;
+                    }
+                }
+                ParseFrame::Object { state: ObjectState::ColonRequired, .. } => {
+                    self.skip_trivia()?;
+                    if self.peek() != Some(b':') {
+                        return self.fault();
+                    }
+                    self.position += 1;
+                    if let ParseFrame::Object { state, .. } = frames.last_mut().expect("checked above") {
+                        *state = ObjectState::ValueRequired;
+                    }
+                }
+                ParseFrame::Object { state: ObjectState::ValueRequired, .. } => need_value = true,
+                ParseFrame::Object { state: ObjectState::DelimiterOrEnd, .. } => {
+                    self.skip_trivia()?;
+                    match self.peek() {
+                        Some(b',') => {
+                            self.position += 1;
+                            if self.options.allow_trailing_commas {
+                                self.skip_trivia()?;
+                                if self.peek() == Some(b'}') {
+                                    self.position += 1;
+                                    self.close_frame(&mut frames, &mut root)?;
+                                    continue;
+                                }
+                            }
+                            if let ParseFrame::Object { state, .. } = frames.last_mut().expect("checked above") {
+                                *state = ObjectState::KeyRequired;
+                            }
+                        }
+                        Some(b'}') => {
+                            self.position += 1;
+                            self.close_frame(&mut frames, &mut root)?;
+                        }
+                        None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
+                        _ => return self.fault(),
+                    }
+                }
+            }
         }
-        Ok(value)
     }
 
-    fn value(&mut self) -> Result<B::Value, JsonError> {
-        self.skip_trivia()?;
-        self.reserve_node()?;
+    fn open_array(&mut self, frames: &mut Vec<ParseFrame<A, B>, A>) -> Result<(), JsonError> {
+        self.enter_container(frames)?;
+        frames.push(ParseFrame::Array {
+            items: Vec::new_in(self.allocator.clone()),
+            trivia: None,
+            state: ArrayState::FirstValueOrEnd,
+        });
+        Ok(())
+    }
+
+    fn open_object(&mut self, frames: &mut Vec<ParseFrame<A, B>, A>) -> Result<(), JsonError> {
+        self.enter_container(frames)?;
+        frames.push(ParseFrame::Object {
+            entries: Vec::new_in(self.allocator.clone()),
+            trivia: None,
+            key: None,
+            state: ObjectState::FirstKeyOrEnd,
+        });
+        Ok(())
+    }
+
+    /// Reserves one frame and enters a container without relying on wrapping
+    /// depth arithmetic. The caller consumes the already-validated opener by
+    /// pushing its concrete array or object frame immediately afterwards.
+    fn enter_container(&mut self, frames: &mut Vec<ParseFrame<A, B>, A>) -> Result<(), JsonError> {
+        let depth = self
+            .depth
+            .checked_add(1)
+            .filter(|&depth| depth <= self.options.max_depth)
+            .ok_or(JsonError::Syntax {
+                offset: self.position,
+                kind: SyntaxKind::DepthExceeded,
+            })?;
+        frames.try_reserve(1).map_err(|_| JsonError::Allocation)?;
+        self.depth = depth;
+        self.position += 1;
+        self.pending.clear();
+        self.broke = false;
+        Ok(())
+    }
+
+    fn scalar_value(&mut self) -> Result<B::Value, JsonError> {
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
-            Some(b'"') => {
-                let span = self.scan_string(b'"')?;
-                B::string(self.source, span, &self.allocator)
-            }
-            Some(b'\'') if self.options.allow_single_quotes => {
-                let span = self.scan_string(b'\'')?;
-                B::string(self.source, span, &self.allocator)
-            }
+            Some(b'"') => B::string(self.source, self.scan_string(b'"')?, &self.allocator),
+            Some(b'\'') if self.options.allow_single_quotes => B::string(self.source, self.scan_string(b'\'')?, &self.allocator),
             Some(b't') => self.expect_literal(b"true").map(|_| B::boolean(true)),
             Some(b'f') => self.expect_literal(b"false").map(|_| B::boolean(false)),
             Some(b'n') => self.expect_literal(b"null").map(|_| B::null()),
@@ -1497,6 +1695,50 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             None => self.fault_kind(SyntaxKind::UnexpectedEnd),
             _ => self.fault(),
         }
+    }
+
+    fn finish_value(
+        &mut self,
+        frames: &mut Vec<ParseFrame<A, B>, A>,
+        root: &mut Option<B::Value>,
+        value: B::Value,
+    ) -> Result<(), JsonError> {
+        match frames.last_mut() {
+            Some(ParseFrame::Array { items, state, .. }) => {
+                self.broke = false;
+                self.try_push(items, value)?;
+                *state = ArrayState::DelimiterOrEnd;
+            }
+            Some(ParseFrame::Object { entries, key, state, .. }) => {
+                self.broke = false;
+                let key = key.take().expect("object value follows a key");
+                self.try_push(entries, (key, value))?;
+                *state = ObjectState::DelimiterOrEnd;
+            }
+            None => *root = Some(value),
+        }
+        Ok(())
+    }
+
+    fn close_frame(
+        &mut self,
+        frames: &mut Vec<ParseFrame<A, B>, A>,
+        root: &mut Option<B::Value>,
+    ) -> Result<(), JsonError> {
+        let mut frame = frames.pop().expect("a closer requires a frame");
+        let value = match &mut frame {
+            ParseFrame::Array { items, trivia, .. } => {
+                self.drain_pending(items.len(), trivia)?;
+                B::array(core::mem::replace(items, Vec::new_in(self.allocator.clone())), trivia.take())
+            }
+            ParseFrame::Object { entries, trivia, .. } => {
+                self.drain_pending(entries.len(), trivia)?;
+                self.dedup_object(entries)?;
+                B::object(core::mem::replace(entries, Vec::new_in(self.allocator.clone())), trivia.take())
+            }
+        };
+        self.depth = self.depth.checked_sub(1).expect("a closed frame has entered depth");
+        self.finish_value(frames, root, value)
     }
 
     fn expect_literal(&mut self, literal: &[u8]) -> Result<(), JsonError> {
@@ -1865,59 +2107,6 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(())
     }
 
-    fn array(&mut self) -> Result<B::Value, JsonError> {
-        self.depth += 1;
-        if self.depth > self.options.max_depth {
-            return self.fault_kind(SyntaxKind::DepthExceeded);
-        }
-        self.position += 1; // opening bracket
-        // Comments seen before the `[` belong to the parent container, which has
-        // already bound them; drop whatever leaks in at the top level.
-        self.pending.clear();
-        self.broke = false;
-        let mut items: Vec<B::Value, A> = Vec::new_in(self.allocator.clone());
-        let mut trivia: Option<Box<TriviaBlock<A>, A>> = None;
-        self.skip_trivia()?;
-        if self.peek() == Some(b']') {
-            self.drain_pending(0, &mut trivia)?;
-            self.position += 1;
-            self.depth -= 1;
-            return Ok(B::array(items, trivia));
-        }
-        loop {
-            // Bind the comments leading this element before parsing it.
-            self.skip_trivia()?;
-            self.drain_pending(items.len(), &mut trivia)?;
-            let value = self.value()?;
-            self.broke = false;
-            self.try_push(&mut items, value)?;
-            self.skip_trivia()?;
-            match self.peek() {
-                Some(b',') => {
-                    self.position += 1;
-                    // A trailing comma is only allowed to precede the closer.
-                    if self.options.allow_trailing_commas {
-                        self.skip_trivia()?;
-                        if self.peek() == Some(b']') {
-                            self.drain_pending(items.len(), &mut trivia)?;
-                            self.position += 1;
-                            break;
-                        }
-                    }
-                }
-                Some(b']') => {
-                    self.drain_pending(items.len(), &mut trivia)?;
-                    self.position += 1;
-                    break;
-                }
-                None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
-                _ => return self.fault(),
-            }
-        }
-        self.depth -= 1;
-        Ok(B::array(items, trivia))
-    }
-
     /// Scans an unquoted JSON5 identifier key, returning its raw span. Version one
     /// accepts ASCII identifier characters only, with no `\u` escapes.
     fn scan_identifier(&mut self) -> Result<Span, JsonError> {
@@ -1936,76 +2125,6 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             start,
             len: self.position - start,
         })
-    }
-
-    fn object(&mut self) -> Result<B::Value, JsonError> {
-        self.depth += 1;
-        if self.depth > self.options.max_depth {
-            return self.fault_kind(SyntaxKind::DepthExceeded);
-        }
-        self.position += 1; // opening brace
-        self.pending.clear();
-        self.broke = false;
-        let mut entries: Vec<(B::Key, B::Value), A> = Vec::new_in(self.allocator.clone());
-        let mut trivia: Option<Box<TriviaBlock<A>, A>> = None;
-        self.skip_trivia()?;
-        if self.peek() == Some(b'}') {
-            self.drain_pending(0, &mut trivia)?;
-            self.position += 1;
-            self.depth -= 1;
-            return Ok(B::object(entries, trivia));
-        }
-        loop {
-            // Bind the comments leading this entry before parsing its key.
-            self.skip_trivia()?;
-            self.drain_pending(entries.len(), &mut trivia)?;
-            let key_span = match self.peek() {
-                Some(b'"') => self.scan_string(b'"')?,
-                Some(b'\'') if self.options.allow_single_quotes => self.scan_string(b'\'')?,
-                Some(byte)
-                    if self.options.allow_unquoted_keys
-                        && (byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$') =>
-                {
-                    self.scan_identifier()?
-                }
-                None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
-                _ => return self.fault(),
-            };
-            let key = B::key(self.source, key_span, &self.allocator)?;
-            self.skip_trivia()?;
-            if self.peek() != Some(b':') {
-                return self.fault();
-            }
-            self.position += 1;
-            let value = self.value()?;
-            self.broke = false;
-            self.try_push(&mut entries, (key, value))?;
-            self.skip_trivia()?;
-            match self.peek() {
-                Some(b',') => {
-                    self.position += 1;
-                    // A trailing comma is only allowed to precede the closer.
-                    if self.options.allow_trailing_commas {
-                        self.skip_trivia()?;
-                        if self.peek() == Some(b'}') {
-                            self.drain_pending(entries.len(), &mut trivia)?;
-                            self.position += 1;
-                            break;
-                        }
-                    }
-                }
-                Some(b'}') => {
-                    self.drain_pending(entries.len(), &mut trivia)?;
-                    self.position += 1;
-                    break;
-                }
-                None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
-                _ => return self.fault(),
-            }
-        }
-        self.dedup_object(&mut entries)?;
-        self.depth -= 1;
-        Ok(B::object(entries, trivia))
     }
 
     fn try_push<T>(&self, items: &mut Vec<T, A>, item: T) -> Result<(), JsonError> {
@@ -6201,6 +6320,31 @@ mod tests {
             document.to_string_with(FormatOptions::pretty().with_comments(true)),
             "[\n  1, // one\n  2\n]",
         );
+    }
+
+    #[test]
+    fn frame_machine_distinguishes_first_entries_from_required_entries() {
+        // A closer is legal only before the first entry, or after a completed
+        // value. It is not legal immediately after a strict comma.
+        for source in [b"[1,]".as_slice(), b"{\"a\":1,}", b"[,]", b"{,}"] {
+            assert!(parse(source).is_err(), "strict parser accepted {source:?}");
+        }
+
+        let options = ParseOptions::json5();
+        assert_eq!(parse_with(b"[1,]", &options).unwrap().to_string(), "[1]");
+        assert_eq!(parse_with(b"{a:1,}", &options).unwrap().to_string(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn frame_machine_handles_deep_valid_nesting_without_recursion() {
+        let depth = 2_048;
+        let mut source = Vec::with_capacity(depth * 2 + 1);
+        source.extend(core::iter::repeat_n(b'[', depth));
+        source.push(b'0');
+        source.extend(core::iter::repeat_n(b']', depth));
+
+        let options = ParseOptions::strict().max_depth((depth + 1) as u32);
+        assert!(parse_with(&source, &options).is_ok());
     }
 }
 
