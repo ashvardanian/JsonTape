@@ -1,1 +1,7 @@
 max_width = 120
+
+# Comments follow the same 120-column budget as the code, counting indentation and
+# the `///` or `//` prefix. That is a convention, not a rule: `wrap_comments` is off
+# by default, so rustfmt copies comments through verbatim. Do not turn it on by
+# itself — it would rewrap every comment to the `comment_width` default of 80. If it
+# is ever wanted, set `comment_width = 120` in the same change.

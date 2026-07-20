@@ -1,27 +1,25 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-// The library is entirely safe Rust; this makes that property compiler-enforced
-// rather than a convention. The test module needs `unsafe impl Allocator` for its
-// stand-in allocators, so the lint is lifted only there. Doctests compile as
-// separate crates and are unaffected.
+// The library is entirely safe Rust; this makes that property compiler-enforced rather than a convention. The test
+// module needs `unsafe impl Allocator` for its stand-in allocators, so the lint is lifted only there. Doctests compile
+// as separate crates and are unaffected.
 #![cfg_attr(not(test), forbid(unsafe_code))]
+// Every public item carries documentation, and this keeps it that way.
+#![deny(missing_docs)]
 
 //! # JsonTape
 //!
-//! A minimalistic, allocator-aware JSON parser in pure Rust, offered in two
-//! complementary flavors that share one strict, RFC 8259-conformant scanner.
+//! A minimalistic, allocator-aware JSON parser in pure Rust, offered in two complementary flavors that share one
+//! strict, RFC 8259-conformant scanner.
 //!
-//! * [`Json`] is an owned, mutable document and the default. Strings are eagerly
-//!   unescaped into the document's allocator at parse time, so [`Json::as_str`]
-//!   needs no source and the tree can be freely edited or built from scratch.
-//!   Produce one with [`parse`] or [`parse_in`].
-//! * [`JsonView`] is an immutable, zero-copy document. String values and object
-//!   keys are kept as [`Span`]s into the original source rather than decoded, so
-//!   parsing copies nothing, and lookups compare against those still-escaped
-//!   spans with an escape-aware, allocation-free comparison. Produce one with
-//!   [`view`] or [`view_in`].
+//! * [`Json`] is an owned, mutable document and the default. Strings are eagerly unescaped into the document's
+//!   allocator at parse time, so [`Json::as_str`] needs no source and the tree can be freely edited or built from
+//!   scratch. Produce one with [`parse`] or [`parse_in`].
+//! * [`JsonView`] is an immutable, zero-copy document. String values and object keys are kept as [`Span`]s into the
+//!   original source rather than decoded, so parsing copies nothing, and lookups compare against those still-escaped
+//!   spans with an escape-aware, allocation-free comparison. Produce one with [`view`] or [`view_in`].
 //!
-//! Both containers allocate through any [`allocator_api2::alloc::Allocator`], so
-//! the whole document can live in a bump arena and free in one step.
+//! Both containers allocate through any [`allocator_api2::alloc::Allocator`], so the whole document can live in a bump
+//! arena and free in one step.
 //!
 //! ```rust
 //! use jsontape::parse;
@@ -37,9 +35,8 @@
 //!
 //! # Reading a view without threading `source`
 //!
-//! A [`JsonView`] resolves its spans against the `source` you parsed. Bind the
-//! two together with [`JsonView::bind`] to get a [`Resolved`] cursor that reads
-//! strings and navigates by key or index with no `source` argument:
+//! A [`JsonView`] resolves its spans against the `source` you parsed. Bind the two together with [`JsonView::bind`] to
+//! get a [`Resolved`] cursor that reads strings and navigates by key or index with no `source` argument:
 //!
 //! ```rust
 //! use jsontape::view_bound;
@@ -51,24 +48,21 @@
 //!
 //! # Beyond parsing
 //!
-//! * __Serialize__ any document back to compact or pretty JSON with `to_string` /
-//!   [`Json::to_string_pretty`], or [`JsonView::to_json_string`].
-//! * __Navigate__ with [`Json::get`], the `[]` operator, or an RFC 6901
-//!   [`Json::pointer`].
-//! * __Preserve numbers__ losslessly: an integer wider than 64 bits, or a value
-//!   outside the `f64` range, is kept as its exact text ([`Json::as_number_str`]).
-//! * __Configure__ the nesting limit and duplicate-key policy through
-//!   [`ParseOptions`] and the `*_with` parsers.
-//! * __Diagnose__ failures with a categorized [`JsonError`]; resolve a fault to a
-//!   line and column with [`JsonError::location`].
+//! * __Serialize__ any document back to compact or pretty JSON with `to_string` / [`Json::to_string_pretty`], or
+//!   [`JsonView::to_json_string`].
+//! * __Navigate__ with [`Json::get`], the `[]` operator, or an RFC 6901 [`Json::pointer`].
+//! * __Preserve numbers__ losslessly: an integer wider than 64 bits, or a value outside the `f64` range, is kept as its
+//!   exact text ([`Json::as_number_str`]).
+//! * __Configure__ the nesting limit and duplicate-key policy through [`ParseOptions`] and the `*_with` parsers.
+//! * __Diagnose__ failures with a categorized [`JsonError`]; resolve a fault to a line and column with
+//!   [`JsonError::location`].
 //!
 //! # Cargo features
 //!
-//! * `std` (default) — enables the [`std::error::Error`] impl; without it the
-//!   crate is `no_std` (still requiring `alloc`).
-//! * `serde` — `serde::Serialize`/`serde::Deserialize` for the document types
-//!   plus `to_value`/`from_value` for converting to and from any serde type
-//!   without a text round trip.
+//! * `std` (default) — enables the [`std::error::Error`] impl; without it the crate is `no_std` (still requiring
+//!   `alloc`).
+//! * `serde` — `serde::Serialize`/`serde::Deserialize` for the document types plus `to_value`/`from_value` for
+//!   converting to and from any serde type without a text round trip.
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -93,8 +87,8 @@ use alloc::borrow::Cow;
 #[cfg(feature = "std")]
 use std::borrow::Cow;
 
-/// A span into the source bytes: a byte offset and a length. String values and
-/// object keys are stored this way, undecoded, so parsing copies nothing.
+/// A span into the source bytes: a byte offset and a length. String values and object keys are stored this way,
+/// undecoded, so parsing copies nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     /// Byte offset of the span's start within the source.
@@ -119,9 +113,8 @@ impl Span {
         self.len == 0
     }
 
-    /// Resolves against the source the document was parsed from. Returns `None`
-    /// if the span is out of bounds or not valid UTF-8. Escape sequences are
-    /// returned verbatim, not decoded; use [`unescape_into`] to decode them.
+    /// Resolves against the source the document was parsed from. Returns `None` if the span is out of bounds or not
+    /// valid UTF-8. Escape sequences are returned verbatim, not decoded; use [`unescape_into`] to decode them.
     pub fn resolve(self, source: &[u8]) -> Option<&str> {
         let end = self.start.checked_add(self.len)?;
         core::str::from_utf8(source.get(self.start..end)?).ok()
@@ -139,7 +132,12 @@ impl Span {
 #[non_exhaustive]
 pub enum JsonError {
     /// Malformed JSON, with the byte offset of the fault and what went wrong.
-    Syntax { offset: usize, kind: SyntaxKind },
+    Syntax {
+        /// Byte offset of the fault within the source. Resolve it to a line and column with [`JsonError::location`].
+        offset: usize,
+        /// Which grammar rule the input violated.
+        kind: SyntaxKind,
+    },
     /// A fallible allocation failed.
     Allocation,
     /// A message from a serde serializer or deserializer.
@@ -147,8 +145,7 @@ pub enum JsonError {
     Message(String),
 }
 
-/// What kind of syntax fault occurred. Non-exhaustive so new categories can be
-/// added without a breaking change.
+/// What kind of syntax fault occurred. Non-exhaustive so new categories can be added without a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SyntaxKind {
@@ -201,8 +198,8 @@ impl SyntaxKind {
     }
 }
 
-/// A resolved source position: byte offset plus 1-based line and column. The
-/// column counts bytes since the last newline.
+/// A resolved source position: byte offset plus 1-based line and column. The column counts bytes since the last
+/// newline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {
     /// Byte offset of the fault within the source.
@@ -214,9 +211,8 @@ pub struct Location {
 }
 
 impl JsonError {
-    /// Resolves a [`Syntax`](JsonError::Syntax) fault to a line and column by
-    /// scanning `source` up to the fault offset. Returns `None` for
-    /// [`Allocation`](JsonError::Allocation).
+    /// Resolves a [`Syntax`](JsonError::Syntax) fault to a line and column by scanning `source` up to the fault offset.
+    /// Returns `None` for [`Allocation`](JsonError::Allocation).
     pub fn location(&self, source: &[u8]) -> Option<Location> {
         let offset = match self {
             JsonError::Syntax { offset, .. } => *offset,
@@ -253,18 +249,16 @@ impl fmt::Display for JsonError {
 #[cfg(feature = "std")]
 impl std::error::Error for JsonError {}
 
-// serde's error traits require a `StdError` supertrait. Under `std` that is
-// `std::error::Error` (implemented above); under `no_std` it is serde's own
-// re-export, which needs this impl for the serde bridge to compile.
+// serde's error traits require a `StdError` supertrait. Under `std` that is `std::error::Error` (implemented above);
+// under `no_std` it is serde's own re-export, which needs this impl for the serde bridge to compile.
 #[cfg(all(feature = "serde", not(feature = "std")))]
 impl serde::ser::StdError for JsonError {}
 
 /// Default nesting limit, guarding against stack exhaustion on adversarial input.
 const MAX_DEPTH: u32 = 128;
 
-/// Optional resource limits for parsing untrusted documents. Limits other than
-/// nesting depth are disabled by default, so valid in-memory JSON remains
-/// accepted unless an application opts into a bounded profile.
+/// Optional resource limits for parsing untrusted documents. Limits other than nesting depth are disabled by default,
+/// so valid in-memory JSON remains accepted unless an application opts into a bounded profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ParseLimits {
@@ -300,8 +294,8 @@ impl Default for ParseLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DuplicateKeys {
-    /// Keep the last value for a repeated key, in the first key's position.
-    /// This is the default and matches `serde_json`.
+    /// Keep the last value for a repeated key, in the first key's position. This is the default and matches
+    /// `serde_json`.
     LastWins,
     /// Keep the first value for a repeated key and ignore later ones.
     FirstWins,
@@ -311,11 +305,10 @@ pub enum DuplicateKeys {
     KeepAll,
 }
 
-/// Knobs for a parse: the nesting limit, the duplicate-key policy, and a set of
-/// opt-in lenient extensions toward JSON5. Every lenient flag defaults to `false`
-/// so the default is strict RFC 8259; enable them individually, or start from the
-/// [`jsonc`](ParseOptions::jsonc) or [`json5`](ParseOptions::json5) preset. Build
-/// from [`ParseOptions::default`] and adjust, then pass to a `*_with` parser.
+/// Knobs for a parse: the nesting limit, the duplicate-key policy, and a set of opt-in lenient extensions toward JSON5.
+/// Every lenient flag defaults to `false` so the default is strict RFC 8259; enable them individually, or start from
+/// the [`jsonc`](ParseOptions::jsonc) or [`json5`](ParseOptions::json5) preset. Build from [`ParseOptions::default`]
+/// and adjust, then pass to a `*_with` parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ParseOptions {
@@ -333,8 +326,8 @@ pub struct ParseOptions {
     pub allow_trailing_commas: bool,
     /// Accept unquoted ASCII identifier object keys.
     pub allow_unquoted_keys: bool,
-    /// Accept single-quoted strings and the JSON5 string escape set: `\'`, `\v`,
-    /// `\0`, `\xHH`, and backslash-newline line continuations.
+    /// Accept single-quoted strings and the JSON5 string escape set: `\'`, `\v`, `\0`, `\xHH`, and backslash-newline
+    /// line continuations.
     pub allow_single_quotes: bool,
     /// Accept `0x`-prefixed hexadecimal integers.
     pub allow_hex_numbers: bool,
@@ -344,13 +337,11 @@ pub struct ParseOptions {
     pub allow_leading_decimal: bool,
     /// Accept a trailing decimal point, as in `5.`.
     pub allow_trailing_decimal: bool,
-    /// Accept `Infinity`, `-Infinity`, and `NaN` number literals. They parse as
-    /// non-finite floats and serialize back to `null`, since strict JSON has no
-    /// literal for them — unlike big numbers, which round-trip losslessly.
+    /// Accept `Infinity`, `-Infinity`, and `NaN` number literals. They parse as non-finite floats and serialize back to
+    /// `null`, since strict JSON has no literal for them — unlike big numbers, which round-trip losslessly.
     pub allow_infinity_nan: bool,
-    /// Keep comments encountered while parsing, attaching them to the owned
-    /// [`Json`] tree for a round trip. Off by default and never set by a preset,
-    /// since it costs memory only when comments are present. Ignored by the
+    /// Keep comments encountered while parsing, attaching them to the owned [`Json`] tree for a round trip. Off by
+    /// default and never set by a preset, since it costs memory only when comments are present. Ignored by the
     /// zero-copy [`JsonView`], which never carries comments.
     pub preserve_comments: bool,
 }
@@ -382,8 +373,8 @@ impl ParseOptions {
         }
     }
 
-    /// The "JSONC" subset: line and block comments plus trailing commas, and
-    /// nothing else. Handy for reading configuration files.
+    /// The "JSONC" subset: line and block comments plus trailing commas, and nothing else. Handy for reading
+    /// configuration files.
     pub const fn jsonc() -> Self {
         ParseOptions {
             allow_line_comments: true,
@@ -393,9 +384,8 @@ impl ParseOptions {
         }
     }
 
-    /// The full set of lenient extensions this crate implements toward JSON5:
-    /// comments, trailing commas, unquoted keys, single quotes, and the extended
-    /// number forms. Whatever lenient input goes in, strict JSON comes out.
+    /// The full set of lenient extensions this crate implements toward JSON5: comments, trailing commas, unquoted keys,
+    /// single quotes, and the extended number forms. Whatever lenient input goes in, strict JSON comes out.
     ///
     /// ```
     /// use jsontape::{parse_with, ParseOptions};
@@ -422,13 +412,11 @@ impl ParseOptions {
 
     /// Sets the maximum nesting depth.
     ///
-    /// Parsing is iterative over an explicit frame stack and never recurses, so
-    /// this limit does not protect the parser — it protects everything that
-    /// walks the resulting tree. Dropping, formatting, cloning, and comparing a
-    /// document all recurse once per level, so a depth raised far above the
-    /// default of 128 can overflow the stack after a successful parse, when the
-    /// document is used or freed. Raise it deliberately, and only as far as the
-    /// consuming code can walk.
+    /// Parsing is iterative over an explicit frame stack and never recurses, so this limit does not protect the parser
+    /// — it protects everything that walks the resulting tree. Dropping, formatting, cloning, and comparing a document
+    /// all recurse once per level, so a depth raised far above the default of 128 can overflow the stack after a
+    /// successful parse, when the document is used or freed. Raise it deliberately, and only as far as the consuming
+    /// code can walk.
     pub fn max_depth(mut self, max_depth: u32) -> Self {
         self.max_depth = max_depth;
         self
@@ -446,8 +434,7 @@ impl ParseOptions {
         self
     }
 
-    /// Enables comment preservation for the owned [`Json`] tree, so a JSON5
-    /// document round-trips its comments.
+    /// Enables comment preservation for the owned [`Json`] tree, so a JSON5 document round-trips its comments.
     ///
     /// ```
     /// use jsontape::{parse_with, FormatOptions, ParseOptions};
@@ -487,8 +474,8 @@ fn hex4_at(bytes: &[u8], start: usize) -> Option<u16> {
     Some(value)
 }
 
-/// A private set of all possible byte values, held as a 256-bit bitmap. Scans
-/// stop on the first byte in the set via [`ByteMask::find_in`].
+/// A private set of all possible byte values, held as a 256-bit bitmap. Scans stop on the first byte in the set via
+/// [`ByteMask::find_in`].
 #[derive(Clone, Copy)]
 struct ByteMask([u64; 4]);
 
@@ -525,42 +512,37 @@ impl ByteMask {
         self.0[(byte / 64) as usize] & (1u64 << (byte % 64)) != 0
     }
 
-    /// Position of the first byte of `bytes` that is in this set, or `None`.
-    /// Used to stop a scan on a string or comment terminator.
+    /// Position of the first byte of `bytes` that is in this set, or `None`. Used to stop a scan on a string or comment
+    /// terminator.
     #[inline]
     fn find_in(self, bytes: &[u8]) -> Option<usize> {
         bytes.iter().position(|&byte| self.contains(byte))
     }
 }
 
-/// One set bit per byte lane, and one high bit per byte lane: the two constants
-/// every SWAR byte test below is built from.
+/// One set bit per byte lane, and one high bit per byte lane: the two constants every SWAR byte test below is built
+/// from.
 const SWAR_ONES: u64 = 0x0101_0101_0101_0101;
 const SWAR_HIGHS: u64 = 0x8080_8080_8080_8080;
 
-/// Leaves `0x80` in the lane of every zero byte of `word`, and nothing in the
-/// lanes of the rest.
+/// Leaves `0x80` in the lane of every zero byte of `word`, and nothing in the lanes of the rest.
 ///
-/// Borrows propagate from less significant lanes to more significant ones, so a
-/// lane above a zero byte can be flagged spuriously — but a lane *below* the
-/// first zero byte never can, which is all [`find_string_stop`] relies on when
-/// it takes the lowest set bit.
+/// Borrows propagate from less significant lanes to more significant ones, so a lane above a zero byte can be flagged
+/// spuriously — but a lane *below* the first zero byte never can, which is all [`find_string_stop`] relies on when it
+/// takes the lowest set bit.
 #[inline]
 const fn swar_zero_lanes(word: u64) -> u64 {
     word.wrapping_sub(SWAR_ONES) & !word & SWAR_HIGHS
 }
 
-/// Position of the first byte that ends a string body — the closing `delimiter`,
-/// a backslash opening an escape, or a raw control byte below `0x20` — or
-/// `bytes.len()` if the body runs to the end. Also reports whether any byte
-/// *before* that position was non-ASCII, which is what decides if the body needs
-/// a UTF-8 validation pass.
+/// Position of the first byte that ends a string body — the closing `delimiter`, a backslash opening an escape, or a
+/// raw control byte below `0x20` — or `bytes.len()` if the body runs to the end. Also reports whether any byte *before*
+/// that position was non-ASCII, which is what decides if the body needs a UTF-8 validation pass.
 ///
-/// This is the parser's hottest scan: string bytes dominate real documents, and
-/// the generic [`ByteMask::find_in`] costs an index, a shift and a mask per
-/// byte. Testing eight bytes per iteration with three SWAR comparisons is the
-/// same predicate for a fraction of the work, in portable safe Rust. The scalar
-/// tail keeps the two paths agreeing on inputs shorter than a word.
+/// This is the parser's hottest scan: string bytes dominate real documents, and the generic [`ByteMask::find_in`] costs
+/// an index, a shift and a mask per byte. Testing eight bytes per iteration with three SWAR comparisons is the same
+/// predicate for a fraction of the work, in portable safe Rust. The scalar tail keeps the two paths agreeing on inputs
+/// shorter than a word.
 #[inline]
 fn find_string_stop(bytes: &[u8], delimiter: u8) -> (usize, bool) {
     let delimiters = SWAR_ONES.wrapping_mul(delimiter as u64);
@@ -570,25 +552,21 @@ fn find_string_stop(bytes: &[u8], delimiter: u8) -> (usize, bool) {
     let mut non_ascii = false;
     while index + 8 <= bytes.len() {
         let Ok(chunk) = <[u8; 8]>::try_from(&bytes[index..index + 8]) else {
-            // The loop bound guarantees eight bytes, so this never runs; falling
-            // out to the scalar tail rather than unwrapping keeps the function
-            // panic-free even if that bound is ever edited.
+            // The loop bound guarantees eight bytes, so this never runs; falling out to the scalar tail rather than
+            // unwrapping keeps the function panic-free even if that bound is ever edited.
             break;
         };
-        // `from_le_bytes` fixes the lane order regardless of host endianness, so
-        // chunk byte `i` always occupies bits `8i..8i+8` and the bit arithmetic
-        // below is portable rather than little-endian-only.
+        // `from_le_bytes` fixes the lane order regardless of host endianness, so chunk byte `i` always occupies bits
+        // `8i..8i+8` and the bit arithmetic below is portable rather than little-endian-only.
         let word = u64::from_le_bytes(chunk);
-        // A lane is flagged when it equals the delimiter, equals a backslash, or
-        // is below 0x20. The last is the classic "has a byte less than n" test,
-        // valid for any n up to 128.
+        // A lane is flagged when it equals the delimiter, equals a backslash, or is below 0x20. The last is the classic
+        // "has a byte less than n" test, valid for any n up to 128.
         let hits = swar_zero_lanes(word ^ delimiters)
             | swar_zero_lanes(word ^ backslashes)
             | (word.wrapping_sub(controls) & !word & SWAR_HIGHS);
         if hits != 0 {
-            // The lowest set bit is the earliest byte, and it is always a real
-            // hit: a spurious flag needs a borrow out of a lower lane, which
-            // only a genuine match produces.
+            // The lowest set bit is the earliest byte, and it is always a real hit: a spurious flag needs a borrow out
+            // of a lower lane, which only a genuine match produces.
             let offset = (hits.trailing_zeros() / 8) as usize;
             // Only the bytes preceding the stop belong to the run.
             let before = (1u64 << (offset * 8)) - 1;
@@ -609,9 +587,8 @@ fn find_string_stop(bytes: &[u8], delimiter: u8) -> (usize, bool) {
     (index, non_ascii)
 }
 
-/// Finds the first occurrence of the fixed `needle` substring in `bytes`. Used
-/// for the block-comment terminator `*/`; the "skip while in set" direction stays
-/// a scalar scan in `advance_while`, and "stop on first byte in set" is
+/// Finds the first occurrence of the fixed `needle` substring in `bytes`. Used for the block-comment terminator `*/`;
+/// the "skip while in set" direction stays a scalar scan in `advance_while`, and "stop on first byte in set" is
 /// [`ByteMask::find_in`].
 #[inline]
 fn find_subslice(bytes: &[u8], needle: &[u8]) -> Option<usize> {
@@ -635,8 +612,8 @@ const IDENTIFIER_TAIL: ByteMask = ByteMask::ascii_range(b'a', b'z')
     .union(ByteMask::with(b'_'))
     .union(ByteMask::with(b'$'));
 
-/// Decodes an RFC 6901 reference token, unescaping `~1` to `/` and `~0` to `~`.
-/// Allocates only when a `~` is present; the order matters so `~01` becomes `~1`.
+/// Decodes an RFC 6901 reference token, unescaping `~1` to `/` and `~0` to `~`. Allocates only when a `~` is present;
+/// the order matters so `~01` becomes `~1`.
 fn decode_pointer_token(raw: &str) -> Cow<'_, str> {
     if raw.contains('~') {
         Cow::Owned(raw.replace("~1", "/").replace("~0", "~"))
@@ -653,15 +630,14 @@ fn pointer_array_index(token: &str) -> Option<usize> {
     token.parse::<usize>().ok()
 }
 
-/// Decodes the bytes of a JSON string span, yielding the resulting UTF-8 bytes
-/// one at a time. Every access is bounds-checked: on a malformed span the
-/// iterator stops early and sets [`malformed`](UnescapeBytes::malformed), so it
+/// Decodes the bytes of a JSON string span, yielding the resulting UTF-8 bytes one at a time. Every access is
+/// bounds-checked: on a malformed span the iterator stops early and sets [`malformed`](UnescapeBytes::malformed), so it
 /// never panics even on a span the scanner did not produce.
 struct UnescapeBytes<'a> {
     content: &'a [u8],
     index: usize,
-    // A decoded `\u` escape can expand to up to four UTF-8 bytes; they are
-    // buffered here and drained one at a time before scanning resumes.
+    // A decoded `\u` escape can expand to up to four UTF-8 bytes; they are buffered here and drained one at a time
+    // before scanning resumes.
     pending: [u8; 4],
     pending_len: u8,
     pending_position: u8,
@@ -681,8 +657,8 @@ impl<'a> UnescapeBytes<'a> {
         }
     }
 
-    /// Reads four hex digits starting at `self.index`, advancing past them.
-    /// Returns `None` if any are missing or not hexadecimal.
+    /// Reads four hex digits starting at `self.index`, advancing past them. Returns `None` if any are missing or not
+    /// hexadecimal.
     fn read_hex4(&mut self) -> Option<u16> {
         let mut value = 0u16;
         for _ in 0..4 {
@@ -730,8 +706,8 @@ impl<'a> Iterator for UnescapeBytes<'a> {
             self.pending_position += 1;
             return Some(byte);
         }
-        // Looping rather than recursing on line continuations keeps a long run
-        // of `\`-newline pairs from overflowing the stack.
+        // Looping rather than recursing on line continuations keeps a long run of `\`-newline pairs from overflowing
+        // the stack.
         loop {
             let byte = *self.content.get(self.index)?;
             if byte != b'\\' {
@@ -754,9 +730,8 @@ impl<'a> Iterator for UnescapeBytes<'a> {
                 b'n' => Some(b'\n'),
                 b'r' => Some(b'\r'),
                 b't' => Some(b'\t'),
-                // JSON5 escape superset. A strict-scanned span never contains these,
-                // so decoding them unconditionally is harmless and lets a re-decoded
-                // `JsonView` span need no parse-mode context.
+                // JSON5 escape superset. A strict-scanned span never contains these, so decoding them unconditionally
+                // is harmless and lets a re-decoded `JsonView` span need no parse-mode context.
                 b'\'' => Some(b'\''),
                 b'v' => Some(0x0B),
                 b'0' => Some(0x00),
@@ -765,8 +740,7 @@ impl<'a> Iterator for UnescapeBytes<'a> {
                     Some(byte) => self.emit_character(char::from(byte)),
                     None => self.fail(),
                 },
-                // A backslash-newline line continuation yields no byte; loop on to
-                // the next byte instead of recursing.
+                // A backslash-newline line continuation yields no byte; loop on to the next byte instead of recursing.
                 b'\n' => continue,
                 b'\r' => {
                     if self.content.get(self.index) == Some(&b'\n') {
@@ -812,15 +786,13 @@ impl<'a> Iterator for UnescapeBytes<'a> {
     }
 }
 
-/// Decodes a JSON string `span` from `source`, appending the resulting UTF-8
-/// bytes to `output`. Spans produced by this crate's parser are always
-/// well-formed; a hand-built or mismatched span is reported, never panicked on.
+/// Decodes a JSON string `span` from `source`, appending the resulting UTF-8 bytes to `output`. Spans produced by this
+/// crate's parser are always well-formed; a hand-built or mismatched span is reported, never panicked on.
 ///
 /// # Errors
 ///
-/// Returns [`JsonError::Allocation`] if `output` cannot grow, or
-/// [`JsonError::Syntax`] if the span falls outside `source` or is not a
-/// well-formed JSON string body.
+/// Returns [`JsonError::Allocation`] if `output` cannot grow, or [`JsonError::Syntax`] if the span falls outside
+/// `source` or is not a well-formed JSON string body.
 pub fn unescape_into<A: Allocator>(source: &[u8], span: Span, output: &mut Vec<u8, A>) -> Result<(), JsonError> {
     let content = span.bytes(source).ok_or(JsonError::Syntax {
         offset: span.start,
@@ -830,16 +802,14 @@ pub fn unescape_into<A: Allocator>(source: &[u8], span: Span, output: &mut Vec<u
     unescape_validated(content, span.start, output)
 }
 
-/// The decoding half of [`unescape_into`], for a `content` slice already known
-/// to be well-formed: valid UTF-8, no unescaped control bytes, and only escapes
-/// the scanner accepts. Parser-produced spans satisfy all three by construction —
-/// [`Parser::scan_string`] checks them while scanning — so the owned builder
-/// calls this directly and skips a second validation pass over every string and
-/// key. The public [`unescape_into`] keeps validating, since it accepts spans
-/// this crate did not produce.
+/// The decoding half of [`unescape_into`], for a `content` slice already known to be well-formed: valid UTF-8, no
+/// unescaped control bytes, and only escapes the scanner accepts. Parser-produced spans satisfy all three by
+/// construction — [`Parser::scan_string`] checks them while scanning — so the owned builder calls this directly and
+/// skips a second validation pass over every string and key. The public [`unescape_into`] keeps validating, since it
+/// accepts spans this crate did not produce.
 fn unescape_validated<A: Allocator>(content: &[u8], offset: usize, output: &mut Vec<u8, A>) -> Result<(), JsonError> {
-    // Decoding only collapses escapes, so the escaped length is an upper bound —
-    // reserve once and push without a per-byte check.
+    // Decoding only collapses escapes, so the escaped length is an upper bound — reserve once and push without a
+    // per-byte check.
     output.try_reserve(content.len()).map_err(|_| JsonError::Allocation)?;
     // Fast path: an escape-free string is copied verbatim.
     if !content.contains(&b'\\') {
@@ -859,9 +829,8 @@ fn unescape_validated<A: Allocator>(content: &[u8], offset: usize, output: &mut 
     Ok(())
 }
 
-/// Validates UTF-8 and raw control bytes before the byte-oriented escape
-/// decoder runs. Parser-produced spans have already passed these checks, but
-/// this public function also accepts caller-provided spans.
+/// Validates UTF-8 and raw control bytes before the byte-oriented escape decoder runs. Parser-produced spans have
+/// already passed these checks, but this public function also accepts caller-provided spans.
 fn validate_string_body(content: &[u8], offset: usize) -> Result<(), JsonError> {
     if core::str::from_utf8(content).is_err() {
         return Err(JsonError::Syntax {
@@ -869,8 +838,8 @@ fn validate_string_body(content: &[u8], offset: usize) -> Result<(), JsonError> 
             kind: SyntaxKind::InvalidUtf8,
         });
     }
-    // The same interesting set the parser's string scanner uses, minus the
-    // delimiter: skip ordinary runs and stop only on a backslash or a control.
+    // The same interesting set the parser's string scanner uses, minus the delimiter: skip ordinary runs and stop only
+    // on a backslash or a control.
     let stops = BACKSLASH.union(ASCII_CONTROLS);
     let mut index = 0;
     while index < content.len() {
@@ -898,8 +867,8 @@ fn validate_string_body(content: &[u8], offset: usize) -> Result<(), JsonError> 
     Ok(())
 }
 
-/// Compares a still-escaped JSON string `span` against a decoded `expected`
-/// string, decoding the span on the fly. Allocation-free.
+/// Compares a still-escaped JSON string `span` against a decoded `expected` string, decoding the span on the fly.
+/// Allocation-free.
 fn escaped_equals(source: &[u8], span: Span, expected: &str) -> bool {
     let content = match span.bytes(source) {
         Some(content) => content,
@@ -920,8 +889,8 @@ fn escaped_equals(source: &[u8], span: Span, expected: &str) -> bool {
     }
 }
 
-/// Orders a still-escaped JSON string `span` against a decoded `other` string by
-/// their decoded byte sequences. Allocation-free; used for view-side sorting.
+/// Orders a still-escaped JSON string `span` against a decoded `other` string by their decoded byte sequences.
+/// Allocation-free; used for view-side sorting.
 fn escaped_compare(source: &[u8], span: Span, other: &str) -> Ordering {
     let content = span.bytes(source).unwrap_or(&[]);
     let mut decoded = UnescapeBytes::new(content);
@@ -940,8 +909,8 @@ fn escaped_compare(source: &[u8], span: Span, other: &str) -> Ordering {
     }
 }
 
-/// Orders two still-escaped JSON string spans by their decoded byte sequences,
-/// decoding both on the fly. Allocation-free; used to sort object keys.
+/// Orders two still-escaped JSON string spans by their decoded byte sequences, decoding both on the fly.
+/// Allocation-free; used to sort object keys.
 fn escaped_span_compare(source: &[u8], left: Span, right: Span) -> Ordering {
     let left_content = left.bytes(source).unwrap_or(&[]);
     let right_content = right.bytes(source).unwrap_or(&[]);
@@ -963,8 +932,7 @@ fn escaped_span_compare(source: &[u8], left: Span, right: Span) -> Ordering {
     }
 }
 
-/// Indentation style for pretty-printing: a fixed number of spaces per nesting
-/// level, or a single tab per level.
+/// Indentation style for pretty-printing: a fixed number of spaces per nesting level, or a single tab per level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Indent {
@@ -974,29 +942,24 @@ pub enum Indent {
     Tabs,
 }
 
-/// Builds a spaces [`Indent`] from a `usize` count, clamping to `u16::MAX` rather
-/// than wrapping so an absurd width never silently becomes a tiny one.
+/// Builds a spaces [`Indent`] from a `usize` count, clamping to `u16::MAX` rather than wrapping so an absurd width
+/// never silently becomes a tiny one.
 fn spaces_indent(count: usize) -> Indent {
     Indent::Spaces(count.min(u16::MAX as usize) as u16)
 }
 
 /// Controls how a document is rendered back to JSON text.
 ///
-/// `indent` of `None` writes compact JSON with no insignificant whitespace;
-/// `Some(indent)` indents nested containers at the given step. When `max_width`
-/// is `None` every non-empty container expands one element per line; when it is
-/// `Some(columns)` a container is printed inline if its single-line form fits in
-/// the remaining columns and expanded otherwise. Construct one with
-/// [`FormatOptions::compact`], [`FormatOptions::pretty`], or
-/// [`FormatOptions::pretty_width`] and pass it to `to_string_with` /
-/// `write_json_with`.
+/// `indent` of `None` writes compact JSON with no insignificant whitespace; `Some(indent)` indents nested containers at
+/// the given step. When `max_width` is `None` every non-empty container expands one element per line; when it is
+/// `Some(columns)` a container is printed inline if its single-line form fits in the remaining columns and expanded
+/// otherwise. Construct one with [`FormatOptions::compact`], [`FormatOptions::pretty`], or
+/// [`FormatOptions::pretty_width`] and pass it to `to_string_with` / `write_json_with`.
 ///
-/// The width budget is measured in Unicode scalar values, not rendered display
-/// columns, so a line of wide characters may occupy more visual width than
-/// `max_width`, and an [`Indent::Tabs`] level counts as one column. A line that
-/// ends in an inlined non-final element carries a trailing comma, so it can run
-/// one column past `max_width`. `max_width` has no effect when `indent` is
-/// `None`, since compact output has no lines to wrap.
+/// The width budget is measured in Unicode scalar values, not rendered display columns, so a line of wide characters
+/// may occupy more visual width than `max_width`, and an [`Indent::Tabs`] level counts as one column. A line that ends
+/// in an inlined non-final element carries a trailing comma, so it can run one column past `max_width`. `max_width` has
+/// no effect when `indent` is `None`, since compact output has no lines to wrap.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct FormatOptions {
@@ -1004,8 +967,8 @@ pub struct FormatOptions {
     pub indent: Option<Indent>,
     /// Column budget for width-based wrapping, or `None` to always expand.
     pub max_width: Option<usize>,
-    /// Emit comments preserved on the owned [`Json`] tree. Forces expansion and
-    /// is ignored by the zero-copy [`JsonView`], which carries no comments.
+    /// Emit comments preserved on the owned [`Json`] tree. Forces expansion and is ignored by the zero-copy
+    /// [`JsonView`], which carries no comments.
     pub comments: bool,
 }
 
@@ -1028,8 +991,8 @@ impl FormatOptions {
         }
     }
 
-    /// Two-space indentation that keeps a container on one line while it fits
-    /// within `columns`, wrapping to one element per line only when it does not.
+    /// Two-space indentation that keeps a container on one line while it fits within `columns`, wrapping to one element
+    /// per line only when it does not.
     pub const fn pretty_width(columns: usize) -> Self {
         Self {
             indent: Some(Indent::Spaces(2)),
@@ -1050,9 +1013,8 @@ impl FormatOptions {
         self
     }
 
-    /// Enables emitting preserved comments, returning the updated options. A
-    /// container carrying comments is always expanded, so this pairs with an
-    /// indent; with none set it defaults to two spaces.
+    /// Enables emitting preserved comments, returning the updated options. A container carrying comments is always
+    /// expanded, so this pairs with an indent; with none set it defaults to two spaces.
     pub const fn with_comments(mut self, comments: bool) -> Self {
         self.comments = comments;
         self
@@ -1091,8 +1053,8 @@ fn indent_cols(indent: Indent, depth: usize) -> usize {
     }
 }
 
-/// A [`fmt::Write`] sink that counts columns and refuses further input once it
-/// would exceed `limit`, so a fits-check stops the instant a line overflows.
+/// A [`fmt::Write`] sink that counts columns and refuses further input once it would exceed `limit`, so a fits-check
+/// stops the instant a line overflows.
 struct WidthLimit {
     used: usize,
     limit: usize,
@@ -1139,9 +1101,8 @@ fn write_escaped_str<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
 fn write_escaped_body<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
     let bytes = text.as_bytes();
     let mut run_start = 0;
-    // Every byte needing an escape is ASCII, and multi-byte UTF-8 bytes are all
-    // >= 0x80, so we can bulk-copy the clean runs between escapes and only break
-    // out to write the escape itself.
+    // Every byte needing an escape is ASCII, and multi-byte UTF-8 bytes are all >= 0x80, so we can bulk-copy the clean
+    // runs between escapes and only break out to write the escape itself.
     for (index, &byte) in bytes.iter().enumerate() {
         if byte >= 0x20 && byte != b'"' && byte != b'\\' {
             continue;
@@ -1167,9 +1128,9 @@ fn write_escaped_body<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result 
     Ok(())
 }
 
-/// Whether a raw string span can be re-emitted verbatim inside double quotes:
-/// it holds no literal `"` and every backslash opens an escape that is also valid
-/// in strict JSON. A JSON5 single-quoted body or an extended escape fails this.
+/// Whether a raw string span can be re-emitted verbatim inside double quotes: it holds no literal `"` and every
+/// backslash opens an escape that is also valid in strict JSON. A JSON5 single-quoted body or an extended escape fails
+/// this.
 fn span_is_strict_json_body(content: &[u8]) -> bool {
     if core::str::from_utf8(content).is_err() {
         return false;
@@ -1226,9 +1187,8 @@ fn span_is_strict_json_body(content: &[u8]) -> bool {
     true
 }
 
-/// Writes a quoted JSON string from a raw source span. When the span is already
-/// valid strict JSON body it is copied verbatim; a JSON5 span with single-quote
-/// content or extended escapes is decoded and re-escaped into strict JSON.
+/// Writes a quoted JSON string from a raw source span. When the span is already valid strict JSON body it is copied
+/// verbatim; a JSON5 span with single-quote content or extended escapes is decoded and re-escaped into strict JSON.
 fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) -> fmt::Result {
     let content = span.bytes(source).unwrap_or(&[]);
     if span_is_strict_json_body(content) {
@@ -1236,8 +1196,8 @@ fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) ->
         writer.write_str(core::str::from_utf8(content).unwrap_or(""))?;
         return writer.write_char('"');
     }
-    // Decode the JSON5 body one byte at a time, reassembling whole UTF-8
-    // characters, and re-escape each into a strict JSON string.
+    // Decode the JSON5 body one byte at a time, reassembling whole UTF-8 characters, and re-escape each into a strict
+    // JSON string.
     writer.write_char('"')?;
     let mut decoder = UnescapeBytes::new(content);
     let mut buffer = [0u8; 4];
@@ -1249,9 +1209,8 @@ fn write_raw_string<W: fmt::Write>(writer: &mut W, source: &[u8], span: Span) ->
             write_escaped_body(writer, text)?;
             filled = 0;
         } else if filled == 4 {
-            // Four bytes that still do not form a character mean a malformed span
-            // (a parser-produced span never gets here); drop them so the index
-            // stays in bounds rather than panicking.
+            // Four bytes that still do not form a character mean a malformed span (a parser-produced span never gets
+            // here); drop them so the index stays in bounds rather than panicking.
             filled = 0;
         }
     }
@@ -1277,8 +1236,7 @@ fn write_comment<W: fmt::Write, A: Allocator>(writer: &mut W, comment: &Comment<
     Ok(())
 }
 
-/// Emits the leading comments anchored to `anchor`, each on its own indented
-/// line, and returns the advanced cursor.
+/// Emits the leading comments anchored to `anchor`, each on its own indented line, and returns the advanced cursor.
 fn write_leading_comments<W: fmt::Write, A: Allocator>(
     writer: &mut W,
     comments: &[AnchoredComment<A>],
@@ -1296,8 +1254,8 @@ fn write_leading_comments<W: fmt::Write, A: Allocator>(
     Ok(cursor)
 }
 
-/// Emits the trailing comments anchored to `anchor`, each after a space on the
-/// current line, and returns the advanced cursor.
+/// Emits the trailing comments anchored to `anchor`, each after a space on the current line, and returns the advanced
+/// cursor.
 fn write_trailing_comments<W: fmt::Write, A: Allocator>(
     writer: &mut W,
     comments: &[AnchoredComment<A>],
@@ -1313,8 +1271,8 @@ fn write_trailing_comments<W: fmt::Write, A: Allocator>(
     Ok(cursor)
 }
 
-/// Emits any comments left after the last element — the tail before the closer —
-/// each on its own indented line, and returns the advanced cursor.
+/// Emits any comments left after the last element — the tail before the closer — each on its own indented line, and
+/// returns the advanced cursor.
 fn write_tail_comments<W: fmt::Write, A: Allocator>(
     writer: &mut W,
     comments: &[AnchoredComment<A>],
@@ -1330,8 +1288,8 @@ fn write_tail_comments<W: fmt::Write, A: Allocator>(
     Ok(cursor)
 }
 
-/// Whether a finite `f64` has no fractional part, computed without the
-/// std-only `f64::fract`/`trunc` so it works under `no_std`.
+/// Whether a finite `f64` has no fractional part, computed without the std-only `f64::fract`/`trunc` so it works under
+/// `no_std`.
 fn is_integral(value: f64) -> bool {
     // Clear the sign bit for the magnitude; `to_bits`/`from_bits` are `core`.
     let magnitude = f64::from_bits(value.to_bits() & 0x7fff_ffff_ffff_ffff);
@@ -1344,9 +1302,8 @@ fn is_integral(value: f64) -> bool {
     }
 }
 
-/// Writes a finite JSON number straight to `writer`. Non-finite floats become
-/// `null`, and integral floats keep a trailing `.0` so their type survives a
-/// round trip. `f64`'s formatter never uses exponent notation, so writing
+/// Writes a finite JSON number straight to `writer`. Non-finite floats become `null`, and integral floats keep a
+/// trailing `.0` so their type survives a round trip. `f64`'s formatter never uses exponent notation, so writing
 /// directly and appending `.0` when integral needs no intermediate buffer.
 fn write_number<W: fmt::Write>(writer: &mut W, value: f64) -> fmt::Result {
     if !value.is_finite() {
@@ -1368,16 +1325,16 @@ enum Scalar {
     Big(Span),
 }
 
-/// Turns raw JSON tokens into a document. The parser is generic over this trait
-/// so a single recursion produces either a [`JsonView`] or a [`Json`].
+/// Turns raw JSON tokens into a document. The parser is generic over this trait so a single recursion produces either a
+/// [`JsonView`] or a [`Json`].
 trait DomBuilder<A: Allocator + Clone> {
     /// A fully parsed value.
     type Value;
     /// An object key.
     type Key;
 
-    /// Whether this builder keeps comment trivia. The parser only collects
-    /// comments when this is `true`, so the zero-copy view pays nothing.
+    /// Whether this builder keeps comment trivia. The parser only collects comments when this is `true`, so the
+    /// zero-copy view pays nothing.
     const PRESERVES_TRIVIA: bool = false;
 
     fn null() -> Self::Value;
@@ -1392,17 +1349,15 @@ trait DomBuilder<A: Allocator + Clone> {
     fn object(entries: Vec<(Self::Key, Self::Value), A>, trivia: Option<Box<TriviaBlock<A>, A>>) -> Self::Value;
     /// Orders two object keys by their decoded bytes, for duplicate handling.
     fn key_compare(source: &[u8], left: &Self::Key, right: &Self::Key) -> Ordering;
-    /// Orders two object keys that are known to contain no escape sequences.
-    /// Defaults to the general comparison, which is already the right thing for
-    /// a builder holding decoded keys; the zero-copy builder overrides it to
-    /// compare raw source bytes rather than decoding as it goes.
+    /// Orders two object keys that are known to contain no escape sequences. Defaults to the general comparison, which
+    /// is already the right thing for a builder holding decoded keys; the zero-copy builder overrides it to compare raw
+    /// source bytes rather than decoding as it goes.
     fn key_compare_plain(source: &[u8], left: &Self::Key, right: &Self::Key) -> Ordering {
         Self::key_compare(source, left, right)
     }
-    /// Whether two escape-free object keys are equal. Deduplication only ever
-    /// asks this question, and equality is strictly cheaper than an ordering: it
-    /// can reject on differing lengths without looking at a single byte, where
-    /// an ordering must walk the common prefix first.
+    /// Whether two escape-free object keys are equal. Deduplication only ever asks this question, and equality is
+    /// strictly cheaper than an ordering: it can reject on differing lengths without looking at a single byte, where an
+    /// ordering must walk the common prefix first.
     fn key_equals_plain(source: &[u8], left: &Self::Key, right: &Self::Key) -> bool {
         Self::key_compare_plain(source, left, right) == Ordering::Equal
     }
@@ -1410,8 +1365,8 @@ trait DomBuilder<A: Allocator + Clone> {
 
 /// The explicit structural stack used by the parser.
 ///
-/// Keeping container state here turns nesting into data rather than Rust call
-/// frames, making the depth limit independent of the host stack.
+/// Keeping container state here turns nesting into data rather than Rust call frames, making the depth limit
+/// independent of the host stack.
 enum ParseFrame<A: Allocator + Clone, B: DomBuilder<A>> {
     Array {
         items: Vec<B::Value, A>,
@@ -1423,10 +1378,9 @@ enum ParseFrame<A: Allocator + Clone, B: DomBuilder<A>> {
         trivia: Option<Box<TriviaBlock<A>, A>>,
         key: Option<B::Key>,
         state: ObjectState,
-        /// Whether every key scanned into this object so far was free of escape
-        /// sequences. Almost every real document satisfies this, and when it
-        /// holds, deduplication can compare raw source bytes instead of
-        /// decoding both keys through the escape-aware iterator.
+        /// Whether every key scanned into this object so far was free of escape sequences. Almost every real document
+        /// satisfies this, and when it holds, deduplication can compare raw source bytes instead of decoding both keys
+        /// through the escape-aware iterator.
         keys_plain: bool,
     },
 }
@@ -1454,14 +1408,12 @@ struct Parser<'a, A: Allocator + Clone, B: DomBuilder<A>> {
     nodes: usize,
     allocator: A,
     options: ParseOptions,
-    // Comments scanned but not yet bound to a container slot, and whether a
-    // newline has been seen since the last value ended. Both are only touched
-    // when the builder preserves trivia and the option is on.
+    // Comments scanned but not yet bound to a container slot, and whether a newline has been seen since the last value
+    // ended. Both are only touched when the builder preserves trivia and the option is on.
     pending: Vec<PendingComment, A>,
     broke: bool,
-    /// Whether the most recent `scan_string` passed over a backslash. Read right
-    /// after scanning an object key, to keep the containing frame's `keys_plain`
-    /// flag current.
+    /// Whether the most recent `scan_string` passed over a backslash. Read right after scanning an object key, to keep
+    /// the containing frame's `keys_plain` flag current.
     scanned_escape: bool,
     _builder: PhantomData<B>,
 }
@@ -1524,11 +1476,9 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             .copied()
     }
 
-    /// Advances through the maximal byte run accepted by `mask` with a plain
-    /// scalar scan. Every such run in real JSON — a number's digits, an
-    /// identifier, a run of indentation whitespace — is short, so a scalar scan
-    /// is the right tool; the contrasting "find the terminator" direction is
-    /// [`ByteMask::find_in`].
+    /// Advances through the maximal byte run accepted by `mask` with a plain scalar scan. Every such run in real JSON —
+    /// a number's digits, an identifier, a run of indentation whitespace — is short, so a scalar scan is the right
+    /// tool; the contrasting "find the terminator" direction is [`ByteMask::find_in`].
     #[inline]
     fn advance_while(&mut self, mask: ByteMask) {
         let remaining = &self.source[self.position..];
@@ -1539,18 +1489,16 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         self.position += run;
     }
 
-    /// Skips insignificant whitespace, and — when the matching options are
-    /// enabled — `//` line and `/* */` block comments. A lone `/` that does not
-    /// open an enabled comment is left in place for the caller to fault on.
+    /// Skips insignificant whitespace, and — when the matching options are enabled — `//` line and `/* */` block
+    /// comments. A lone `/` that does not open an enabled comment is left in place for the caller to fault on.
     fn skip_trivia(&mut self) -> Result<(), JsonError> {
         loop {
-            // Skip the whitespace run in one search. A newline anywhere in it
-            // decides whether a following comment trails the last value or leads
-            // the next one.
+            // Skip the whitespace run in one search. A newline anywhere in it decides whether a following comment
+            // trails the last value or leads the next one.
             let whitespace_start = self.position;
             self.advance_while(WHITESPACE);
-            // The newline flag only matters for comment classification, so re-scan
-            // the skipped run for a line break only when collecting comments.
+            // The newline flag only matters for comment classification, so re-scan the skipped run for a line break
+            // only when collecting comments.
             if self.collecting_comments()
                 && self.source[whitespace_start..self.position]
                     .iter()
@@ -1596,9 +1544,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
     }
 
-    /// Records a scanned comment's text span into `pending`, if this parse is
-    /// collecting comments. Best-effort fallible allocation, like the rest of the
-    /// parse path.
+    /// Records a scanned comment's text span into `pending`, if this parse is collecting comments. Best-effort fallible
+    /// allocation, like the rest of the parse path.
     fn record_comment(&mut self, start: usize, end: usize, style: CommentStyle) -> Result<(), JsonError> {
         self.check_limit(end.saturating_sub(start), self.options.limits.max_comment_bytes)?;
         if !self.collecting_comments() {
@@ -1616,11 +1563,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(())
     }
 
-    /// Binds every pending comment to a slot of the container currently being
-    /// built, given the number of elements collected so far. A comment with a
-    /// newline before it, or one seen before any element, leads element `index`;
-    /// otherwise it trails element `index - 1`. `index == len` at the closer makes
-    /// the leftover comments the tail before the closing bracket.
+    /// Binds every pending comment to a slot of the container currently being built, given the number of elements
+    /// collected so far. A comment with a newline before it, or one seen before any element, leads element `index`;
+    /// otherwise it trails element `index - 1`. `index == len` at the closer makes the leftover comments the tail
+    /// before the closing bracket.
     fn drain_pending(&mut self, index: usize, trivia: &mut Option<Box<TriviaBlock<A>, A>>) -> Result<(), JsonError> {
         if self.pending.is_empty() {
             return Ok(());
@@ -1651,19 +1597,16 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(())
     }
 
-    /// Parses a single top-level document, requiring that nothing but
-    /// trivia follows the value.
+    /// Parses a single top-level document, requiring that nothing but trivia follows the value.
     fn parse_document(&mut self) -> Result<B::Value, JsonError> {
         let mut frames: Vec<ParseFrame<A, B>, A> = Vec::new_in(self.allocator.clone());
         let mut root = None;
         let mut need_value = true;
-        // Cursor position at which trivia was most recently skipped. A state
-        // transition that does not advance the cursor — an array element moving
-        // from "value required" to "parse a value" is the hot one — would
-        // otherwise rescan the same whitespace. Skipping again at an unmoved
-        // cursor is a no-op by construction, so memoizing it changes nothing
-        // observable, including comment collection and the newline flag.
-        // `usize::MAX` means "nowhere", since it is never a valid position.
+        // Cursor position at which trivia was most recently skipped. A state transition that does not advance the
+        // cursor — an array element moving from "value required" to "parse a value" is the hot one — would otherwise
+        // rescan the same whitespace. Skipping again at an unmoved cursor is a no-op by construction, so memoizing it
+        // changes nothing observable, including comment collection and the newline flag. `usize::MAX` means "nowhere",
+        // since it is never a valid position.
         let mut trivia_skipped_at = usize::MAX;
 
         loop {
@@ -1877,9 +1820,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(())
     }
 
-    /// Reserves one frame and enters a container without relying on wrapping
-    /// depth arithmetic. The caller consumes the already-validated opener by
-    /// pushing its concrete array or object frame immediately afterwards.
+    /// Reserves one frame and enters a container without relying on wrapping depth arithmetic. The caller consumes the
+    /// already-validated opener by pushing its concrete array or object frame immediately afterwards.
     fn enter_container(&mut self, frames: &mut Vec<ParseFrame<A, B>, A>) -> Result<(), JsonError> {
         let depth = self
             .depth
@@ -1994,12 +1936,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
     }
 
-    /// Scans a number. Strict RFC 8259 is an optional minus, an integer part of
-    /// either a lone zero or a non-zero digit run, an optional fraction of a dot
-    /// and digits, and an optional exponent, classified into the narrowest of
-    /// `i64`, `u64`, or `f64`. The JSON5 options additionally accept a leading
-    /// `+`, `0x` hexadecimal integers, `.5`/`5.` decimal points, and the
-    /// `Infinity`/`NaN` literals.
+    /// Scans a number. Strict RFC 8259 is an optional minus, an integer part of either a lone zero or a non-zero digit
+    /// run, an optional fraction of a dot and digits, and an optional exponent, classified into the narrowest of `i64`,
+    /// `u64`, or `f64`. The JSON5 options additionally accept a leading `+`, `0x` hexadecimal integers, `.5`/`5.`
+    /// decimal points, and the `Infinity`/`NaN` literals.
     fn scan_number(&mut self) -> Result<Scalar, JsonError> {
         let start = self.position;
 
@@ -2037,15 +1977,14 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 
         let mut is_float = false;
         let mut has_integer_digits = false;
-        // The integer part's magnitude, accumulated while scanning so the common
-        // integer case never re-walks the token through `str::parse`. Set when
-        // the value outgrows 64 bits, which hands it to the lossless big-number
-        // path exactly as the parse-based route did.
+        // The integer part's magnitude, accumulated while scanning so the common integer case never re-walks the token
+        // through `str::parse`. Set when the value outgrows 64 bits, which hands it to the lossless big-number path
+        // exactly as the parse-based route did.
         let mut magnitude: u64 = 0;
         let mut magnitude_overflowed = false;
 
-        // Integer part: a lone zero, or a non-zero digit run with no leading zeros.
-        // JSON5 may also open with a decimal point and no integer digits at all.
+        // Integer part: a lone zero, or a non-zero digit run with no leading zeros. JSON5 may also open with a decimal
+        // point and no integer digits at all.
         match self.peek() {
             Some(b'0') => {
                 self.position += 1;
@@ -2076,9 +2015,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
         }
 
-        // Fractional part: a dot followed by digits. Strict JSON requires at
-        // least one digit; JSON5 allows a trailing dot when integer digits are
-        // present, and a leading dot when a fraction follows.
+        // Fractional part: a dot followed by digits. Strict JSON requires at least one digit; JSON5 allows a trailing
+        // dot when integer digits are present, and a leading dot when a fraction follows.
         if self.peek() == Some(b'.') {
             is_float = true;
             self.position += 1;
@@ -2119,10 +2057,9 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
 
         if is_float {
-            // Only the float lane needs the token as text: correctly-rounded
-            // `f64` parsing is worth keeping in `str::parse`. The integer lane
-            // below was accumulated during the scan and never comes back here,
-            // so it pays for neither this UTF-8 pass nor a second walk.
+            // Only the float lane needs the token as text: correctly-rounded `f64` parsing is worth keeping in
+            // `str::parse`. The integer lane below was accumulated during the scan and never comes back here, so it
+            // pays for neither this UTF-8 pass nor a second walk.
             let token = &self.source[start..self.position];
             // The token is all ASCII, so this never fails.
             let text = core::str::from_utf8(token).map_err(|_| JsonError::Syntax {
@@ -2133,18 +2070,16 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 offset: start,
                 kind: SyntaxKind::InvalidNumber,
             })?;
-            // A finite, faithfully-represented value keeps its `f64` lane. One
-            // that overflowed to infinity, or a nonzero magnitude that
-            // underflowed to zero, would lose data — preserve its exact lexeme.
+            // A finite, faithfully-represented value keeps its `f64` lane. One that overflowed to infinity, or a
+            // nonzero magnitude that underflowed to zero, would lose data — preserve its exact lexeme.
             let underflowed_to_zero = value == 0.0 && token.iter().any(|&byte| (b'1'..=b'9').contains(&byte));
             if value.is_finite() && !underflowed_to_zero {
                 return Ok(Scalar::Float(value));
             }
             return self.big_number(start);
         }
-        // A plain integer: the magnitude was accumulated during the scan, so the
-        // token needs no second pass. Anything that outgrew 64 bits keeps its
-        // exact lexeme instead.
+        // A plain integer: the magnitude was accumulated during the scan, so the token needs no second pass. Anything
+        // that outgrew 64 bits keeps its exact lexeme instead.
         if !magnitude_overflowed {
             if !negative {
                 return Ok(Scalar::Unsigned(magnitude));
@@ -2159,12 +2094,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         self.big_number(start)
     }
 
-    /// Builds a [`Scalar::Big`] span from `start` to the cursor, keeping the
-    /// exact lexeme. The preserved text is re-emitted verbatim, so it must
-    /// already be valid strict JSON: a leading `+` is dropped, and any decimal
-    /// point not sitting between two digits — a leading `.5`, a trailing `5.`,
-    /// or a `5.e6` before an exponent — is rejected. JSON5 forms reach this
-    /// path only in the f64-overflow range, so rejecting them is a rare corner.
+    /// Builds a [`Scalar::Big`] span from `start` to the cursor, keeping the exact lexeme. The preserved text is
+    /// re-emitted verbatim, so it must already be valid strict JSON: a leading `+` is dropped, and any decimal point
+    /// not sitting between two digits — a leading `.5`, a trailing `5.`, or a `5.e6` before an exponent — is rejected.
+    /// JSON5 forms reach this path only in the f64-overflow range, so rejecting them is a rare corner.
     fn big_number(&self, start: usize) -> Result<Scalar, JsonError> {
         let mut low = start;
         if self.source.get(low) == Some(&b'+') {
@@ -2189,8 +2122,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }))
     }
 
-    /// Scans a `0x`/`0X` hexadecimal integer, already positioned on the `0`. The
-    /// magnitude must fit a 64-bit lane, so the decimal it re-emits is valid JSON.
+    /// Scans a `0x`/`0X` hexadecimal integer, already positioned on the `0`. The magnitude must fit a 64-bit lane, so
+    /// the decimal it re-emits is valid JSON.
     fn scan_hex_integer(&mut self, start: usize, negative: bool) -> Result<Scalar, JsonError> {
         self.position += 2; // the "0x"
         let digits_start = self.position;
@@ -2224,21 +2157,19 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(Scalar::Integer(signed as i64))
     }
 
-    /// Scans a string opened by `delimiter` (a double or, under JSON5, single
-    /// quote), validating escapes and rejecting raw control characters, and
-    /// returns the raw span between the quotes, still escaped.
+    /// Scans a string opened by `delimiter` (a double or, under JSON5, single quote), validating escapes and rejecting
+    /// raw control characters, and returns the raw span between the quotes, still escaped.
     fn scan_string(&mut self, delimiter: u8) -> Result<Span, JsonError> {
         self.position += 1; // opening quote
         let start = self.position;
-        // Track non-ASCII so a pure-ASCII body (the common case) skips the second
-        // UTF-8 validation pass — ASCII is always valid UTF-8.
+        // Track non-ASCII so a pure-ASCII body (the common case) skips the second UTF-8 validation pass — ASCII is
+        // always valid UTF-8.
         let mut has_non_ascii = false;
-        // Recorded for the caller: an escape-free body can be compared as raw
-        // source bytes later, with no decoding.
+        // Recorded for the caller: an escape-free body can be compared as raw source bytes later, with no decoding.
         self.scanned_escape = false;
         loop {
-            // One SWAR pass finds the run's end and reports whether it held any
-            // non-ASCII byte, so the ASCII question costs nothing extra.
+            // One SWAR pass finds the run's end and reports whether it held any non-ASCII byte, so the ASCII question
+            // costs nothing extra.
             let remaining = &self.source[self.position..];
             let (run_len, run_non_ascii) = find_string_stop(remaining, delimiter);
             has_non_ascii |= run_non_ascii;
@@ -2246,9 +2177,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             match self.peek() {
                 None => return self.fault_kind(SyntaxKind::UnexpectedEnd),
                 Some(byte) if byte == delimiter => {
-                    // RFC 8259 §8.1: the text must be valid UTF-8. Escape bytes are
-                    // all ASCII, so validating the body only when it holds non-ASCII
-                    // bytes catches every ill-formed literal byte.
+                    // RFC 8259 §8.1: the text must be valid UTF-8. Escape bytes are all ASCII, so validating the body
+                    // only when it holds non-ASCII bytes catches every ill-formed literal byte.
                     if has_non_ascii {
                         let content = &self.source[start..self.position];
                         if let Err(error) = core::str::from_utf8(content) {
@@ -2273,17 +2203,15 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 }
                 // RFC 8259 forbids unescaped control characters in strings.
                 Some(byte) if byte < 0x20 => return self.fault_kind(SyntaxKind::ControlCharacter),
-                // `interesting` covers the delimiter, backslash, and controls, so
-                // the arms above are exhaustive. Fault defensively rather than
-                // panic if a future mask or arm edit ever desyncs the two.
+                // `interesting` covers the delimiter, backslash, and controls, so the arms above are exhaustive. Fault
+                // defensively rather than panic if a future mask or arm edit ever desyncs the two.
                 Some(_) => return self.fault(),
             }
         }
     }
 
-    /// Validates one escape sequence, positioned just past the backslash. The
-    /// JSON5 extensions — `\'`, `\v`, `\0`, `\xHH`, and backslash-newline line
-    /// continuations — are accepted only when single quotes are enabled.
+    /// Validates one escape sequence, positioned just past the backslash. The JSON5 extensions — `\'`, `\v`, `\0`,
+    /// `\xHH`, and backslash-newline line continuations — are accepted only when single quotes are enabled.
     fn scan_escape(&mut self) -> Result<(), JsonError> {
         match self.peek() {
             Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
@@ -2296,8 +2224,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
             Some(b'0') if self.options.allow_single_quotes => {
                 self.position += 1;
-                // `\0` is the null character, but `\0` before a digit is not a
-                // valid JSON5 escape.
+                // `\0` is the null character, but `\0` before a digit is not a valid JSON5 escape.
                 if matches!(self.peek(), Some(b'0'..=b'9')) {
                     return self.fault_kind(SyntaxKind::InvalidEscape);
                 }
@@ -2344,8 +2271,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
     }
 
-    /// Reads `\u`'s four hex digits, positioned on the `u`, and returns the code
-    /// unit. Advances past the `u` and all four digits.
+    /// Reads `\u`'s four hex digits, positioned on the `u`, and returns the code unit. Advances past the `u` and all
+    /// four digits.
     fn scan_hex4(&mut self) -> Result<u16, JsonError> {
         self.position += 1; // the 'u'
         let mut value = 0u16;
@@ -2372,8 +2299,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(())
     }
 
-    /// Scans an unquoted JSON5 identifier key, returning its raw span. Version one
-    /// accepts ASCII identifier characters only, with no `\u` escapes.
+    /// Scans an unquoted JSON5 identifier key, returning its raw span. Version one accepts ASCII identifier characters
+    /// only, with no `\u` escapes.
     fn scan_identifier(&mut self) -> Result<Span, JsonError> {
         // An identifier is ASCII letters, digits, `_` and `$`; no escapes exist.
         self.scanned_escape = false;
@@ -2398,14 +2325,11 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         Ok(())
     }
 
-    /// Applies the duplicate-key policy to a fully collected object. `KeepAll`
-    /// keeps every entry; the others keep one entry per key in first-occurrence
-    /// order — `LastWins` with the last value, `FirstWins` with the first,
-    /// `Reject` faulting. Small objects dedup with a linear scan; larger ones sort
-    /// a permutation of key positions, so the work stays `O(n log n)` on any
-    /// input — no hash, so no hash-collision denial of service.
-    /// `keys_plain` says no key in this object contained an escape sequence, in
-    /// which case keys compare as raw bytes and no decoding is needed.
+    /// Applies the duplicate-key policy to a fully collected object. `KeepAll` keeps every entry; the others keep one
+    /// entry per key in first-occurrence order — `LastWins` with the last value, `FirstWins` with the first, `Reject`
+    /// faulting. Small objects dedup with a linear scan; larger ones sort a permutation of key positions, so the work
+    /// stays `O(n log n)` on any input — no hash, so no hash-collision denial of service. `keys_plain` says no key in
+    /// this object contained an escape sequence, in which case keys compare as raw bytes and no decoding is needed.
     fn dedup_object(&self, entries: &mut Vec<(B::Key, B::Value), A>, keys_plain: bool) -> Result<(), JsonError> {
         if self.options.duplicate_keys == DuplicateKeys::KeepAll || entries.len() < 2 {
             return Ok(());
@@ -2417,12 +2341,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
     }
 
-    /// Orders two keys of the object being deduplicated. Deduplication is the
-    /// parser's hottest quadratic-ish inner loop, and on the zero-copy builder
-    /// the general comparison decodes both keys byte by byte through
-    /// [`UnescapeBytes`]. When the scanner saw no escape in any of this object's
-    /// keys — nearly always — the raw bytes are the decoded bytes, so the
-    /// comparison collapses to a length check and a `memcmp`.
+    /// Orders two keys of the object being deduplicated. Deduplication is the parser's hottest quadratic-ish inner
+    /// loop, and on the zero-copy builder the general comparison decodes both keys byte by byte through
+    /// [`UnescapeBytes`]. When the scanner saw no escape in any of this object's keys — nearly always — the raw bytes
+    /// are the decoded bytes, so the comparison collapses to a length check and a `memcmp`.
     #[inline]
     fn compare_keys(&self, plain: bool, left: &B::Key, right: &B::Key) -> Ordering {
         if plain {
@@ -2475,12 +2397,10 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         }
         order.sort_unstable_by(|&a, &b| self.compare_keys(plain, &entries[a].0, &entries[b].0));
 
-        // Decide each position's fate in one buffer: `REMOVED` for a position that
-        // loses, otherwise the position whose value it should end up holding —
-        // itself, unless a later duplicate overrides it under `LastWins`. Folding
-        // the removal flag and the source index together halves this scratch
-        // space, which matters because every byte of it is arena garbage that
-        // outlives the call.
+        // Decide each position's fate in one buffer: `REMOVED` for a position that loses, otherwise the position whose
+        // value it should end up holding — itself, unless a later duplicate overrides it under `LastWins`. Folding the
+        // removal flag and the source index together halves this scratch space, which matters because every byte of it
+        // is arena garbage that outlives the call.
         const REMOVED: usize = usize::MAX;
         let mut fate: Vec<usize, A> = Vec::new_in(self.allocator.clone());
         fate.try_reserve(count).map_err(|_| JsonError::Allocation)?;
@@ -2498,8 +2418,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 if self.options.duplicate_keys == DuplicateKeys::Reject {
                     return self.fault_kind(SyntaxKind::DuplicateKey);
                 }
-                // `sort_unstable` doesn't preserve input order within a run, so scan
-                // for the first and last original positions of this key.
+                // `sort_unstable` doesn't preserve input order within a run, so scan for the first and last original
+                // positions of this key.
                 let mut first = usize::MAX;
                 let mut last = 0;
                 for slot in run_start..run_end {
@@ -2520,10 +2440,9 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             run_start = run_end;
         }
 
-        // Pull each winning value back to its keeper. A keeper and the duplicate
-        // it takes from hold equal keys by construction, so swapping whole
-        // entries is the same as moving just the value — and it needs no spare
-        // storage, where taking values out by index would.
+        // Pull each winning value back to its keeper. A keeper and the duplicate it takes from hold equal keys by
+        // construction, so swapping whole entries is the same as moving just the value — and it needs no spare storage,
+        // where taking values out by index would.
         for position in 0..count {
             let source = fate[position];
             if source != REMOVED && source != position {
@@ -2531,9 +2450,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
             }
         }
 
-        // Compact the survivors forward in place; the losers collect in the tail
-        // and are dropped by the truncate. Deduplication only ever shrinks the
-        // object, so no entry limit can be newly exceeded here.
+        // Compact the survivors forward in place; the losers collect in the tail and are dropped by the truncate.
+        // Deduplication only ever shrinks the object, so no entry limit can be newly exceeded here.
         let mut kept = 0;
         for position in 0..count {
             if fate[position] == REMOVED {
@@ -2549,25 +2467,22 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
     }
 }
 
-/// Objects at or below this many entries deduplicate with a linear scan; larger
-/// ones sort key positions to stay sub-quadratic.
+/// Objects at or below this many entries deduplicate with a linear scan; larger ones sort key positions to stay
+/// sub-quadratic.
 const DEDUP_LINEAR_LIMIT: usize = 16;
 
-/// An immutable JSON document that borrows its text from the parsed source.
-/// String values and object keys are stored as [`Span`]s, so nothing is copied;
-/// resolve them against the same `source` you parsed. Numbers keep their width,
-/// so large integers survive past the `2^53` float boundary.
+/// An immutable JSON document that borrows its text from the parsed source. String values and object keys are stored as
+/// [`Span`]s, so nothing is copied; resolve them against the same `source` you parsed. Numbers keep their width, so
+/// large integers survive past the `2^53` float boundary.
 ///
 /// # Layout and allocators
 ///
-/// Each array and object owns its own [`Vec`], so parsing with the default
-/// global allocator scatters those nodes across the heap. Parse with
-/// [`view_in`] and a bump or slab allocator (any [`allocator_api2::alloc::Allocator`],
-/// for example a `bump-scope` arena) to pack the whole document into one contiguous
-/// region that frees in `O(1)` when the arena is dropped — the closest this design
-/// gets to a flat tape. Note the caveat: the per-node `Vec`s still grow by
-/// doubling, so an arena keeps some slack and dead reallocation remnants; it is
-/// arena-flat and cheap to allocate and free, not a single compact flat buffer.
+/// Each array and object owns its own [`Vec`], so parsing with the default global allocator scatters those nodes across
+/// the heap. Parse with [`view_in`] and a bump or slab allocator (any [`allocator_api2::alloc::Allocator`], for example
+/// a `bump-scope` arena) to pack the whole document into one contiguous region that frees in `O(1)` when the arena is
+/// dropped — the closest this design gets to a flat tape. Note the caveat: the per-node `Vec`s still grow by doubling,
+/// so an arena keeps some slack and dead reallocation remnants; it is arena-flat and cheap to allocate and free, not a
+/// single compact flat buffer.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum JsonView<A: Allocator = Global> {
@@ -2583,8 +2498,7 @@ pub enum JsonView<A: Allocator = Global> {
     Float(f64),
     /// A string, as its still-escaped span into the source.
     String(Span),
-    /// A number too wide for a 64-bit lane or the `f64` range, kept as its raw
-    /// source span so no precision is lost.
+    /// A number too wide for a 64-bit lane or the `f64` range, kept as its raw source span so no precision is lost.
     BigNumber(Span),
     /// An array of values.
     Array(Vec<JsonView<A>, A>),
@@ -2633,20 +2547,19 @@ impl<A: Allocator + Clone> DomBuilder<A> for ViewBuilder {
         escaped_span_compare(source, *left, *right)
     }
     fn key_compare_plain(source: &[u8], left: &Span, right: &Span) -> Ordering {
-        // No escapes, so the raw span *is* the decoded text and a slice compare
-        // settles it — no decoding at all.
+        // No escapes, so the raw span *is* the decoded text and a slice compare settles it — no decoding at all.
         left.bytes(source)
             .unwrap_or(&[])
             .cmp(right.bytes(source).unwrap_or(&[]))
     }
     fn key_equals_plain(source: &[u8], left: &Span, right: &Span) -> bool {
-        // Spans of different length cannot be equal, and slice equality checks
-        // that before touching the bytes.
+        // Spans of different length cannot be equal, and slice equality checks that before touching the bytes.
         left.bytes(source).unwrap_or(&[]) == right.bytes(source).unwrap_or(&[])
     }
 }
 
 impl<A: Allocator> JsonView<A> {
+    /// The boolean value, or `None` for anything else.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             JsonView::Boolean(value) => Some(*value),
@@ -2654,6 +2567,8 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
+    /// The value as a `u64`. Accepts an [`Unsigned`](JsonView::Unsigned), and an [`Integer`](JsonView::Integer) that is
+    /// not negative; a negative integer, a float, or a non-number yields `None`.
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             JsonView::Unsigned(value) => Some(*value),
@@ -2662,6 +2577,8 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
+    /// The value as an `i64`. Accepts an [`Integer`](JsonView::Integer), and an [`Unsigned`](JsonView::Unsigned) up to
+    /// `i64::MAX`; anything larger, a float, or a non-number yields `None`.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             JsonView::Integer(value) => Some(*value),
@@ -2670,9 +2587,8 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
-    /// The number as an `f64`, or `None`. A bare view cannot resolve a
-    /// [`BigNumber`](JsonView::BigNumber) without `source`, so that variant
-    /// returns `None` here; read it through [`bind`](JsonView::bind) or
+    /// The number as an `f64`, or `None`. A bare view cannot resolve a [`BigNumber`](JsonView::BigNumber) without
+    /// `source`, so that variant returns `None` here; read it through [`bind`](JsonView::bind) or
     /// [`as_number_str`](JsonView::as_number_str) instead.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
@@ -2699,8 +2615,7 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
-    /// The exact decimal text of a big integer that overflowed 64 bits, or
-    /// `None`. Resolved against `source`.
+    /// The exact decimal text of a big integer that overflowed 64 bits, or `None`. Resolved against `source`.
     pub fn as_number_str<'s>(&self, source: &'s [u8]) -> Option<&'s str> {
         match self {
             JsonView::BigNumber(span) => span.resolve(source),
@@ -2708,8 +2623,8 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
-    /// Decodes a string value's escapes into `output`. Returns `None` if this is
-    /// not a string, otherwise the result of the decode.
+    /// Decodes a string value's escapes into `output`. Returns `None` if this is not a string, otherwise the result of
+    /// the decode.
     pub fn unescape_into<B: Allocator>(&self, source: &[u8], output: &mut Vec<u8, B>) -> Option<Result<(), JsonError>> {
         match self {
             JsonView::String(span) => Some(unescape_into(source, *span, output)),
@@ -2759,8 +2674,8 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
-    /// Looks up a key in an object, matching against the decoded form of each
-    /// stored key. Linear scan; returns the first match.
+    /// Looks up a key in an object, matching against the decoded form of each stored key. Linear scan; returns the
+    /// first match.
     pub fn get(&self, source: &[u8], key: &str) -> Option<&JsonView<A>> {
         match self {
             JsonView::Object(entries) => entries
@@ -2771,10 +2686,9 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
-    /// Recursively sorts every object's entries by their decoded key order,
-    /// enabling [`JsonView::get_sorted`] for logarithmic lookups.
-    /// Arrays are traversed so nested objects are sorted too; array element
-    /// order is preserved. Reorders the document's own storage, not the source.
+    /// Recursively sorts every object's entries by their decoded key order, enabling [`JsonView::get_sorted`] for
+    /// logarithmic lookups. Arrays are traversed so nested objects are sorted too; array element order is preserved.
+    /// Reorders the document's own storage, not the source.
     pub fn sort_keys(&mut self, source: &[u8]) {
         match self {
             JsonView::Array(items) => {
@@ -2792,8 +2706,7 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
-    /// Looks up a key in an object previously ordered by
-    /// [`JsonView::sort_keys`], using binary search. Returns `None`
+    /// Looks up a key in an object previously ordered by [`JsonView::sort_keys`], using binary search. Returns `None`
     /// for a non-object; results are unspecified if the object is not sorted.
     pub fn get_sorted(&self, source: &[u8], key: &str) -> Option<&JsonView<A>> {
         match self {
@@ -2806,8 +2719,8 @@ impl<A: Allocator> JsonView<A> {
     }
 }
 
-/// A key or index that resolves a child of a [`Resolved`] cursor: a `&str`
-/// object key (escape-aware) or a `usize` array position.
+/// A key or index that resolves a child of a [`Resolved`] cursor: a `&str` object key (escape-aware) or a `usize` array
+/// position.
 pub trait ResolveKey<A: Allocator> {
     #[doc(hidden)]
     fn find<'s>(&self, source: &'s [u8], node: &'s JsonView<A>) -> Option<&'s JsonView<A>>;
@@ -2828,16 +2741,14 @@ impl<A: Allocator> ResolveKey<A> for &str {
     }
 }
 
-/// A [`JsonView`] node paired with the `source` it was parsed from, so string
-/// values resolve and keyed navigation work without threading `source` through
-/// every call. `Copy`, so it chains freely: `view.bind(src).get("a").get(0)`.
+/// A [`JsonView`] node paired with the `source` it was parsed from, so string values resolve and keyed navigation work
+/// without threading `source` through every call. `Copy`, so it chains freely: `view.bind(src).get("a").get(0)`.
 pub struct Resolved<'s, A: Allocator = Global> {
     source: &'s [u8],
     node: &'s JsonView<A>,
 }
 
-// Both fields are references, so the cursor is `Copy` for any allocator; the
-// derive would wrongly require `A: Copy`.
+// Both fields are references, so the cursor is `Copy` for any allocator; the derive would wrongly require `A: Copy`.
 impl<'s, A: Allocator> Clone for Resolved<'s, A> {
     fn clone(&self) -> Self {
         *self
@@ -2851,18 +2762,22 @@ impl<'s, A: Allocator> Resolved<'s, A> {
         self.node
     }
 
+    /// The boolean value, or `None` for anything else.
     pub fn as_bool(self) -> Option<bool> {
         self.node.as_bool()
     }
+    /// The value as an `i64`, on the same terms as [`JsonView::as_i64`].
     pub fn as_i64(self) -> Option<i64> {
         self.node.as_i64()
     }
+    /// The value as a `u64`, on the same terms as [`JsonView::as_u64`].
     pub fn as_u64(self) -> Option<u64> {
         self.node.as_u64()
     }
+    /// The value as an `f64`. Unlike [`JsonView::as_f64`], this cursor carries its source, so it can also approximate a
+    /// [`BigNumber`](JsonView::BigNumber) — the one place where binding to the source widens what is readable.
     pub fn as_f64(self) -> Option<f64> {
-        // Unlike a bare view, the cursor has `source`, so a big number can be
-        // approximated as an `f64`.
+        // Unlike a bare view, the cursor has `source`, so a big number can be approximated as an `f64`.
         match self.node {
             JsonView::BigNumber(span) => span.resolve(self.source)?.parse::<f64>().ok(),
             _ => self.node.as_f64(),
@@ -2879,21 +2794,28 @@ impl<'s, A: Allocator> Resolved<'s, A> {
         self.node.as_number_str(self.source)
     }
 
+    /// Whether this is the `null` literal. Note a missing child also reads as `null`, since [`get`](Resolved::get)
+    /// returns a `Null`-backed cursor on a miss; use [`try_get`](Resolved::try_get) to tell the two apart.
     pub fn is_null(self) -> bool {
         self.node.is_null()
     }
+    /// Whether this is `true` or `false`.
     pub fn is_boolean(self) -> bool {
         self.node.is_boolean()
     }
+    /// Whether this is a number of any lane, including one too wide for 64 bits.
     pub fn is_number(self) -> bool {
         self.node.is_number()
     }
+    /// Whether this is a string.
     pub fn is_string(self) -> bool {
         self.node.is_string()
     }
+    /// Whether this is an array.
     pub fn is_array(self) -> bool {
         self.node.is_array()
     }
+    /// Whether this is an object.
     pub fn is_object(self) -> bool {
         self.node.is_object()
     }
@@ -2907,8 +2829,8 @@ impl<'s, A: Allocator> Resolved<'s, A> {
         self.node.is_empty()
     }
 
-    /// Navigates to a child by `&str` key or `usize` index, returning a
-    /// `Null`-backed cursor on a miss so lookups chain without `?`.
+    /// Navigates to a child by `&str` key or `usize` index, returning a `Null`-backed cursor on a miss so lookups chain
+    /// without `?`.
     pub fn get<K: ResolveKey<A>>(self, key: K) -> Resolved<'s, A> {
         Resolved {
             source: self.source,
@@ -2946,8 +2868,7 @@ impl<'s, A: Allocator> Resolved<'s, A> {
         slice.iter().map(move |node| Resolved { source, node })
     }
 
-    /// Resolves an RFC 6901 JSON Pointer, returning a `Null`-backed cursor on a
-    /// miss.
+    /// Resolves an RFC 6901 JSON Pointer, returning a `Null`-backed cursor on a miss.
     pub fn pointer(self, pointer: &str) -> Resolved<'s, A> {
         self.try_pointer(pointer).unwrap_or(Resolved {
             source: self.source,
@@ -2987,25 +2908,23 @@ impl<'s, A: Allocator> fmt::Display for Resolved<'s, A> {
     }
 }
 
-/// An owned, decoded UTF-8 string used for keys and string values in [`Json`].
-/// Its bytes are always valid UTF-8, so [`JsonString::as_str`] never fails.
+/// An owned, decoded UTF-8 string used for keys and string values in [`Json`]. Its bytes are always valid UTF-8, so
+/// [`JsonString::as_str`] never fails.
 pub struct JsonString<A: Allocator = Global>(Vec<u8, A>);
 
 /// The backing storage for a [`Json::Object`]: its key and value pairs.
 type ObjectEntries<A> = Vec<(JsonString<A>, Json<A>), A>;
 
 impl<A: Allocator> JsonString<A> {
-    /// Decodes a JSON string `span` the parser itself produced, from the very
-    /// source it was scanned against, into a fresh owned string.
+    /// Decodes a JSON string `span` the parser itself produced, from the very source it was scanned against, into a
+    /// fresh owned string.
     ///
-    /// Skips both validation passes [`from_span`](JsonString::from_span) makes,
-    /// which is sound only under those two conditions. [`Parser::scan_string`]
-    /// has already rejected invalid UTF-8, unescaped control bytes, and
-    /// malformed escapes, and decoding preserves well-formedness: literal bytes
-    /// are copied out of a valid-UTF-8 span, and every escape yields either
-    /// ASCII or a `char` encoded through `encode_utf8`. So the result is valid
-    /// UTF-8 by construction and re-checking it is pure overhead — measurably
-    /// so, since it runs once per string and once per key.
+    /// Skips both validation passes [`from_span`](JsonString::from_span) makes, which is sound only under those two
+    /// conditions. [`Parser::scan_string`] has already rejected invalid UTF-8, unescaped control bytes, and malformed
+    /// escapes, and decoding preserves well-formedness: literal bytes are copied out of a valid-UTF-8 span, and every
+    /// escape yields either ASCII or a `char` encoded through `encode_utf8`. So the result is valid UTF-8 by
+    /// construction and re-checking it is pure overhead — measurably so, since it runs once per string and once per
+    /// key.
     fn from_span_trusted(source: &[u8], span: Span, allocator: A) -> Result<Self, JsonError> {
         let content = span.bytes(source).ok_or(JsonError::Syntax {
             offset: span.start,
@@ -3016,9 +2935,8 @@ impl<A: Allocator> JsonString<A> {
         Ok(JsonString(bytes))
     }
 
-    /// Decodes a JSON string `span` into a fresh owned string, validating it
-    /// first. Used where the span may not have come from this parser, or may be
-    /// resolved against different bytes than it was scanned against.
+    /// Decodes a JSON string `span` into a fresh owned string, validating it first. Used where the span may not have
+    /// come from this parser, or may be resolved against different bytes than it was scanned against.
     fn from_span(source: &[u8], span: Span, allocator: A) -> Result<Self, JsonError> {
         let mut bytes = Vec::new_in(allocator);
         unescape_into(source, span, &mut bytes)?;
@@ -3031,18 +2949,16 @@ impl<A: Allocator> JsonString<A> {
         Ok(JsonString(bytes))
     }
 
-    /// Copies `text` into a fresh owned string. Aborts on allocation failure,
-    /// like the standard collections' build-from-code paths.
+    /// Copies `text` into a fresh owned string. Aborts on allocation failure, like the standard collections'
+    /// build-from-code paths.
     fn from_str_in(text: &str, allocator: A) -> Self {
         let mut bytes = Vec::new_in(allocator);
         bytes.extend_from_slice(text.as_bytes());
         JsonString(bytes)
     }
 
-    /// Copies raw `bytes` verbatim, without unescaping. Used for comment text,
-    /// which is not a JSON-escaped string. This runs on the parse path, so it
-    /// allocates fallibly rather than aborting. Non-UTF-8 bytes leave `as_str`
-    /// empty.
+    /// Copies raw `bytes` verbatim, without unescaping. Used for comment text, which is not a JSON-escaped string. This
+    /// runs on the parse path, so it allocates fallibly rather than aborting. Non-UTF-8 bytes leave `as_str` empty.
     ///
     /// # Errors
     ///
@@ -3154,8 +3070,8 @@ pub enum CommentStyle {
     Block,
 }
 
-/// A comment preserved from JSON5 source, attached to a container element in the
-/// owned [`Json`] tree. The zero-copy [`JsonView`] never carries comments.
+/// A comment preserved from JSON5 source, attached to a container element in the owned [`Json`] tree. The zero-copy
+/// [`JsonView`] never carries comments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Comment<A: Allocator = Global> {
@@ -3181,8 +3097,7 @@ impl<A: Allocator> Comment<A> {
         self.style
     }
 
-    /// The comment text, without its `//` or `/* */` delimiters, exactly as it
-    /// appeared in the source.
+    /// The comment text, without its `//` or `/* */` delimiters, exactly as it appeared in the source.
     pub fn text(&self) -> &str {
         self.text.as_str()
     }
@@ -3197,9 +3112,8 @@ enum CommentSlot {
     Trailing,
 }
 
-/// One preserved comment bound to a container position. `anchor` is the element
-/// index it attaches to, or the element count for a comment after the last
-/// element and before the closing bracket.
+/// One preserved comment bound to a container position. `anchor` is the element index it attaches to, or the element
+/// count for a comment after the last element and before the closing bracket.
 #[derive(Debug, Clone)]
 struct AnchoredComment<A: Allocator> {
     anchor: u32,
@@ -3207,36 +3121,32 @@ struct AnchoredComment<A: Allocator> {
     comment: Comment<A>,
 }
 
-/// A container's preserved comments as one flat list in source order. Storing
-/// only the comments that exist keeps a sparsely commented large container from
-/// paying an empty slot per element, and the source ordering lets serialization
+/// A container's preserved comments as one flat list in source order. Storing only the comments that exist keeps a
+/// sparsely commented large container from paying an empty slot per element, and the source ordering lets serialization
 /// walk it in lockstep with the elements.
 #[derive(Debug, Clone)]
 struct TriviaBlock<A: Allocator> {
     comments: Vec<AnchoredComment<A>, A>,
 }
 
-/// A comment recorded during scanning, before it is bound to a container slot.
-/// `broke` is whether a newline separated it from the previous value, which
-/// decides whether it trails that value or leads the next one.
+/// A comment recorded during scanning, before it is bound to a container slot. `broke` is whether a newline separated
+/// it from the previous value, which decides whether it trails that value or leads the next one.
 struct PendingComment {
     span: Span,
     style: CommentStyle,
     broke: bool,
 }
 
-/// The backing storage for a [`Json::Array`]: its elements plus optional comment
-/// trivia. With no comments `trivia` is `None` and adds no heap allocation. It
-/// dereferences to the element `Vec`, so it indexes, iterates, and pushes like
+/// The backing storage for a [`Json::Array`]: its elements plus optional comment trivia. With no comments `trivia` is
+/// `None` and adds no heap allocation. It dereferences to the element `Vec`, so it indexes, iterates, and pushes like
 /// one — `array.len()`, `array[0]`, `for item in &array` all work.
 pub struct ArrayBody<A: Allocator = Global> {
     items: Vec<Json<A>, A>,
     trivia: Option<Box<TriviaBlock<A>, A>>,
 }
 
-/// The backing storage for a [`Json::Object`]: its `(key, value)` entries plus
-/// optional comment trivia. Like [`ArrayBody`], it dereferences to the entry
-/// `Vec` and carries no heap when there are no comments.
+/// The backing storage for a [`Json::Object`]: its `(key, value)` entries plus optional comment trivia. Like
+/// [`ArrayBody`], it dereferences to the entry `Vec` and carries no heap when there are no comments.
 pub struct ObjectBody<A: Allocator = Global> {
     entries: Vec<(JsonString<A>, Json<A>), A>,
     trivia: Option<Box<TriviaBlock<A>, A>>,
@@ -3332,8 +3242,7 @@ impl<'a, A: Allocator> IntoIterator for &'a mut ObjectBody<A> {
     }
 }
 
-// Comment trivia is metadata, not document content, so equality and Debug of a
-// body reflect only its elements.
+// Comment trivia is metadata, not document content, so equality and Debug of a body reflect only its elements.
 impl<A: Allocator + fmt::Debug> fmt::Debug for ArrayBody<A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.items.fmt(formatter)
@@ -3364,14 +3273,12 @@ impl<A: Allocator + Clone> Clone for ObjectBody<A> {
     }
 }
 
-/// An owned, mutable JSON document. Unlike [`JsonView`], strings are decoded at
-/// parse time, so [`Json::as_str`] needs no source and the tree can be
-/// edited freely. Numbers keep their width past the `2^53` float boundary.
+/// An owned, mutable JSON document. Unlike [`JsonView`], strings are decoded at parse time, so [`Json::as_str`] needs
+/// no source and the tree can be edited freely. Numbers keep their width past the `2^53` float boundary.
 ///
-/// The parser fills a `Json` with fallible allocation, but the build-from-code
-/// mutators — [`Json::push`], [`Json::insert`], and the `*_in` constructors —
-/// allocate infallibly and abort on out-of-memory, matching the standard
-/// collections.
+/// The parser fills a `Json` with fallible allocation, but the build-from-code mutators — [`Json::push`],
+/// [`Json::insert`], and the `*_in` constructors — allocate infallibly and abort on out-of-memory, matching the
+/// standard collections.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum Json<A: Allocator = Global> {
@@ -3388,8 +3295,7 @@ pub enum Json<A: Allocator = Global> {
     Float(f64),
     /// A string, decoded into the document's allocator.
     String(JsonString<A>),
-    /// A number too wide for a 64-bit lane or the `f64` range, kept as its exact
-    /// decimal text so no precision is lost.
+    /// A number too wide for a 64-bit lane or the `f64` range, kept as its exact decimal text so no precision is lost.
     BigNumber(JsonString<A>),
     /// An array of values.
     Array(ArrayBody<A>),
@@ -3421,9 +3327,8 @@ impl<A: Allocator + Clone> DomBuilder<A> for OwnedBuilder {
     fn float(value: f64) -> Json<A> {
         Json::Float(value)
     }
-    // Every span reaching these three came from this parse, scanned against this
-    // very `source`, so they take the trusted decode and skip re-validating what
-    // the scanner already proved.
+    // Every span reaching these three came from this parse, scanned against this very `source`, so they take the
+    // trusted decode and skip re-validating what the scanner already proved.
     fn string(source: &[u8], span: Span, allocator: &A) -> Result<Json<A>, JsonError> {
         Ok(Json::String(JsonString::from_span_trusted(
             source,
@@ -3482,6 +3387,7 @@ impl<A: Allocator, B: Allocator> PartialEq<Json<B>> for Json<A> {
 }
 
 impl<A: Allocator> Json<A> {
+    /// The boolean value, or `None` for anything else.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Json::Boolean(value) => Some(*value),
@@ -3489,6 +3395,8 @@ impl<A: Allocator> Json<A> {
         }
     }
 
+    /// The value as a `u64`. Accepts an [`Unsigned`](Json::Unsigned), and an [`Integer`](Json::Integer) that is not
+    /// negative; a negative integer, a float, or a non-number yields `None`.
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Json::Unsigned(value) => Some(*value),
@@ -3497,6 +3405,8 @@ impl<A: Allocator> Json<A> {
         }
     }
 
+    /// The value as an `i64`. Accepts an [`Integer`](Json::Integer), and an [`Unsigned`](Json::Unsigned) up to
+    /// `i64::MAX`; anything larger, a float, or a non-number yields `None`.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Json::Integer(value) => Some(*value),
@@ -3505,6 +3415,8 @@ impl<A: Allocator> Json<A> {
         }
     }
 
+    /// The value as an `f64`. Integers widen, and a [`BigNumber`](Json::BigNumber) is reparsed from its exact text, so
+    /// this is the one accessor that can lose precision rather than return `None`.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Json::Float(value) => Some(*value),
@@ -3515,8 +3427,8 @@ impl<A: Allocator> Json<A> {
         }
     }
 
-    /// The exact decimal text of a big integer that overflowed 64 bits, or
-    /// `None`. Pair with a big-integer crate for lossless arithmetic.
+    /// The exact decimal text of a big integer that overflowed 64 bits, or `None`. Pair with a big-integer crate for
+    /// lossless arithmetic.
     pub fn as_number_str(&self) -> Option<&str> {
         match self {
             Json::BigNumber(number) => Some(number.as_str()),
@@ -3590,11 +3502,10 @@ impl<A: Allocator> Json<A> {
         }
     }
 
-    /// Looks up an object key or an array position, returning `None` if it is
-    /// absent or the value is the wrong kind. The index is a `&str` key or a
-    /// `usize` position, so `document.get("field")` and `document.get(0)` both
-    /// work. For infix syntax, index a `Json` with `document["field"]` or
-    /// `document[0]`, which never panics and yields `Null` on a miss.
+    /// Looks up an object key or an array position, returning `None` if it is absent or the value is the wrong kind.
+    /// The index is a `&str` key or a `usize` position, so `document.get("field")` and `document.get(0)` both work. For
+    /// infix syntax, index a `Json` with `document["field"]` or `document[0]`, which never panics and yields `Null` on
+    /// a miss.
     pub fn get<I: Lookup<A>>(&self, index: I) -> Option<&Json<A>> {
         index.look_up(self)
     }
@@ -3604,9 +3515,8 @@ impl<A: Allocator> Json<A> {
         index.look_up_mut(self)
     }
 
-    /// Resolves an RFC 6901 JSON Pointer such as `"/items/0/name"`, walking
-    /// nested objects and arrays. An empty pointer refers to the whole document;
-    /// a malformed pointer or a missing step yields `None`.
+    /// Resolves an RFC 6901 JSON Pointer such as `"/items/0/name"`, walking nested objects and arrays. An empty pointer
+    /// refers to the whole document; a malformed pointer or a missing step yields `None`.
     pub fn pointer(&self, pointer: &str) -> Option<&Json<A>> {
         if pointer.is_empty() {
             return Some(self);
@@ -3626,8 +3536,7 @@ impl<A: Allocator> Json<A> {
         Some(current)
     }
 
-    /// Appends `value` to an array value. Returns `false`, leaving `value`
-    /// dropped, if this is not an array.
+    /// Appends `value` to an array value. Returns `false`, leaving `value` dropped, if this is not an array.
     pub fn push(&mut self, value: Json<A>) -> bool {
         match self {
             Json::Array(items) => {
@@ -3681,9 +3590,8 @@ impl<A: Allocator> Json<A> {
 }
 
 impl<A: Allocator + Clone> Json<A> {
-    /// Inserts `key`/`value` into an object value. If the key was already
-    /// present its old value is replaced and returned; otherwise the entry is
-    /// appended and `None` is returned. A no-op returning `None` on a non-object.
+    /// Inserts `key`/`value` into an object value. If the key was already present its old value is replaced and
+    /// returned; otherwise the entry is appended and `None` is returned. A no-op returning `None` on a non-object.
     pub fn insert(&mut self, key: &str, value: Json<A>) -> Option<Json<A>> {
         match self {
             Json::Object(entries) => {
@@ -3700,20 +3608,19 @@ impl<A: Allocator + Clone> Json<A> {
 }
 
 impl<A: Allocator> JsonView<A> {
-    /// Deep-converts this borrowed view into an owned [`Json`] allocated in
-    /// `allocator`, decoding every string's escapes.
+    /// Deep-converts this borrowed view into an owned [`Json`] allocated in `allocator`, decoding every string's
+    /// escapes.
     ///
     /// # Errors
     ///
-    /// Returns [`JsonError::Allocation`] on allocation failure, or
-    /// [`JsonError::Syntax`] if a string decodes to invalid UTF-8.
+    /// Returns [`JsonError::Allocation`] on allocation failure, or [`JsonError::Syntax`] if a string decodes to invalid
+    /// UTF-8.
     pub fn to_json_in<B: Allocator + Clone>(&self, source: &[u8], allocator: B) -> Result<Json<B>, JsonError> {
         self.to_json_ref(source, &allocator)
     }
 
-    /// Shared recursion for [`to_json_in`](JsonView::to_json_in) that borrows the
-    /// allocator, cloning it only where a `Vec` or `JsonString` must own one
-    /// rather than once per traversal step.
+    /// Shared recursion for [`to_json_in`](JsonView::to_json_in) that borrows the allocator, cloning it only where a
+    /// `Vec` or `JsonString` must own one rather than once per traversal step.
     fn to_json_ref<B: Allocator + Clone>(&self, source: &[u8], allocator: &B) -> Result<Json<B>, JsonError> {
         match self {
             JsonView::Null => Ok(Json::Null),
@@ -3756,24 +3663,31 @@ impl<A: Allocator> JsonView<A> {
 }
 
 impl<A: Allocator> Json<A> {
+    /// Whether this is the `null` literal. Indexing a miss with `[]` also yields `Null`, so this cannot distinguish an
+    /// absent key from a present `null` one; use [`get`](Json::get) for that.
     pub fn is_null(&self) -> bool {
         matches!(self, Json::Null)
     }
+    /// Whether this is `true` or `false`.
     pub fn is_boolean(&self) -> bool {
         matches!(self, Json::Boolean(_))
     }
+    /// Whether this is a number in any lane, including a [`BigNumber`](Json::BigNumber) too wide for 64 bits.
     pub fn is_number(&self) -> bool {
         matches!(
             self,
             Json::Integer(_) | Json::Unsigned(_) | Json::Float(_) | Json::BigNumber(_)
         )
     }
+    /// Whether this is a string. A big number is kept as text but is not a string.
     pub fn is_string(&self) -> bool {
         matches!(self, Json::String(_))
     }
+    /// Whether this is an array.
     pub fn is_array(&self) -> bool {
         matches!(self, Json::Array(_))
     }
+    /// Whether this is an object.
     pub fn is_object(&self) -> bool {
         matches!(self, Json::Object(_))
     }
@@ -3806,8 +3720,8 @@ impl<A: Allocator> Json<A> {
         self.as_object_mut().into_iter().flatten().map(|(_, value)| value)
     }
 
-    /// Consumes an array value, yielding its element storage; `None` otherwise.
-    /// Any preserved comment trivia is discarded.
+    /// Consumes an array value, yielding its element storage; `None` otherwise. Any preserved comment trivia is
+    /// discarded.
     pub fn into_array(self) -> Option<Vec<Json<A>, A>> {
         match self {
             Json::Array(body) => Some(body.items),
@@ -3815,8 +3729,8 @@ impl<A: Allocator> Json<A> {
         }
     }
 
-    /// Consumes an object value, yielding its entry storage; `None` otherwise.
-    /// Any preserved comment trivia is discarded.
+    /// Consumes an object value, yielding its entry storage; `None` otherwise. Any preserved comment trivia is
+    /// discarded.
     pub fn into_object(self) -> Option<ObjectEntries<A>> {
         match self {
             Json::Object(body) => Some(body.entries),
@@ -3824,8 +3738,7 @@ impl<A: Allocator> Json<A> {
         }
     }
 
-    /// This container's preserved comments, or an empty slice for a scalar or an
-    /// uncommented container.
+    /// This container's preserved comments, or an empty slice for a scalar or an uncommented container.
     fn container_trivia(&self) -> &[AnchoredComment<A>] {
         match self {
             Json::Array(body) => trivia_comments(&body.trivia),
@@ -3834,21 +3747,19 @@ impl<A: Allocator> Json<A> {
         }
     }
 
-    /// Whether this container carries any preserved comments. Only populated when
-    /// parsed with [`ParseOptions::preserve_comments`]; always `false` otherwise
-    /// and for scalars and the zero-copy [`JsonView`].
+    /// Whether this container carries any preserved comments. Only populated when parsed with
+    /// [`ParseOptions::preserve_comments`]; always `false` otherwise and for scalars and the zero-copy [`JsonView`].
     pub fn has_comments(&self) -> bool {
         !self.container_trivia().is_empty()
     }
 
-    /// The comments written on their own line before the element or entry at
-    /// `index`, in source order. Empty when there are none.
+    /// The comments written on their own line before the element or entry at `index`, in source order. Empty when there
+    /// are none.
     ///
-    /// Each [`Comment`] is verbatim source text, not an escaped JSON string.
-    /// Mutating the container with [`as_array_mut`](Json::as_array_mut),
-    /// [`as_object_mut`](Json::as_object_mut), or the deref-mut `Vec` can shift
-    /// element positions while comment anchors stay put, so comments may then
-    /// attach to a neighbor; this never affects values, only comment placement.
+    /// Each [`Comment`] is verbatim source text, not an escaped JSON string. Mutating the container with
+    /// [`as_array_mut`](Json::as_array_mut), [`as_object_mut`](Json::as_object_mut), or the deref-mut `Vec` can shift
+    /// element positions while comment anchors stay put, so comments may then attach to a neighbor; this never affects
+    /// values, only comment placement.
     pub fn leading_comments(&self, index: usize) -> impl Iterator<Item = &Comment<A>> {
         let anchor = u32::try_from(index).unwrap_or(u32::MAX);
         self.container_trivia()
@@ -3857,8 +3768,8 @@ impl<A: Allocator> Json<A> {
             .map(|entry| &entry.comment)
     }
 
-    /// The comments written on the same line after the element or entry at
-    /// `index`, in source order. Empty when there are none.
+    /// The comments written on the same line after the element or entry at `index`, in source order. Empty when there
+    /// are none.
     pub fn trailing_comments(&self, index: usize) -> impl Iterator<Item = &Comment<A>> {
         let anchor = u32::try_from(index).unwrap_or(u32::MAX);
         self.container_trivia()
@@ -3867,8 +3778,7 @@ impl<A: Allocator> Json<A> {
             .map(|entry| &entry.comment)
     }
 
-    /// The comments after the last element and before the closing bracket, in
-    /// source order. Empty when there are none.
+    /// The comments after the last element and before the closing bracket, in source order. Empty when there are none.
     pub fn tail_comments(&self) -> impl Iterator<Item = &Comment<A>> {
         let tail = u32::try_from(self.len()).unwrap_or(u32::MAX);
         self.container_trivia()
@@ -3974,10 +3884,9 @@ impl<A: Allocator> Json<A> {
         }
     }
 
-    /// Writes this value wrapping to `max_width` columns, starting at column
-    /// `col`. A container that fits on the current line is emitted inline with no
-    /// per-child re-measurement, otherwise it is expanded one element per line and
-    /// each child is placed recursively at its own starting column.
+    /// Writes this value wrapping to `max_width` columns, starting at column `col`. A container that fits on the
+    /// current line is emitted inline with no per-child re-measurement, otherwise it is expanded one element per line
+    /// and each child is placed recursively at its own starting column.
     fn write_wrapped<W: fmt::Write>(
         &self,
         writer: &mut W,
@@ -4023,11 +3932,9 @@ impl<A: Allocator> Json<A> {
         }
     }
 
-    /// Writes this value expanded, emitting any preserved comments. Containers
-    /// always expand one element per line; a lockstep cursor over the flat
-    /// comment list places leading comments on their own line before an element,
-    /// trailing comments on the same line after it, and the tail before the
-    /// closing bracket.
+    /// Writes this value expanded, emitting any preserved comments. Containers always expand one element per line; a
+    /// lockstep cursor over the flat comment list places leading comments on their own line before an element, trailing
+    /// comments on the same line after it, and the tail before the closing bracket.
     fn write_commented<W: fmt::Write>(&self, writer: &mut W, indent: Indent, depth: usize) -> fmt::Result {
         match self {
             Json::Array(body) => {
@@ -4125,9 +4032,8 @@ impl<A: Allocator> fmt::Display for Json<A> {
     }
 }
 
-/// Types that can index a [`Json`] value: a `&str` object key or a `usize`
-/// array position. Powers [`Json::get`], [`Json::get_mut`], and the infix
-/// [`core::ops::Index`] operators.
+/// Types that can index a [`Json`] value: a `&str` object key or a `usize` array position. Powers [`Json::get`],
+/// [`Json::get_mut`], and the infix [`core::ops::Index`] operators.
 pub trait Lookup<A: Allocator> {
     #[doc(hidden)]
     fn look_up<'j>(&self, value: &'j Json<A>) -> Option<&'j Json<A>>;
@@ -4180,9 +4086,8 @@ impl<A: Allocator> Lookup<A> for &str {
     }
 }
 
-// The `Null` fallback below is a promoted `&'static Json<A>`. Rvalue static
-// promotion applies because `Json` has no explicit `Drop` impl (its drop glue
-// comes only from the `Vec` fields), so this works for every allocator `A`, not
+// The `Null` fallback below is a promoted `&'static Json<A>`. Rvalue static promotion applies because `Json` has no
+// explicit `Drop` impl (its drop glue comes only from the `Vec` fields), so this works for every allocator `A`, not
 // just `Global` — indexing a miss yields `Null` instead of panicking.
 impl<A: Allocator> core::ops::Index<usize> for Json<A> {
     type Output = Json<A>;
@@ -4199,24 +4104,31 @@ impl<A: Allocator> core::ops::Index<&str> for Json<A> {
 }
 
 impl<A: Allocator> JsonView<A> {
+    /// Whether this is the `null` literal. Indexing a miss with `[]` also yields `Null`, so this cannot distinguish an
+    /// absent element from a present `null` one; use [`get`](JsonView::get) for that.
     pub fn is_null(&self) -> bool {
         matches!(self, JsonView::Null)
     }
+    /// Whether this is `true` or `false`.
     pub fn is_boolean(&self) -> bool {
         matches!(self, JsonView::Boolean(_))
     }
+    /// Whether this is a number in any lane, including a [`BigNumber`](JsonView::BigNumber) too wide for 64 bits.
     pub fn is_number(&self) -> bool {
         matches!(
             self,
             JsonView::Integer(_) | JsonView::Unsigned(_) | JsonView::Float(_) | JsonView::BigNumber(_)
         )
     }
+    /// Whether this is a string. The span is still escaped; a big number is also held as a span but is not a string.
     pub fn is_string(&self) -> bool {
         matches!(self, JsonView::String(_))
     }
+    /// Whether this is an array.
     pub fn is_array(&self) -> bool {
         matches!(self, JsonView::Array(_))
     }
+    /// Whether this is an object.
     pub fn is_object(&self) -> bool {
         matches!(self, JsonView::Object(_))
     }
@@ -4229,8 +4141,8 @@ impl<A: Allocator> JsonView<A> {
         }
     }
 
-    /// Iterates an object value's keys, resolved against `source` and still
-    /// escaped. Keys that are not valid UTF-8 are skipped.
+    /// Iterates an object value's keys, resolved against `source` and still escaped. Keys that are not valid UTF-8 are
+    /// skipped.
     pub fn keys<'s>(&'s self, source: &'s [u8]) -> impl Iterator<Item = &'s str> + 's {
         self.entries().filter_map(move |(span, _)| span.resolve(source))
     }
@@ -4511,17 +4423,16 @@ impl<A: Allocator> core::ops::Index<usize> for JsonView<A> {
 }
 
 impl<A: Allocator> JsonView<A> {
-    /// Pairs this view node with its `source`, yielding a [`Resolved`] cursor
-    /// whose reads and lookups need no further `source` argument.
+    /// Pairs this view node with its `source`, yielding a [`Resolved`] cursor whose reads and lookups need no further
+    /// `source` argument.
     pub fn bind<'s>(&'s self, source: &'s [u8]) -> Resolved<'s, A> {
         Resolved { source, node: self }
     }
 }
 
-/// A zero-copy [`JsonView`] permanently paired with the source it was parsed
-/// from. Prefer this type when exposing a view beyond the immediate parse site:
-/// its navigation and serialization APIs cannot accidentally receive a
-/// mismatched source slice.
+/// A zero-copy [`JsonView`] permanently paired with the source it was parsed from. Prefer this type when exposing a
+/// view beyond the immediate parse site: its navigation and serialization APIs cannot accidentally receive a mismatched
+/// source slice.
 pub struct BoundJsonView<'src, A: Allocator = Global> {
     source: &'src [u8],
     document: JsonView<A>,
@@ -4571,8 +4482,8 @@ impl<'src, A: Allocator> BoundJsonView<'src, A> {
     }
 }
 
-/// Parses `source` into an immutable [`JsonView`] allocated in `allocator`,
-/// under `options`. Spans in the result are offsets into `source`.
+/// Parses `source` into an immutable [`JsonView`] allocated in `allocator`, under `options`. Spans in the result are
+/// offsets into `source`.
 pub fn view_in_with<A: Allocator + Clone>(
     source: &[u8],
     allocator: A,
@@ -4581,13 +4492,12 @@ pub fn view_in_with<A: Allocator + Clone>(
     Parser::<A, ViewBuilder>::new(source, allocator, *options).parse_document()
 }
 
-/// Parses `source` into an immutable [`JsonView`] allocated in `allocator`.
-/// Spans in the result are offsets into `source`, so keep `source` alive.
+/// Parses `source` into an immutable [`JsonView`] allocated in `allocator`. Spans in the result are offsets into
+/// `source`, so keep `source` alive.
 ///
 /// # Errors
 ///
-/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
-/// if the document cannot be allocated.
+/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`] if the document cannot be allocated.
 pub fn view_in<A: Allocator + Clone>(source: &[u8], allocator: A) -> Result<JsonView<A>, JsonError> {
     view_in_with(source, allocator, &ParseOptions::default())
 }
@@ -4601,8 +4511,7 @@ pub fn view_with(source: &[u8], options: &ParseOptions) -> Result<JsonView<Globa
 ///
 /// # Errors
 ///
-/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
-/// if the document cannot be allocated.
+/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`] if the document cannot be allocated.
 pub fn view(source: &[u8]) -> Result<JsonView<Global>, JsonError> {
     view_in(source, Global)
 }
@@ -4627,15 +4536,14 @@ pub fn view_in_bound<'src, A: Allocator + Clone>(
     view_in_bound_with(source, allocator, &ParseOptions::default())
 }
 
-/// Parses a source-bound, zero-copy document on the global heap. Unlike
-/// [`view`], the returned value retains its source reference and therefore
-/// cannot be navigated or serialized with a mismatched byte slice.
+/// Parses a source-bound, zero-copy document on the global heap. Unlike [`view`], the returned value retains its source
+/// reference and therefore cannot be navigated or serialized with a mismatched byte slice.
 pub fn view_bound<'src>(source: &'src [u8]) -> Result<BoundJsonView<'src, Global>, JsonError> {
     view_in_bound(source, Global)
 }
 
-/// Parses `source` into an owned, mutable [`Json`] allocated in `allocator`,
-/// under `options`. The result borrows nothing from `source`.
+/// Parses `source` into an owned, mutable [`Json`] allocated in `allocator`, under `options`. The result borrows
+/// nothing from `source`.
 pub fn parse_in_with<A: Allocator + Clone>(
     source: &[u8],
     allocator: A,
@@ -4644,14 +4552,12 @@ pub fn parse_in_with<A: Allocator + Clone>(
     Parser::<A, OwnedBuilder>::new(source, allocator, *options).parse_document()
 }
 
-/// Parses `source` into an owned, mutable [`Json`] allocated in `allocator`,
-/// decoding every string's escapes. The result borrows nothing from `source`.
+/// Parses `source` into an owned, mutable [`Json`] allocated in `allocator`, decoding every string's escapes. The
+/// result borrows nothing from `source`.
 ///
-/// The `allocator` is any [`allocator_api2::alloc::Allocator`], so the whole
-/// document can be packed into one region — a bump or slab arena — that frees in
-/// `O(1)` when dropped. Here a custom allocator simply tallies the bytes handed
-/// out; swap in a bump-arena allocator to get the packed, drop-once layout
-/// described on [`JsonView`].
+/// The `allocator` is any [`allocator_api2::alloc::Allocator`], so the whole document can be packed into one region — a
+/// bump or slab arena — that frees in `O(1)` when dropped. Here a custom allocator simply tallies the bytes handed out;
+/// swap in a bump-arena allocator to get the packed, drop-once layout described on [`JsonView`].
 ///
 /// ```
 /// use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
@@ -4679,8 +4585,7 @@ pub fn parse_in_with<A: Allocator + Clone>(
 ///
 /// # Errors
 ///
-/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
-/// if the document cannot be allocated.
+/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`] if the document cannot be allocated.
 pub fn parse_in<A: Allocator + Clone>(source: &[u8], allocator: A) -> Result<Json<A>, JsonError> {
     parse_in_with(source, allocator, &ParseOptions::default())
 }
@@ -4694,8 +4599,7 @@ pub fn parse_with(source: &[u8], options: &ParseOptions) -> Result<Json<Global>,
 ///
 /// # Errors
 ///
-/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`]
-/// if the document cannot be allocated.
+/// Returns [`JsonError::Syntax`] for malformed JSON, or [`JsonError::Allocation`] if the document cannot be allocated.
 pub fn parse(source: &[u8]) -> Result<Json<Global>, JsonError> {
     parse_in(source, Global)
 }
@@ -4739,8 +4643,8 @@ mod serde_impls {
         }
     }
 
-    /// Serializes a big-number lexeme, preferring an exact 128-bit integer and
-    /// falling back to `f64` (then a string) for anything wider.
+    /// Serializes a big-number lexeme, preferring an exact 128-bit integer and falling back to `f64` (then a string)
+    /// for anything wider.
     fn serialize_big_number<S: serde::Serializer>(lexeme: &str, serializer: S) -> Result<S::Ok, S::Error> {
         if let Ok(value) = lexeme.parse::<i128>() {
             serializer.serialize_i128(value)
@@ -4749,15 +4653,13 @@ mod serde_impls {
         } else if let Some(value) = lexeme.parse::<f64>().ok().filter(|value| value.is_finite()) {
             serializer.serialize_f64(value)
         } else {
-            // Over/underflowed the `f64` range: emit the exact text as a string
-            // rather than a lossy `null`.
+            // Over/underflowed the `f64` range: emit the exact text as a string rather than a lossy `null`.
             serializer.serialize_str(lexeme)
         }
     }
 
-    /// Decodes a still-escaped view span into a fresh byte buffer for serde,
-    /// mapping any fault to the serializer's error type. The caller borrows a
-    /// `&str` from it, so there is no second allocation or copy.
+    /// Decodes a still-escaped view span into a fresh byte buffer for serde, mapping any fault to the serializer's
+    /// error type. The caller borrows a `&str` from it, so there is no second allocation or copy.
     fn decode_for_serde<E: serde::ser::Error>(source: &[u8], span: Span) -> Result<Vec<u8, Global>, E> {
         let mut buffer: Vec<u8, Global> = Vec::new_in(Global);
         unescape_into(source, span, &mut buffer).map_err(E::custom)?;
@@ -4774,8 +4676,8 @@ mod serde_impls {
                 JsonView::Unsigned(value) => serializer.serialize_u64(*value),
                 JsonView::Float(value) => serializer.serialize_f64(*value),
                 JsonView::BigNumber(span) => serialize_big_number(span.resolve(self.source).unwrap_or("0"), serializer),
-                // The span is still escaped, so decode it before handing serde a
-                // plain string it would otherwise escape a second time.
+                // The span is still escaped, so decode it before handing serde a plain string it would otherwise escape
+                // a second time.
                 JsonView::String(span) => {
                     let buffer = decode_for_serde::<S::Error>(self.source, *span)?;
                     let decoded = core::str::from_utf8(&buffer).map_err(serde::ser::Error::custom)?;
@@ -4887,24 +4789,22 @@ mod serde_impls {
         }
     }
 
-    /// Serializes any `T: Serialize` into an owned [`Json`] on the global heap,
-    /// without going through a text representation.
+    /// Serializes any `T: Serialize` into an owned [`Json`] on the global heap, without going through a text
+    /// representation.
     ///
     /// # Errors
     ///
-    /// Returns whatever error `T`'s [`Serialize`](serde::Serialize) impl reports,
-    /// as a [`JsonError::Message`].
+    /// Returns whatever error `T`'s [`Serialize`](serde::Serialize) impl reports, as a [`JsonError::Message`].
     pub fn to_value<T: serde::Serialize + ?Sized>(value: &T) -> Result<Json<Global>, JsonError> {
         value.serialize(JsonSerializer)
     }
 
-    /// Deserializes any `T: Deserialize` directly from a borrowed [`Json`]. Strings
-    /// are borrowed from the document, so `&str` fields need no copy.
+    /// Deserializes any `T: Deserialize` directly from a borrowed [`Json`]. Strings are borrowed from the document, so
+    /// `&str` fields need no copy.
     ///
     /// # Errors
     ///
-    /// Returns a [`JsonError::Message`] if the document does not match `T`'s
-    /// shape.
+    /// Returns a [`JsonError::Message`] if the document does not match `T`'s shape.
     pub fn from_value<'de, T, A>(value: &'de Json<A>) -> Result<T, JsonError>
     where
         T: serde::Deserialize<'de>,
@@ -5692,8 +5592,7 @@ mod tests {
     fn serialize_view_uses_raw_spans() {
         let source = br#"{ "m" : "a\u00e9b" , "n" : [ 1 , 2 ] }"#;
         let view = view(source).unwrap();
-        // The view emits the still-escaped span verbatim, dropping only the
-        // insignificant whitespace between tokens.
+        // The view emits the still-escaped span verbatim, dropping only the insignificant whitespace between tokens.
         assert_eq!(view.to_json_string(source), r#"{"m":"a\u00e9b","n":[1,2]}"#);
     }
 
@@ -5711,8 +5610,8 @@ mod tests {
 
     #[test]
     fn serialize_escapes_control_chars_in_runs() {
-        // The run-based escaper still emits \u00xx for bare control characters
-        // while bulk-copying the clean spans around them.
+        // The run-based escaper still emits \u00xx for bare control characters while bulk-copying the clean spans
+        // around them.
         let mut object = Json::object_in(Global);
         object.insert("k", Json::from("a\u{1}b\u{1f}c"));
         assert_eq!(object.to_string(), r#"{"k":"a\u0001b\u001fc"}"#);
@@ -5732,8 +5631,8 @@ mod tests {
         let tabbed = document.to_string_with(FormatOptions::pretty().with_indent(Indent::Tabs));
         assert_eq!(tabbed, "{\n\t\"a\": [\n\t\t1,\n\t\t2\n\t],\n\t\"b\": {}\n}");
 
-        // A huge indent clamps to u16::MAX rather than wrapping to zero: the byte
-        // after the opening `{` and newline is still an indent space, not a quote.
+        // A huge indent clamps to u16::MAX rather than wrapping to zero: the byte after the opening `{` and newline is
+        // still an indent space, not a quote.
         let clamped = parse(br#"{"a":1}"#).unwrap().to_string_pretty(65_536);
         assert_eq!(clamped.as_bytes().get(2), Some(&b' '));
         assert_eq!(indent_cols(Indent::Spaces(u16::MAX), usize::MAX), usize::MAX);
@@ -5753,8 +5652,8 @@ mod tests {
             document.to_string_with(FormatOptions::pretty_width(20)),
             "{\n  \"a\": [1, 2],\n  \"b\": {}\n}",
         );
-        // A degenerate budget expands everything the always-expand printer would,
-        // still keeping empty containers and scalars on their own line.
+        // A degenerate budget expands everything the always-expand printer would, still keeping empty containers and
+        // scalars on their own line.
         assert_eq!(
             document.to_string_with(FormatOptions::pretty_width(1)),
             document.to_string_pretty(2),
@@ -5877,8 +5776,8 @@ mod tests {
 
     #[test]
     fn unescape_into_never_panics_on_bad_span() {
-        // A hand-built span the parser would never produce: a lone trailing
-        // backslash. It must be reported, not panicked on.
+        // A hand-built span the parser would never produce: a lone trailing backslash. It must be reported, not
+        // panicked on.
         let source = b"x\\";
         let span = Span { start: 1, len: 1 };
         let mut output = Vec::new();
@@ -5891,8 +5790,8 @@ mod tests {
         assert!(unescape_into(b"\\u12", Span { start: 0, len: 4 }, &mut output).is_err());
         let mut output = Vec::new();
         assert!(unescape_into(b"\\uDE00", Span { start: 0, len: 6 }, &mut output).is_err());
-        // Public spans may be hand-built, so raw controls and invalid UTF-8 are
-        // rejected before the fast copy path can expose malformed string bodies.
+        // Public spans may be hand-built, so raw controls and invalid UTF-8 are rejected before the fast copy path can
+        // expose malformed string bodies.
         let mut output = Vec::new();
         assert!(matches!(
             unescape_into(b"a\nb", Span { start: 0, len: 3 }, &mut output),
@@ -6030,8 +5929,8 @@ mod tests {
         assert_eq!(root.get("a").get("b").elements().count(), 2);
     }
 
-    /// The scalar definition of the string-body stop, kept here purely as the
-    /// reference the SWAR scanner is checked against.
+    /// The scalar definition of the string-body stop, kept here purely as the reference the SWAR scanner is checked
+    /// against.
     fn find_string_stop_scalar(bytes: &[u8], delimiter: u8) -> (usize, bool) {
         let mut non_ascii = false;
         for (index, &byte) in bytes.iter().enumerate() {
@@ -6045,8 +5944,8 @@ mod tests {
 
     #[test]
     fn swar_string_scan_matches_the_scalar_definition() {
-        // Every stop byte at every offset within and past a word, against a
-        // filler that is ASCII, high-bit, or itself near a boundary value.
+        // Every stop byte at every offset within and past a word, against a filler that is ASCII, high-bit, or itself
+        // near a boundary value.
         for &filler in &[b'a', 0x7f, 0x80, 0xff, 0x20, 0x21] {
             for &stop in &[b'"', b'\'', b'\\', 0x00, 0x1f, 0x19] {
                 for length in 0..40usize {
@@ -6062,7 +5961,7 @@ mod tests {
                             assert_eq!(
                                 find_string_stop(&bytes, delimiter),
                                 find_string_stop_scalar(&bytes, delimiter),
-                                "filler={filler:#04x} stop={stop:#04x} len={length} pos={position} delim={delimiter:#04x}"
+                                "fill={filler:#04x} stop={stop:#04x} len={length} at={position} quote={delimiter:#04x}"
                             );
                         }
                     }
@@ -6073,8 +5972,8 @@ mod tests {
 
     #[test]
     fn swar_string_scan_matches_scalar_on_pseudorandom_bytes() {
-        // A deterministic xorshift walk over arbitrary byte soup, which mixes
-        // stop bytes, high bytes and control bytes at unpredictable offsets.
+        // A deterministic xorshift walk over arbitrary byte soup, which mixes stop bytes, high bytes and control bytes
+        // at unpredictable offsets.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {
             state ^= state << 13;
@@ -6111,11 +6010,10 @@ mod tests {
 
     #[test]
     fn dedup_sees_through_escapes_that_decode_equal() {
-        // The parser tracks whether any key in an object was escaped so that the
-        // common all-plain object can deduplicate on raw bytes. These keys are
-        // textually different but decode to the same string, so they must still
-        // collapse — the raw-byte shortcut would wrongly keep both.
-        // The first key is written as a `\\u` escape, the second literally.
+        // The parser tracks whether any key in an object was escaped so that the common all-plain object can
+        // deduplicate on raw bytes. These keys are textually different but decode to the same string, so they must
+        // still collapse — the raw-byte shortcut would wrongly keep both. The first key is written as a `\\u` escape,
+        // the second literally.
         let source = r#"{"na\u00efve":1,"naïve":2}"#.as_bytes();
         let document = view(source).unwrap();
         assert_eq!(document.len(), 1, "escaped and literal keys must deduplicate");
@@ -6162,8 +6060,8 @@ mod tests {
 
     #[test]
     fn scanner_paths_agree_under_byte_mutation() {
-        // A compact, deterministic fuzz-regression corpus. Every mutation must
-        // either be rejected by both DOM builders or re-serialize as strict JSON.
+        // A compact, deterministic fuzz-regression corpus. Every mutation must either be rejected by both DOM builders
+        // or re-serialize as strict JSON.
         let seed = br#"{"key":"a\nb","items":[0,true,null],"ratio":1.25e-2}"#;
         let replacements = [
             0, b' ', b'"', b'\\', b'[', b']', b'{', b'}', b',', b':', b'0', b'x', 0xff,
@@ -6199,8 +6097,8 @@ mod tests {
         assert_eq!(mask.find_in(b"plain"), None);
     }
 
-    /// A distinct allocator type that just forwards to the global heap, used to
-    /// prove the ergonomics work for any allocator, not only `Global`.
+    /// A distinct allocator type that just forwards to the global heap, used to prove the ergonomics work for any
+    /// allocator, not only `Global`.
     #[derive(Clone, Copy)]
     struct Passthrough;
 
@@ -6216,10 +6114,9 @@ mod tests {
         }
     }
 
-    /// An allocator with a byte budget: it forwards to the global heap until
-    /// `remaining` is exhausted, then fails every further request. Parsing under
-    /// it must surface [`JsonError::Allocation`] rather than aborting, which is
-    /// the only way to exercise the parser's fallible-allocation paths.
+    /// An allocator with a byte budget: it forwards to the global heap until `remaining` is exhausted, then fails every
+    /// further request. Parsing under it must surface [`JsonError::Allocation`] rather than aborting, which is the only
+    /// way to exercise the parser's fallible-allocation paths.
     struct Budget {
         remaining: Cell<usize>,
     }
@@ -6232,8 +6129,8 @@ mod tests {
         }
     }
 
-    // Implemented for the shared reference so `&Budget` is `Copy` and satisfies
-    // the parser's `Allocator + Clone` bound directly.
+    // Implemented for the shared reference so `&Budget` is `Copy` and satisfies the parser's `Allocator + Clone` bound
+    // directly.
     unsafe impl Allocator for &Budget {
         fn allocate(
             &self,
@@ -6252,11 +6149,9 @@ mod tests {
         }
     }
 
-    /// Parses `source` under every budget from 0 up to the amount a full parse
-    /// needs, asserting that each attempt either succeeds or reports
-    /// [`JsonError::Allocation`] — never a panic, an abort, or a bogus syntax
-    /// fault. Sweeping the whole range walks the failure point across every
-    /// allocation site the document reaches.
+    /// Parses `source` under every budget from 0 up to the amount a full parse needs, asserting that each attempt
+    /// either succeeds or reports [`JsonError::Allocation`] — never a panic, an abort, or a bogus syntax fault.
+    /// Sweeping the whole range walks the failure point across every allocation site the document reaches.
     fn sweep_allocation_failures(source: &[u8], options: &ParseOptions) {
         // Establish the high-water mark with an effectively unlimited budget.
         let generous = Budget::new(usize::MAX);
@@ -6291,8 +6186,7 @@ mod tests {
 
     #[test]
     fn allocation_failure_is_reported_not_aborted() {
-        // Exercises container frames, entry pushes, decoded keys and strings, and
-        // the big-number path.
+        // Exercises container frames, entry pushes, decoded keys and strings, and the big-number path.
         sweep_allocation_failures(
             br#"{"key":"value","nested":[1,2,{"deep":"text"}],"big":123456789012345678901234567890}"#,
             &ParseOptions::default(),
@@ -6301,8 +6195,7 @@ mod tests {
 
     #[test]
     fn allocation_failure_is_reported_for_escaped_strings() {
-        // Escaped bodies take the decoding branch of `unescape_into` rather than
-        // the verbatim copy.
+        // Escaped bodies take the decoding branch of `unescape_into` rather than the verbatim copy.
         sweep_allocation_failures(
             r#"{"naïve":"a\tb\nc","emoji":"😀"}"#.as_bytes(),
             &ParseOptions::default(),
@@ -6311,8 +6204,8 @@ mod tests {
 
     #[test]
     fn allocation_failure_is_reported_while_preserving_comments() {
-        // Regression test for the comment-text allocation, which previously used
-        // an infallible copy and would abort instead of returning an error.
+        // Regression test for the comment-text allocation, which previously used an infallible copy and would abort
+        // instead of returning an error.
         let options = ParseOptions::json5().preserve_comments(true);
         sweep_allocation_failures(
             b"{\n  // leading\n  a: 1, /* trailing */\n  b: [2], // tail\n}",
@@ -6322,9 +6215,8 @@ mod tests {
 
     #[test]
     fn allocation_failure_is_reported_for_wide_objects() {
-        // More than `DEDUP_LINEAR_LIMIT` entries, so the sorted dedup path and its
-        // scratch buffers are the ones that run out of memory.
-        // Built without `format!`, which needs `alloc::format` under `no_std`.
+        // More than `DEDUP_LINEAR_LIMIT` entries, so the sorted dedup path and its scratch buffers are the ones that
+        // run out of memory. Built without `format!`, which needs `alloc::format` under `no_std`.
         let mut source = Vec::new();
         source.push(b'{');
         for key in 0..(DEDUP_LINEAR_LIMIT + 8) {
@@ -6344,8 +6236,8 @@ mod tests {
     #[test]
     fn indexing_works_for_any_allocator() {
         let document = parse_in(br#"{"k":[1,2]}"#, Passthrough).unwrap();
-        // The infix `[]` sugar and its Null-on-miss fallback are not limited to
-        // `Json<Global>`; the `Null` sentinel promotes for every allocator.
+        // The infix `[]` sugar and its Null-on-miss fallback are not limited to `Json<Global>`; the `Null` sentinel
+        // promotes for every allocator.
         assert_eq!(document["k"][1].as_u64(), Some(2));
         assert!(document["missing"].is_null());
     }
@@ -6392,8 +6284,8 @@ mod tests {
 
     #[test]
     fn large_object_dedup_stays_correct() {
-        // Build a big object that crosses the linear->index threshold and forces
-        // several rehashes, with a duplicate of every key appended at the end.
+        // Build a big object that crosses the linear->index threshold and forces several rehashes, with a duplicate of
+        // every key appended at the end.
         let count = 500usize;
         let mut source = String::from("{");
         for key in 0..count {
@@ -6443,9 +6335,8 @@ mod tests {
 
     #[test]
     fn sorted_dedup_heavy_duplication() {
-        // 100 keys declared three times each in rising rounds. Well past the
-        // linear threshold, so this drives the sort path's run detection and
-        // last-value moves — and, without a hash, no crafted-key blowup.
+        // 100 keys declared three times each in rising rounds. Well past the linear threshold, so this drives the sort
+        // path's run detection and last-value moves — and, without a hash, no crafted-key blowup.
         let mut source = String::from("{");
         for round in 0..3u64 {
             for key in 0..100u64 {
@@ -6504,8 +6395,8 @@ mod tests {
         // A finite float keeps its lane.
         assert!(matches!(parse(b"2.5e3").unwrap(), Json::Float(_)));
 
-        // A value that overflows or underflows f64 would become inf/0 and then
-        // serialize to a lossy "null"; instead it is kept as its exact lexeme.
+        // A value that overflows or underflows f64 would become inf/0 and then serialize to a lossy "null"; instead it
+        // is kept as its exact lexeme.
         for source in [b"1e400".as_slice(), b"-1e400", b"1e309", b"1e-400"] {
             let document = parse(source).unwrap();
             assert!(matches!(document, Json::BigNumber(_)), "{document:?}");
@@ -6522,8 +6413,8 @@ mod tests {
 
     #[test]
     fn container_bodies_deref_like_vecs() {
-        // Destructuring a container variant still yields something that indexes,
-        // measures, iterates, and mutates like the underlying Vec.
+        // Destructuring a container variant still yields something that indexes, measures, iterates, and mutates like
+        // the underlying Vec.
         let mut document = parse(br#"{"xs":[10,20,30]}"#).unwrap();
         if let Json::Object(entries) = &document {
             assert_eq!(entries.len(), 1);
@@ -6624,8 +6515,8 @@ mod tests {
             assert_eq!(document.to_string(), *expected, "for {source:?}");
         }
 
-        // Infinity and NaN parse as non-finite floats and re-emit as null, the
-        // same lossy-but-valid path a user-built infinity already takes.
+        // Infinity and NaN parse as non-finite floats and re-emit as null, the same lossy-but-valid path a user-built
+        // infinity already takes.
         for source in [b"Infinity".as_slice(), b"-Infinity", b"NaN"] {
             let document = parse_with(source, &options).unwrap();
             assert!(document.is_number());
@@ -6707,8 +6598,8 @@ mod tests {
     fn json5_view_reescapes_single_quoted_content() {
         let options = ParseOptions::json5();
 
-        // The view keeps raw spans, so serialization must re-escape a `\'`
-        // and a literal `"` into a valid strict JSON string.
+        // The view keeps raw spans, so serialization must re-escape a `\'` and a literal `"` into a valid strict JSON
+        // string.
         let source = br"'a\'b'";
         let view = view_with(source, &options).unwrap();
         assert_eq!(view.to_json_string(source), r#""a'b""#);
@@ -6740,8 +6631,8 @@ mod tests {
     fn json5_big_number_stays_valid_json() {
         let options = ParseOptions::json5();
 
-        // An extended decimal-point number outside f64 range cannot be preserved
-        // as valid strict JSON, so it is rejected rather than emitting `5.` etc.
+        // An extended decimal-point number outside f64 range cannot be preserved as valid strict JSON, so it is
+        // rejected rather than emitting `5.` etc.
         let mut trailing_dot = String::from("1");
         for _ in 0..320 {
             trailing_dot.push('1');
@@ -6751,8 +6642,7 @@ mod tests {
         assert!(parse_with(b"5.e-400", &options).is_err());
         assert!(parse_with(b".5e400", &options).is_err());
 
-        // A well-formed decimal beyond f64 range is still preserved losslessly,
-        // and re-serializes as valid strict JSON.
+        // A well-formed decimal beyond f64 range is still preserved losslessly, and re-serializes as valid strict JSON.
         let document = parse_with(b"1.5e400", &options).unwrap();
         assert!(matches!(document, Json::BigNumber(_)));
         assert_eq!(document.to_string(), "1.5e400");
@@ -6761,8 +6651,8 @@ mod tests {
 
     #[test]
     fn json5_line_continuations_do_not_overflow() {
-        // A long run of backslash-newline continuations must decode iteratively,
-        // never recursively, so it cannot overflow the stack.
+        // A long run of backslash-newline continuations must decode iteratively, never recursively, so it cannot
+        // overflow the stack.
         let mut source = String::from("'");
         for _ in 0..500_000 {
             source.push_str("\\\n");
@@ -6801,8 +6691,8 @@ mod tests {
         let options = ParseOptions::json5().preserve_comments(true);
         let document = parse_with(b"{ /* c */ \"a\": [1, /* x */ 2] }", &options).unwrap();
 
-        // Comment-free serialization is exactly the same as for an uncommented
-        // parse, and equal values compare equal regardless of trivia.
+        // Comment-free serialization is exactly the same as for an uncommented parse, and equal values compare equal
+        // regardless of trivia.
         let plain = parse(br#"{"a":[1,2]}"#).unwrap();
         assert_eq!(document.to_string(), r#"{"a":[1,2]}"#);
         assert_eq!(document.to_string_pretty(2), plain.to_string_pretty(2));
@@ -6855,8 +6745,8 @@ mod tests {
 
     #[test]
     fn frame_machine_distinguishes_first_entries_from_required_entries() {
-        // A closer is legal only before the first entry, or after a completed
-        // value. It is not legal immediately after a strict comma.
+        // A closer is legal only before the first entry, or after a completed value. It is not legal immediately after
+        // a strict comma.
         for source in [b"[1,]".as_slice(), b"{\"a\":1,}", b"[,]", b"{,}"] {
             assert!(parse(source).is_err(), "strict parser accepted {source:?}");
         }
@@ -6974,8 +6864,7 @@ mod serde_tests {
 
     #[test]
     fn big_number_serializes_as_a_json_number() {
-        // Overflows u64 but fits u128, so serde_json emits it as a lossless
-        // number, not a string.
+        // Overflows u64 but fits u128, so serde_json emits it as a lossless number, not a string.
         let document = parse(b"123456789012345678901234567890").unwrap();
         assert_eq!(
             serde_json::to_string(&document).unwrap(),

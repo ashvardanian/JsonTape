@@ -6,20 +6,16 @@
 //! cargo run --release --example fuzz -- 100000 512 0x9E3779B97F4A7C15
 //! ```
 //!
-//! Arguments are `cases`, `maximum input length`, and an optional hexadecimal
-//! seed. The seed is printed on completion and on failure, so any run that finds
-//! something can be replayed exactly by passing it back.
+//! Arguments are `cases`, `maximum input length`, and an optional hexadecimal seed. The seed is printed on completion
+//! and on failure, so any run that finds something can be replayed exactly by passing it back.
 //!
-//! Every accepted input is checked against several invariants, needing no
-//! external oracle: the owned and zero-copy parsers must agree on acceptance and
-//! serialize identically, the re-emitted text must be valid strict JSON that
-//! round-trips by value and serializes to a fixed point, and a comment-preserving
-//! JSON5 parse must round-trip its comments. The harness fails on any panic or
-//! violated invariant.
+//! Every accepted input is checked against several invariants, needing no external oracle: the owned and zero-copy
+//! parsers must agree on acceptance and serialize identically, the re-emitted text must be valid strict JSON that
+//! round-trips by value and serializes to a fixed point, and a comment-preserving JSON5 parse must round-trip its
+//! comments. The harness fails on any panic or violated invariant.
 //!
-//! A strict-mode acceptance cross-check against `serde_json` runs alongside
-//! those invariants. It is a signal, not an oracle: the two libraries differ on
-//! some edges such as nesting limits, so divergences are printed rather than
+//! A strict-mode acceptance cross-check against `serde_json` runs alongside those invariants. It is a signal, not an
+//! oracle: the two libraries differ on some edges such as nesting limits, so divergences are printed rather than
 //! treated as failures.
 
 use std::env;
@@ -57,8 +53,7 @@ fn parse_argument(position: usize, default: usize) -> usize {
 }
 
 fn parse_seed() -> u64 {
-    // Parsed separately from `parse_argument`: the seed is hexadecimal (radix 16),
-    // not a decimal count.
+    // Parsed separately from `parse_argument`: the seed is hexadecimal (radix 16), not a decimal count.
     env::args()
         .nth(3)
         .map(|argument| u64::from_str_radix(argument.trim_start_matches("0x"), 16).expect("seed must be hexadecimal"))
@@ -66,15 +61,14 @@ fn parse_seed() -> u64 {
 }
 
 fn arbitrary(rng: &mut Rng, maximum: usize) -> Vec<u8> {
-    // Bind the target length: `with_capacity` may round up, so filling to
-    // `capacity()` could overshoot `maximum`.
+    // Bind the target length: `with_capacity` may round up, so filling to `capacity()` could overshoot `maximum`.
     let length = rng.below(maximum.saturating_add(1));
     (0..length).map(|_| rng.byte()).collect()
 }
 
 fn mutate_jsonish(rng: &mut Rng, maximum: usize) -> Vec<u8> {
-    // Byte-string literals must be ASCII, so multi-byte UTF-8 seeds use a normal
-    // string with `.as_bytes()`, and the JSON5 escape seed stays ASCII.
+    // Byte-string literals must be ASCII, so multi-byte UTF-8 seeds use a normal string with `.as_bytes()`, and the
+    // JSON5 escape seed stays ASCII.
     const SEEDS: &[&[u8]] = &[
         br#"null"#,
         br#"[true,false,null,0,-1,1.5,1e9]"#,
@@ -107,8 +101,8 @@ fn mutate_jsonish(rng: &mut Rng, maximum: usize) -> Vec<u8> {
     bytes
 }
 
-/// Checks that the owned and zero-copy parsers agree on `source` under `options`,
-/// and, when they accept it, that serialization and round-tripping hold.
+/// Checks that the owned and zero-copy parsers agree on `source` under `options`, and, when they accept it, that
+/// serialization and round-tripping hold.
 fn check_consistency(source: &[u8], options: &ParseOptions, label: &str) {
     let owned = parse_with(source, options);
     let borrowed = view_with(source, options);
@@ -139,9 +133,8 @@ fn check_consistency(source: &[u8], options: &ParseOptions, label: &str) {
         }
     }
 
-    // The view serializes to valid strict JSON of the same value. It may differ
-    // byte-for-byte from the owned form, since the view preserves the original
-    // escaping while the owned tree normalizes it, so compare by value.
+    // The view serializes to valid strict JSON of the same value. It may differ byte-for-byte from the owned form,
+    // since the view preserves the original escaping while the owned tree normalizes it, so compare by value.
     let view_text = borrowed.to_json_string(source);
     match parse(view_text.as_bytes()) {
         Ok(reparsed) => {
@@ -172,18 +165,16 @@ fn check_comment_round_trip(source: &[u8]) {
     }
 }
 
-/// How many divergences to print in full before falling back to counting them.
-/// The two libraries disagree by design on whole classes of input — numbers
-/// outside the `f64` range, which JsonTape preserves losslessly and `serde_json`
-/// rejects, are the common one — and the seed corpus contains such a case, so an
-/// uncapped report would bury the run's real output.
+/// How many divergences to print in full before falling back to counting them. The two libraries disagree by design on
+/// whole classes of input — numbers outside the `f64` range, which JsonTape preserves losslessly and `serde_json`
+/// rejects, are the common one — and the seed corpus contains such a case, so an uncapped report would bury the run's
+/// real output.
 const DIVERGENCE_REPORT_LIMIT: usize = 20;
 
 static DIVERGENCES: AtomicUsize = AtomicUsize::new(0);
 
-/// Strict-acceptance cross-check against `serde_json`. A signal only: mismatches
-/// are reported, not fatal, since the two libraries differ on edges like nesting
-/// depth and out-of-range numbers. Always compiled — the harness builds as a
+/// Strict-acceptance cross-check against `serde_json`. A signal only: mismatches are reported, not fatal, since the two
+/// libraries differ on edges like nesting depth and out-of-range numbers. Always compiled — the harness builds as a
 /// Cargo example, so `serde_json` is available from `dev-dependencies`.
 fn report_serde_json_divergence(source: &[u8]) {
     let ours = parse(source).is_ok();
