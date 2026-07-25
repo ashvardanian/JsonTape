@@ -53,6 +53,8 @@
 //! * __Navigate__ with [`Json::get`], the `[]` operator, or an RFC 6901 [`Json::pointer`].
 //! * __Preserve numbers__ losslessly: an integer wider than 64 bits, or a value outside the `f64` range, is kept as its
 //!   exact text ([`Json::as_number_str`]).
+//! * __Emit incrementally__ without a document, writing one value at a time through [`write_escaped_str`] and
+//!   [`write_number`] — the same escaping and number spelling the serializer uses.
 //! * __Configure__ the nesting limit and duplicate-key policy through [`ParseOptions`] and the `*_with` parsers.
 //! * __Diagnose__ failures with a categorized [`JsonError`]; resolve a fault to a line and column with
 //!   [`JsonError::location`].
@@ -1091,7 +1093,11 @@ fn raw_string_width(source: &[u8], span: Span) -> usize {
 }
 
 /// Writes `text` as a quoted JSON string, escaping what the grammar requires.
-fn write_escaped_str<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
+///
+/// Public for callers assembling JSON incrementally — one row at a time, rather than building a document to serialize —
+/// who would otherwise rewrite escaping, and usually rewrite less of it: the control range below `0x20` needs `\u`
+/// escapes that a hand-rolled version tends to miss.
+pub fn write_escaped_str<W: fmt::Write>(writer: &mut W, text: &str) -> fmt::Result {
     writer.write_char('"')?;
     write_escaped_body(writer, text)?;
     writer.write_char('"')
@@ -1302,10 +1308,24 @@ fn is_integral(value: f64) -> bool {
     }
 }
 
+/// A big number's exact text approximated as an `f64`, or `None` when the magnitude does not fit.
+///
+/// The scanner stores an out-of-range literal as a [`BigNumber`] precisely because `f64` would lose it, so handing the
+/// saturated infinity back through an accessor would undo that decision silently. Rust's float parser saturates rather
+/// than failing, so `Ok` is not enough on its own — the result has to be checked. Underflow to zero is left alone: it
+/// is a loss of precision, which these accessors document, not a magnitude the type cannot name.
+fn finite_or_none(text: &str) -> Option<f64> {
+    match text.parse::<f64>() {
+        Ok(value) if value.is_finite() => Some(value),
+        _ => None,
+    }
+}
+
 /// Writes a finite JSON number straight to `writer`. Non-finite floats become `null`, and integral floats keep a
 /// trailing `.0` so their type survives a round trip. `f64`'s formatter never uses exponent notation, so writing
-/// directly and appending `.0` when integral needs no intermediate buffer.
-fn write_number<W: fmt::Write>(writer: &mut W, value: f64) -> fmt::Result {
+/// directly and appending `.0` when integral needs no intermediate buffer. Public alongside
+/// [`write_escaped_str`], for the same incremental callers.
+pub fn write_number<W: fmt::Write>(writer: &mut W, value: f64) -> fmt::Result {
     if !value.is_finite() {
         return writer.write_str("null");
     }
@@ -2775,11 +2795,12 @@ impl<'s, A: Allocator> Resolved<'s, A> {
         self.node.as_u64()
     }
     /// The value as an `f64`. Unlike [`JsonView::as_f64`], this cursor carries its source, so it can also approximate a
-    /// [`BigNumber`](JsonView::BigNumber) — the one place where binding to the source widens what is readable.
+    /// [`BigNumber`](JsonView::BigNumber) — the one place where binding to the source widens what is readable. A
+    /// magnitude `f64` cannot hold at all yields `None`; read it through [`as_number_str`](Resolved::as_number_str).
     pub fn as_f64(self) -> Option<f64> {
         // Unlike a bare view, the cursor has `source`, so a big number can be approximated as an `f64`.
         match self.node {
-            JsonView::BigNumber(span) => span.resolve(self.source)?.parse::<f64>().ok(),
+            JsonView::BigNumber(span) => finite_or_none(span.resolve(self.source)?),
             _ => self.node.as_f64(),
         }
     }
@@ -3416,13 +3437,15 @@ impl<A: Allocator> Json<A> {
     }
 
     /// The value as an `f64`. Integers widen, and a [`BigNumber`](Json::BigNumber) is reparsed from its exact text, so
-    /// this is the one accessor that can lose precision rather than return `None`.
+    /// this is the one accessor that can lose precision rather than return `None`. Precision is all it will lose: a
+    /// magnitude outside `f64`'s range yields `None` rather than an infinity — read it through
+    /// [`as_number_str`](Json::as_number_str).
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Json::Float(value) => Some(*value),
             Json::Integer(value) => Some(*value as f64),
             Json::Unsigned(value) => Some(*value as f64),
-            Json::BigNumber(number) => number.as_str().parse::<f64>().ok(),
+            Json::BigNumber(number) => finite_or_none(number.as_str()),
             _ => None,
         }
     }
@@ -6766,6 +6789,35 @@ mod tests {
 
         let options = ParseOptions::strict().max_depth((depth + 1) as u32);
         assert!(parse_with(&source, &options).is_ok());
+    }
+
+    #[test]
+    fn out_of_range_literals_do_not_saturate() {
+        let document = parse_in(b"[1e400, -1e400, 1e300]", allocator_api2::alloc::Global).unwrap();
+        let items = document.as_array().unwrap();
+        assert_eq!(items[0].as_f64(), None);
+        assert_eq!(items[1].as_f64(), None);
+        // In range, so still approximated — precision may go, magnitude may not.
+        assert!(items[2].as_f64().is_some_and(|value| value.is_finite()));
+        // The exact text survives either way.
+        assert_eq!(items[0].as_number_str(), Some("1e400"));
+
+        // The cursor resolves its own span, so it is a separate arm and needs its
+        // own case — an in-range big number still approximates there.
+        let source = b"[1e400, 123456789012345678901234567890]";
+        let document = view(source).unwrap();
+        let root = document.bind(source);
+        assert_eq!(root.get(0).as_f64(), None);
+        assert!(root.get(1).as_f64().is_some_and(|value| value > 1.2e29));
+    }
+
+    #[test]
+    fn incremental_writers_escape_and_spell_numbers() {
+        let mut output = String::new();
+        write_escaped_str(&mut output, "a\"b\nc").unwrap();
+        write_number(&mut output, f64::NAN).unwrap();
+        write_number(&mut output, 1.5).unwrap();
+        assert_eq!(output, r#""a\"b\nc"null1.5"#);
     }
 }
 
