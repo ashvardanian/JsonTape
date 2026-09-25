@@ -28,7 +28,7 @@
 //! times parsing plus the drop of that iteration's document, which is exactly where the `-arena` rows' O(1) teardown
 //! shows up.
 
-use allocator_api2::alloc::{AllocError, Allocator, Layout};
+use core::alloc::{AllocError, Allocator, Layout};
 use core::cell::Cell;
 use core::ops::Range;
 use core::ptr::NonNull;
@@ -203,9 +203,7 @@ fn nested_document() -> Vec<u8> {
         source.extend_from_slice(format!(r#"{{"level_{level}":"#).as_bytes());
     }
     source.extend_from_slice(br#"[0,1,2,{"leaf":true}]"#);
-    // `repeat().take()` rather than `repeat_n`, which needs Rust 1.82 and would push the crate's declared MSRV up for a
-    // dev-only benchmark.
-    source.extend(core::iter::repeat(b'}').take(32));
+    source.extend(core::iter::repeat_n(b'}', 32));
     source
 }
 
@@ -335,9 +333,7 @@ fn bench_json5_parse(c: &mut Criterion) {
             BenchmarkId::new(JSONTAPE_VIEW_BOUND, &workload.name),
             &workload.source,
             |bench, source| {
-                bench.iter(|| {
-                    black_box(view_in_bound_with(black_box(source), allocator_api2::alloc::Global, &options).unwrap())
-                })
+                bench.iter(|| black_box(view_in_bound_with(black_box(source), std::alloc::Global, &options).unwrap()))
             },
         );
         // The json5 crate is the natural JSON5 peer; serde_json and simd-json cannot parse these documents at all.

@@ -1,8 +1,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-// The library is entirely safe Rust; this makes that property compiler-enforced rather than a convention. The test
-// module needs `unsafe impl Allocator` for its stand-in allocators, so the lint is lifted only there. Doctests compile
-// as separate crates and are unaffected.
-#![cfg_attr(not(test), forbid(unsafe_code))]
+// The library is safe Rust apart from `try_box_in`; this makes that property compiler-enforced rather than a
+// convention. The test module needs `unsafe impl Allocator` for its stand-in allocators, so the lint is lifted only
+// there. Doctests compile as separate crates and are unaffected.
+#![cfg_attr(not(test), deny(unsafe_code))]
 // Every public item carries documentation, and this keeps it that way.
 #![deny(missing_docs)]
 
@@ -18,8 +18,8 @@
 //!   original source rather than decoded, so parsing copies nothing, and lookups compare against those still-escaped
 //!   spans with an escape-aware, allocation-free comparison. Produce one with [`view`] or [`view_in`].
 //!
-//! Both containers allocate through any [`allocator_api2::alloc::Allocator`], so the whole document can live in a bump
-//! arena and free in one step.
+//! Both containers allocate through any [`Allocator`], so the whole document can live in a bump arena and free in one
+//! step.
 //!
 //! ```rust
 //! use jsontape::parse;
@@ -69,17 +69,17 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-#[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use core::alloc::{Allocator, Layout};
 use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
-use allocator_api2::alloc::{Allocator, Global};
-use allocator_api2::boxed::Box;
-use allocator_api2::vec::Vec;
+use alloc::alloc::Global;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
@@ -1608,7 +1608,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 let block = TriviaBlock {
                     comments: Vec::new_in(self.allocator.clone()),
                 };
-                *trivia = Some(Box::try_new_in(block, self.allocator.clone()).map_err(|_| JsonError::Allocation)?);
+                *trivia = Some(try_box_in(block, self.allocator.clone())?);
             }
             let block = trivia.as_mut().expect("just set");
             block.comments.try_reserve(1).map_err(|_| JsonError::Allocation)?;
@@ -1879,7 +1879,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
 
     fn finish_value(
         &mut self,
-        frames: &mut Vec<ParseFrame<A, B>, A>,
+        frames: &mut [ParseFrame<A, B>],
         root: &mut Option<B::Value>,
         value: B::Value,
     ) -> Result<(), JsonError> {
@@ -2442,13 +2442,11 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
                 // positions of this key.
                 let mut first = usize::MAX;
                 let mut last = 0;
-                for slot in run_start..run_end {
-                    let position = order[slot];
+                for &position in &order[run_start..run_end] {
                     first = first.min(position);
                     last = last.max(position);
                 }
-                for slot in run_start..run_end {
-                    let position = order[slot];
+                for &position in &order[run_start..run_end] {
                     if position != first {
                         fate[position] = REMOVED;
                     }
@@ -2463,8 +2461,7 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         // Pull each winning value back to its keeper. A keeper and the duplicate it takes from hold equal keys by
         // construction, so swapping whole entries is the same as moving just the value — and it needs no spare storage,
         // where taking values out by index would.
-        for position in 0..count {
-            let source = fate[position];
+        for (position, &source) in fate.iter().enumerate() {
             if source != REMOVED && source != position {
                 entries.swap(position, source);
             }
@@ -2473,8 +2470,8 @@ impl<'a, A: Allocator + Clone, B: DomBuilder<A>> Parser<'a, A, B> {
         // Compact the survivors forward in place; the losers collect in the tail and are dropped by the truncate.
         // Deduplication only ever shrinks the object, so no entry limit can be newly exceeded here.
         let mut kept = 0;
-        for position in 0..count {
-            if fate[position] == REMOVED {
+        for (position, &source) in fate.iter().enumerate() {
+            if source == REMOVED {
                 continue;
             }
             if kept != position {
@@ -2498,10 +2495,10 @@ const DEDUP_LINEAR_LIMIT: usize = 16;
 /// # Layout and allocators
 ///
 /// Each array and object owns its own [`Vec`], so parsing with the default global allocator scatters those nodes across
-/// the heap. Parse with [`view_in`] and a bump or slab allocator (any [`allocator_api2::alloc::Allocator`], for example
-/// a `bump-scope` arena) to pack the whole document into one contiguous region that frees in `O(1)` when the arena is
-/// dropped — the closest this design gets to a flat tape. Note the caveat: the per-node `Vec`s still grow by doubling,
-/// so an arena keeps some slack and dead reallocation remnants; it is arena-flat and cheap to allocate and free, not a
+/// the heap. Parse with [`view_in`] and a bump or slab allocator (any [`Allocator`], for example a `bump-scope` arena)
+/// to pack the whole document into one contiguous region that frees in `O(1)` when the arena is dropped — the closest
+/// this design gets to a flat tape. Note the caveat: the per-node `Vec`s still grow by doubling, so an arena keeps some
+/// slack and dead reallocation remnants; it is arena-flat and cheap to allocate and free, not a
 /// single compact flat buffer.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -3148,6 +3145,20 @@ struct AnchoredComment<A: Allocator> {
 #[derive(Debug, Clone)]
 struct TriviaBlock<A: Allocator> {
     comments: Vec<AnchoredComment<A>, A>,
+}
+
+/// Stands in for `Box::try_new_in`, still unstable under `allocator_ext`.
+#[allow(unsafe_code)]
+fn try_box_in<T, A: Allocator>(value: T, allocator: A) -> Result<Box<T, A>, JsonError> {
+    let ptr = allocator
+        .allocate(Layout::new::<T>())
+        .map_err(|_| JsonError::Allocation)?
+        .cast::<T>();
+    // SAFETY: `ptr` is a fresh allocation of `Layout::new::<T>()` from `allocator`, which the `Box` takes over.
+    unsafe {
+        ptr.write(value);
+        Ok(Box::from_non_null_in(ptr, allocator))
+    }
 }
 
 /// A comment recorded during scanning, before it is bound to a container slot. `broke` is whether a newline separated
@@ -4578,12 +4589,13 @@ pub fn parse_in_with<A: Allocator + Clone>(
 /// Parses `source` into an owned, mutable [`Json`] allocated in `allocator`, decoding every string's escapes. The
 /// result borrows nothing from `source`.
 ///
-/// The `allocator` is any [`allocator_api2::alloc::Allocator`], so the whole document can be packed into one region — a
-/// bump or slab arena — that frees in `O(1)` when dropped. Here a custom allocator simply tallies the bytes handed out;
-/// swap in a bump-arena allocator to get the packed, drop-once layout described on [`JsonView`].
+/// The `allocator` is any [`Allocator`], so the whole document can be packed into one region — a bump or slab arena —
+/// that frees in `O(1)` when dropped. Here a custom allocator simply tallies the bytes handed out; swap in a bump-arena
+/// allocator to get the packed, drop-once layout described on [`JsonView`].
 ///
 /// ```
-/// use allocator_api2::alloc::{AllocError, Allocator, Global, Layout};
+/// use core::alloc::{AllocError, Allocator, Layout};
+/// use std::alloc::Global;
 /// use core::cell::Cell;
 /// use core::ptr::NonNull;
 ///
@@ -6006,10 +6018,7 @@ mod tests {
         };
         for length in 0..64usize {
             for _ in 0..64 {
-                let mut bytes = Vec::new();
-                for _ in 0..length {
-                    bytes.push(0u8);
-                }
+                let mut bytes = alloc::vec![0u8; length];
                 for slot in bytes.iter_mut() {
                     // Bias toward the interesting byte values.
                     let value = next();
@@ -6126,10 +6135,7 @@ mod tests {
     struct Passthrough;
 
     unsafe impl Allocator for Passthrough {
-        fn allocate(
-            &self,
-            layout: core::alloc::Layout,
-        ) -> Result<core::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        fn allocate(&self, layout: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
             Global.allocate(layout)
         }
         unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: core::alloc::Layout) {
@@ -6155,13 +6161,10 @@ mod tests {
     // Implemented for the shared reference so `&Budget` is `Copy` and satisfies the parser's `Allocator + Clone` bound
     // directly.
     unsafe impl Allocator for &Budget {
-        fn allocate(
-            &self,
-            layout: core::alloc::Layout,
-        ) -> Result<core::ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        fn allocate(&self, layout: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
             let size = layout.size();
             if size > self.remaining.get() {
-                return Err(allocator_api2::alloc::AllocError);
+                return Err(core::alloc::AllocError);
             }
             let block = Global.allocate(layout)?;
             self.remaining.set(self.remaining.get() - size);
@@ -6793,7 +6796,7 @@ mod tests {
 
     #[test]
     fn out_of_range_literals_do_not_saturate() {
-        let document = parse_in(b"[1e400, -1e400, 1e300]", allocator_api2::alloc::Global).unwrap();
+        let document = parse_in(b"[1e400, -1e400, 1e300]", Global).unwrap();
         let items = document.as_array().unwrap();
         assert_eq!(items[0].as_f64(), None);
         assert_eq!(items[1].as_f64(), None);

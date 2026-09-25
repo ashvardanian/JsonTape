@@ -3,11 +3,11 @@
 ![JsonTape banner](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/JsonTape.png?raw=true)
 
 __JsonTape__ is a minimalistic, allocator-aware JSON and JSON5 parser in pure Rust.
-It exists to fix what a typical DOM costs in memory and fragmentation: every container allocates through any [`allocator_api2`] allocator, so a whole document can live in one bump arena and free in a single step.
+It exists to fix what a typical DOM costs in memory and fragmentation: every container allocates through any [`Allocator`], so a whole document can live in one bump arena and free in a single step.
 Its sibling project — [StringTape] — does the same for Arrow-like string collections.
 
 - __Allocator-aware__ — parse a payload into an arena, read it, and reclaim it all in one `O(1)` teardown; or take the zero-copy view and never decode at all.
-- __Safe by construction__ — no `unsafe` anywhere in the library, enforced by `forbid(unsafe_code)` rather than by convention.
+- __Safe by construction__ — one `unsafe` block in the library, standing in for the still-unstable `Box::try_new_in`, and `deny(unsafe_code)` everywhere else.
   The parse path allocates fallibly and returns an error instead of aborting, and never panics on hostile input.
 - __Genuinely `no_std`__ — CI builds the crate for a bare-metal `thumbv7em-none-eabihf` target, so the claim is checked rather than asserted.
 - __Lossless numbers__ — integers wider than `u64` and decimals outside the `f64` range survive verbatim, so money never silently rounds.
@@ -209,11 +209,11 @@ A blunt, honest comparison, where ● is first-class, ◐ is partial or behind a
 | Configurable duplicate-key policy   |            ○ |       ○ |           ○ |          ● |
 | Source key order preserved          |            ◐ |       ○ |           ○ |          ● |
 | Zero-copy borrowed DOM              |            ○ |       ○ |           ● |          ● |
-| Custom [`allocator_api2`] allocator |            ○ |       ○ |           ○ |          ● |
+| Custom [`Allocator`]                |            ○ |       ○ |           ○ |          ● |
 | `O(1)` arena teardown               |            ○ |       ○ |           ○ |          ● |
 | `no_std` with `alloc`               |            ◐ |       ○ |           ○ |          ● |
 | Fallible allocation on parse        |            ○ |       ○ |           ○ |          ● |
-| No `unsafe` anywhere in the library |            ○ |       ● |           ○ |          ● |
+| No `unsafe` anywhere in the library |            ○ |       ● |           ○ |          ◐ |
 | Lossless numbers past 64 bits       |            ◐ |       ○ |           ◐ |          ● |
 | Width-based pretty-printing         |            ○ |       ○ |           ○ |          ● |
 | Serde derive to and from user types |            ● |       ● |           ● |          ◐ |
@@ -225,13 +225,13 @@ The gap is narrower than that trade usually implies: on the object-key-dense `ci
 
 ## Allocators
 
-Every container allocates through the `allocator` you pass to `parse_in` or `view_in`, any [`allocator_api2`] allocator.
+Every container allocates through the `allocator` you pass to `parse_in` or `view_in`, any [`Allocator`].
 With the default global heap each array and object is a separate allocation scattered across the heap.
 Pass a bump or slab arena instead and the whole document is packed into one contiguous region that frees in `O(1)` when the arena is dropped — parse a large payload, read it, and reclaim it all at once.
 This is the closest the pointer-tree design gets to a flat tape; the per-node `Vec`s still grow by doubling, so an arena keeps some slack, but allocation and teardown are cheap and fragmentation-free.
 See the [`parse_in`] docs for a worked custom-allocator example.
 
-Bring any arena crate that implements `allocator_api2::Allocator`.
+Bring any arena crate that implements `core::alloc::Allocator`.
 To process a stream of documents through one arena, reset it between them:
 
 ```rust
@@ -321,7 +321,7 @@ Apache-2.0.
 
 [StringTape]: https://github.com/ashvardanian/StringTape
 [`scripts/bench.rs`]: scripts/bench.rs
-[`allocator_api2`]: https://docs.rs/allocator-api2
+[`Allocator`]: https://doc.rust-lang.org/core/alloc/trait.Allocator.html
 [`parse_in`]: https://docs.rs/jsontape/latest/jsontape/fn.parse_in.html
 [`simd-json`]: https://docs.rs/simd-json
 [`json5`]: https://docs.rs/json5

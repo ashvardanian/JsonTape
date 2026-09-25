@@ -9,9 +9,9 @@ readme = "README.md"
 repository = "https://github.com/ashvardanian/JsonTape"
 documentation = "https://docs.rs/jsontape"
 homepage = "https://github.com/ashvardanian/JsonTape"
-# 1.70 is the floor: `Option::is_some_and` stabilized there. Verified by building
-# the library with 1.70 and confirming 1.65 fails.
-rust-version = "1.70"
+# 1.100 is the floor: `core::alloc::Allocator` and allocator-generic `Vec` and `Box`
+# stabilized there.
+rust-version = "1.100"
 keywords = ["json", "json5", "parser", "no-std", "zero-copy"]
 categories = ["parser-implementations", "no-std", "encoding"]
 # `scripts/` holds the benchmark and fuzz harnesses, which are dev-only; the
@@ -27,9 +27,6 @@ path = "jsontape.rs"
 all-features = true
 
 [dependencies]
-allocator-api2 = { version = "0.4.0", default-features = false, features = [
-    "alloc",
-] }
 serde = { version = "1.0.229", default-features = false, optional = true }
 
 [dev-dependencies]
@@ -58,5 +55,5 @@ path = "scripts/fuzz.rs"
 
 [features]
 default = ["std"]
-std = ["allocator-api2/std", "serde?/std"]
+std = ["serde?/std"]
 serde = ["dep:serde", "serde/alloc"]
