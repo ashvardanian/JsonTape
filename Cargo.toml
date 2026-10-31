@@ -8,15 +8,14 @@ license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/ashvardanian/JsonTape"
 documentation = "https://docs.rs/jsontape"
-homepage = "https://github.com/ashvardanian/JsonTape"
 # 1.100 is the floor: `core::alloc::Allocator` and allocator-generic `Vec` and `Box`
 # stabilized there.
 rust-version = "1.100"
 keywords = ["json", "json5", "parser", "no-std", "zero-copy"]
 categories = ["parser-implementations", "no-std", "encoding"]
-# `scripts/` holds the benchmark and fuzz harnesses, which are dev-only; the
-# published crate is the single library file.
-exclude = [".github/", "data/"]
+# The published crate is the library file and its docs; the benchmark and fuzz
+# harnesses in `scripts/` are dev-only, so cargo skips their targets on publish.
+include = ["jsontape.rs", "LICENSE", "README.md"]
 
 [lib]
 path = "jsontape.rs"

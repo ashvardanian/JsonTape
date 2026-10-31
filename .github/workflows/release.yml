@@ -26,10 +26,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+      # Nightly until Rust 1.100 ships on 2026-11-12; then switch all three to @stable and add an @1.100 MSRV job.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, miri, rust-src
           targets: thumbv7em-none-eabihf
       - name: Format
         run: cargo fmt --check
@@ -59,6 +60,8 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test the Slot casts under Miri
+        run: cargo miri test --locked --lib slot
       - name: Compile benches
         run: cargo bench --locked --no-run
 
@@ -69,7 +72,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
       - name: Fuzz the parser
         run: cargo run --locked --release --example fuzz -- 200000 512 "$(printf '%x' ${{ github.run_id }})"
 
@@ -85,7 +88,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
       - name: Authenticate with crates.io
         id: crates_io
         uses: rust-lang/crates-io-auth-action@v1

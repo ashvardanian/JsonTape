@@ -1,4 +1,4 @@
-//! A dependency-free parser stress harness.
+//! A parser stress harness.
 //!
 //! Build and run it from the repository root:
 //!
@@ -61,7 +61,6 @@ fn parse_seed() -> u64 {
 }
 
 fn arbitrary(rng: &mut Rng, maximum: usize) -> Vec<u8> {
-    // Bind the target length: `with_capacity` may round up, so filling to `capacity()` could overshoot `maximum`.
     let length = rng.below(maximum.saturating_add(1));
     (0..length).map(|_| rng.byte()).collect()
 }
@@ -103,7 +102,7 @@ fn mutate_jsonish(rng: &mut Rng, maximum: usize) -> Vec<u8> {
 
 /// Checks that the owned and zero-copy parsers agree on `source` under `options`, and, when they accept it, that
 /// serialization and round-tripping hold.
-fn check_consistency(source: &[u8], options: &ParseOptions, label: &str) {
+fn check_consistency(source: &[u8], options: ParseOptions, label: &str) {
     let owned = parse_with(source, options);
     let borrowed = view_with(source, options);
     if owned.is_ok() != borrowed.is_ok() {
@@ -135,7 +134,9 @@ fn check_consistency(source: &[u8], options: &ParseOptions, label: &str) {
 
     // The view serializes to valid strict JSON of the same value. It may differ byte-for-byte from the owned form,
     // since the view preserves the original escaping while the owned tree normalizes it, so compare by value.
-    let view_text = borrowed.to_json_string(source);
+    let view_text = borrowed
+        .to_json_string(source, FormatOptions::compact())
+        .expect("a view renders against its own source");
     match parse(view_text.as_bytes()) {
         Ok(reparsed) => {
             if reparsed != *document {
@@ -151,11 +152,13 @@ fn check_consistency(source: &[u8], options: &ParseOptions, label: &str) {
 /// Checks that a comment-preserving JSON5 parse round-trips its comments by value.
 fn check_comment_round_trip(source: &[u8]) {
     let options = ParseOptions::json5().preserve_comments(true);
-    let Ok(document) = parse_with(source, &options) else {
+    let Ok(document) = parse_with(source, options) else {
         return;
     };
-    let commented = document.to_string_with(FormatOptions::pretty().with_comments(true));
-    match parse_with(commented.as_bytes(), &options) {
+    let commented = document
+        .to_json_string(FormatOptions::pretty().with_comments(true))
+        .expect("an owned document renders unless the heap runs out");
+    match parse_with(commented.as_bytes(), options) {
         Ok(reparsed) => {
             if reparsed != document {
                 panic!("comment round-trip value mismatch: text={commented:?}, input={source:?}");
@@ -190,7 +193,7 @@ fn report_serde_json_divergence(source: &[u8]) {
     }
 }
 
-fn check_case(source: &[u8], strict: &ParseOptions, json5: &ParseOptions) {
+fn check_case(source: &[u8], strict: ParseOptions, json5: ParseOptions) {
     check_consistency(source, strict, "strict");
     check_consistency(source, json5, "json5");
     check_comment_round_trip(source);
@@ -211,7 +214,7 @@ fn main() {
         } else {
             mutate_jsonish(&mut rng, maximum)
         };
-        if panic::catch_unwind(AssertUnwindSafe(|| check_case(&source, &strict, &json5))).is_err() {
+        if panic::catch_unwind(AssertUnwindSafe(|| check_case(&source, strict, json5))).is_err() {
             eprintln!("failure at case {case} with seed 0x{seed:016X}, input={source:?}");
             std::process::exit(1);
         }

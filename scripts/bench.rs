@@ -27,6 +27,24 @@
 //! kept — and reuse one set of scratch `Buffers` across runs (its analogue to JsonTape reusing an arena). Every row
 //! times parsing plus the drop of that iteration's document, which is exactly where the `-arena` rows' O(1) teardown
 //! shows up.
+//!
+//! # Datasets
+//!
+//! The synthetic groups run standalone. To benchmark real-world documents too, download the canonical datasets into
+//! `data/` and point the suite at it with `JSONTAPE_DATA`. Single documents (`*.json`) and NDJSON / JSON Lines streams
+//! (`*.ndjson`, `*.jsonl`) are both recognized:
+//!
+//! ```sh
+//! mkdir -p data
+//! # Single documents (serde-rs/json-benchmark, identical to simdjson's copies):
+//! for f in twitter canada citm_catalog; do
+//!   curl -sSL "https://raw.githubusercontent.com/serde-rs/json-benchmark/master/data/$f.json" -o "data/$f.json"
+//! done
+//! # NDJSON stream (simdjson's streaming-benchmark file):
+//! curl -sSL -o data/amazon_cellphones.ndjson \
+//!   "https://raw.githubusercontent.com/simdjson/simdjson/master/jsonexamples/amazon_cellphones.ndjson"
+//! JSONTAPE_DATA=data cargo bench --bench bench -- parse-data parse-ndjson
+//! ```
 
 use core::alloc::{AllocError, Allocator, Layout};
 use core::cell::Cell;
@@ -34,7 +52,9 @@ use core::ops::Range;
 use core::ptr::NonNull;
 use criterion::measurement::WallTime;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion, Throughput};
-use jsontape::{parse, parse_in, parse_with, view, view_bound, view_in, view_in_bound_with, view_with, ParseOptions};
+use jsontape::{
+    parse, parse_in, parse_with, view, view_bound, view_bound_with_in, view_in, view_with, FormatOptions, ParseOptions,
+};
 
 /// `jsontape::parse`: owned, mutable DOM; strings decoded into the document's allocator at parse time, keys deduped in
 /// source order.
@@ -315,25 +335,25 @@ fn bench_json5_parse(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new(JSONTAPE_OWNED, &workload.name),
             &workload.source,
-            |bench, source| bench.iter(|| black_box(parse_with(black_box(source), &options).unwrap())),
+            |bench, source| bench.iter(|| black_box(parse_with(black_box(source), options).unwrap())),
         );
         // The comment-preserving round trip — the one output shape no peer here can produce — priced against the
         // comment-dropping rows above.
         group.bench_with_input(
             BenchmarkId::new(JSONTAPE_OWNED_COMMENTS, &workload.name),
             &workload.source,
-            |bench, source| bench.iter(|| black_box(parse_with(black_box(source), &comment_options).unwrap())),
+            |bench, source| bench.iter(|| black_box(parse_with(black_box(source), comment_options).unwrap())),
         );
         group.bench_with_input(
             BenchmarkId::new(JSONTAPE_VIEW, &workload.name),
             &workload.source,
-            |bench, source| bench.iter(|| black_box(view_with(black_box(source), &options).unwrap())),
+            |bench, source| bench.iter(|| black_box(view_with(black_box(source), options).unwrap())),
         );
         group.bench_with_input(
             BenchmarkId::new(JSONTAPE_VIEW_BOUND, &workload.name),
             &workload.source,
             |bench, source| {
-                bench.iter(|| black_box(view_in_bound_with(black_box(source), std::alloc::Global, &options).unwrap()))
+                bench.iter(|| black_box(view_bound_with_in(black_box(source), options, std::alloc::Global).unwrap()))
             },
         );
         // The json5 crate is the natural JSON5 peer; serde_json and simd-json cannot parse these documents at all.
@@ -366,12 +386,18 @@ fn bench_serialize(c: &mut Criterion) {
             bench.iter(|| black_box(document.to_string()))
         });
         group.bench_with_input(BenchmarkId::new(JSONTAPE_VIEW, name), &borrowed, |bench, document| {
-            bench.iter(|| black_box(document.to_json_string(black_box(source))))
+            bench.iter(|| {
+                black_box(
+                    document
+                        .to_json_string(black_box(source), FormatOptions::compact())
+                        .unwrap(),
+                )
+            })
         });
         group.bench_with_input(
             BenchmarkId::new(JSONTAPE_VIEW_BOUND, name),
             &bound,
-            |bench, document| bench.iter(|| black_box(document.to_json_string())),
+            |bench, document| bench.iter(|| black_box(document.root().to_string())),
         );
         group.bench_with_input(BenchmarkId::new(SERDE_OWNED, name), &serde_value, |bench, document| {
             bench.iter(|| black_box(serde_json::to_string(document).unwrap()))
@@ -386,8 +412,8 @@ fn bench_serialize(c: &mut Criterion) {
 }
 
 /// Reads the dataset directory named by the `JSONTAPE_DATA` environment variable, keeping only files whose extension is
-/// in `extensions`. Empty when the variable is unset, so the synthetic benches run standalone. See the README for the
-/// download commands.
+/// in `extensions`. Empty when the variable is unset, so the synthetic benches run standalone. See the module
+/// documentation for the download commands.
 fn read_data_dir(extensions: &[&str]) -> Vec<(String, Vec<u8>)> {
     let Ok(dir) = std::env::var("JSONTAPE_DATA") else {
         return Vec::new();

@@ -7,8 +7,8 @@ It exists to fix what a typical DOM costs in memory and fragmentation: every con
 Its sibling project — [StringTape] — does the same for Arrow-like string collections.
 
 - __Allocator-aware__ — parse a payload into an arena, read it, and reclaim it all in one `O(1)` teardown; or take the zero-copy view and never decode at all.
-- __Safe by construction__ — one `unsafe` block in the library, standing in for the still-unstable `Box::try_new_in`, and `deny(unsafe_code)` everywhere else.
-  The parse path allocates fallibly and returns an error instead of aborting, and never panics on hostile input.
+- __Safe by construction__ — three small `unsafe` helpers in the library: one standing in for the still-unstable `Box::try_new_in`, one casting a found value to the `Slot` that brackets return, and one reading a `JsonString` that every constructor already validated as UTF-8; `deny(unsafe_code)` everywhere else.
+  Parsing, editing, and rendering allocate fallibly and return an error instead of aborting, and nothing panics on hostile input.
 - __Genuinely `no_std`__ — CI builds the crate for a bare-metal `thumbv7em-none-eabihf` target, so the claim is checked rather than asserted.
 - __Lossless numbers__ — integers wider than `u64` and decimals outside the `f64` range survive verbatim, so money never silently rounds.
 - __Round-trips comments and layout__ — comments survive a parse and come back byte for byte, and the printer wraps to a column budget rather than one element per line.
@@ -23,17 +23,22 @@ Two document types share one strict scanner.
 ```rust
 use jsontape::{parse, Json};
 
-let mut document = parse(br#"{ "greeting": "a\nb", "peers": [1, 2, 3] }"#).unwrap();
+let mut document = parse(br#"{ "greeting": "a\nb", "peers": [1, 2, 3] }"#)?;
 
-// Navigate with indexing; a miss anywhere in the chain yields Null, not a panic.
+// Navigate with brackets; a miss anywhere yields an empty slot: no panic, and never mistaken for null.
 assert_eq!(document["greeting"].as_str(), Some("a\nb"));
 assert_eq!(document["peers"][0].as_u64(), Some(1));
-assert!(document["absent"].is_null());
+assert!(!document["absent"].exists());
+assert!(document["absent"]["deeper"][9].as_u64().is_none());
 
-// Or look things up fallibly, by key or by position, and edit in place.
-assert_eq!(document.get("peers").and_then(|v| v.get(2)).and_then(|v| v.as_u64()), Some(3));
-assert_eq!(document.pointer("/peers/1").and_then(|v| v.as_u64()), Some(2));
-document.insert("count", Json::from(3u64));
+// Or get an `Option<&Json>` directly, by key, position, path, or JSON Pointer.
+assert_eq!(document.get(("peers", 2)).and_then(|peer| peer.as_u64()), Some(3));
+assert_eq!(document.pointer("/peers/1").and_then(|peer| peer.as_u64()), Some(2));
+
+// Edit through the typed body; only an allocation failure is an error.
+if let Some(object) = document.as_object_mut() {
+    object.insert("count", Json::from(3u64))?;
+}
 ```
 
 `JsonView` is the immutable, zero-copy counterpart: string values and object keys stay as `Span`s into the original source and nothing is decoded, so key lookups compare against those still-escaped spans with an escape-aware, allocation-free comparison.
@@ -49,13 +54,13 @@ assert_eq!(document.get(source, "metric").and_then(|v| v.as_str(source)), Some("
 assert_eq!(document.get(source, "nodes").and_then(|v| v.as_u64()), Some(20_000_000));
 ```
 
-For a source-bound view that cannot accidentally be resolved against different bytes, use `view_bound` and navigate without passing the source again:
+For a source-bound view that cannot accidentally be resolved against different bytes, use `view_bound` and navigate from its `root()` without passing the source again:
 
 ```rust
 use jsontape::view_bound;
 
 let document = view_bound(br#"{ "a": [10, 20] }"#).unwrap();
-assert_eq!(document.get("a").get(1).as_u64(), Some(20));
+assert_eq!(document.root().get(("a", 1)).and_then(|value| value.as_u64()), Some(20));
 ```
 
 ## Feature Tour
@@ -73,12 +78,12 @@ let config = br#"{
     "port": 8080, // default
     "hosts": ["a", "b",], /* note the trailing comma */
 }"#;
-let document = parse_with(config, &ParseOptions::jsonc()).unwrap();
+let document = parse_with(config, ParseOptions::jsonc()).unwrap();
 assert_eq!(document["port"].as_u64(), Some(8080));
 
 // The json5 preset also allows unquoted keys, single quotes, and extended numbers.
 let json5 = br#"{ name: 'tape', ratio: .5, mask: 0xFF }"#;
-let document = parse_with(json5, &ParseOptions::json5()).unwrap();
+let document = parse_with(json5, ParseOptions::json5()).unwrap();
 assert_eq!(document["name"].as_str(), Some("tape"));
 assert_eq!(document["mask"].as_u64(), Some(255));
 
@@ -104,13 +109,13 @@ let source = br#"{
   "port": 8080 // default
 }"#;
 let options = ParseOptions::json5().preserve_comments(true);
-let document = parse_with(source, &options).unwrap();
+let document = parse_with(source, options).unwrap();
 
 // Read the comments back off the tree.
 assert_eq!(document.leading_comments(0).next().unwrap().text(), " the service port");
 
 // Or serialize them back into place, byte for byte.
-let formatted = document.to_string_with(FormatOptions::pretty().with_comments(true));
+let formatted = document.to_json_string(FormatOptions::pretty().with_comments(true)).unwrap();
 assert_eq!(formatted.as_bytes(), source);
 ```
 
@@ -134,7 +139,7 @@ let source = br#"{ "name": "tape", "tags": ["json", "json5"],
 let document = parse(source).unwrap();
 
 let compact = document.to_string();
-let wrapped = document.to_string_with(FormatOptions::pretty_width(40));
+let wrapped = document.to_json_string(FormatOptions::pretty_width(40)).unwrap();
 ```
 
 `compact` carries no insignificant whitespace at all:
@@ -162,7 +167,7 @@ That is why `limits` breaks across lines here while `tags` and `ratios` stay inl
 
 ### Errors With a Location
 
-A syntax fault carries a byte offset, resolved to a line and column on demand:
+A syntax fault, or a document that a `ParseOptions` limit refuses, carries a byte offset, resolved to a line and column on demand:
 
 ```rust
 use jsontape::parse;
@@ -172,12 +177,31 @@ let source = br#"{
 }"#;
 let error = parse(source).unwrap_err();
 assert_eq!(error.to_string(), "unexpected byte at byte offset 9");
-
-let location = error.location(source).unwrap();
-assert_eq!((location.line, location.column), (2, 8));
+assert_eq!(error.location(source).unwrap().to_string(), "2:8");
 ```
 
 Line and column are computed only when asked for, so the common path of discarding the error costs nothing beyond the offset.
+`JsonError` separates the failures you would handle differently: `Syntax` for malformed input, `Limit` for well-formed input that a nesting, size, or duplicate-key limit refused, `SourceMismatch` for a view span resolved against the wrong bytes, and `Allocation` when the allocator refuses.
+It implements `core::error::Error` with or without `std`.
+
+### Failure Conventions
+
+Every operation answers "what if it doesn't work" the same way:
+
+- A read that can miss — an absent key, an index past the end, the wrong kind — returns `Option`, and `None` never means that something broke.
+- Brackets never panic: `document["a"]["b"][0]` is a `Slot`, empty on a miss, so its accessors return `None` and its predicates `false`, while `exists()` tells a miss from an explicit `null`.
+- Anything that allocates or validates returns `Result<_, JsonError>`: parsing, `to_json_string`, `clone_in`, `ArrayBody::push`, and `ObjectBody::insert`.
+- A removal returns the removed value, and mutating the wrong kind is impossible, because `as_array_mut` and `as_object_mut` hand out a typed body or `None`.
+- Documents implement no `Clone`, `FromIterator`, or `FromStr`, whose signatures cannot report a failed allocation; `clone_in` and the `parse*` functions are the fallible paths, and `From<String>` adopts the buffer without copying.
+
+A few exceptions are deliberate:
+
+- `Display` stays, so std's blanket `to_string()` aborts on a global-heap OOM like any other `String` growth; `to_json_string` reports `JsonError::Allocation` instead.
+- `Json` dereferences to `Slot` although it is not a smart pointer, against the API guidelines' C-DEREF, because that is what defines every accessor once and keeps brackets working.
+  Two spellings follow from it: accessors are `Slot` methods, so `.and_then(Json::as_u64)` becomes `.and_then(|value| value.as_u64())`.
+  `Slot` has no `Display` or `Serialize` either, since a miss has no JSON form, so print or serialize `document["a"].value()` instead.
+- The parser keeps a few frame invariants as `expect`s that no input can reach, which the fuzzer checks.
+- Three small `unsafe` helpers remain: one for the still-unstable `Box::try_new_in`; the cast from `&[Json]` to the `repr(transparent)` `Slot`, the same pattern as `Path` over `OsStr`, whose tests run under Miri; and `JsonString::as_str`, which skips re-validating UTF-8 that every constructor already checked.
 
 ### Lossless Numbers
 
@@ -197,7 +221,7 @@ Enable the `serde` feature for `Serialize` and `Deserialize`, plus `to_value` an
 ## Where It Wins
 
 JsonTape is positioned on its memory model and safety, not on raw SIMD throughput.
-It suits embedded and `no_std` targets, where `serde_json`'s `Value` cannot follow and SIMD parsers need `std`; WASM and the edge, being small, dependency-free beyond the allocator shim, and deterministic; blockchain and financial work, where amounts must not silently round; and per-request arenas, where a payload is parsed, read, and reclaimed in one step.
+It suits embedded and `no_std` targets, where `serde_json`'s `Value` cannot follow and SIMD parsers need `std`; WASM and the edge, being small, dependency-free, and deterministic; blockchain and financial work, where amounts must not silently round; and per-request arenas, where a payload is parsed, read, and reclaimed in one step.
 
 A blunt, honest comparison, where ● is first-class, ◐ is partial or behind a feature, and ○ is unsupported:
 
@@ -249,13 +273,13 @@ Because `reset` takes `&mut self` and every allocation borrows the arena with `&
 
 Even in lenient mode the scanner stays strict about what it accepts and re-emits.
 Unescaped control characters, invalid `\u` escapes, and lone surrogates are always rejected, and surrogate pairs are combined.
+Invalid UTF-8 is rejected wherever it appears, comments included.
 A leading UTF-8 byte order mark is rejected rather than skipped — RFC 8259 §8.1 permits either choice, but plenty of tools emit one, so strip it before parsing if your input may carry it.
 
 The default nesting limit of 128 bounds the stack, but note where the bound comes from: parsing is iterative over an explicit frame stack and never recurses, so it is dropping, formatting, and comparing a document that recurse.
 Raising `max_depth` far above the default therefore moves the risk out of the parser and into those operations.
 
-JsonTape implements the widely-used JSON5 extensions as `ParseOptions` flags under the `strict`, `jsonc`, and `json5` presets:
-line and block comments, trailing commas, unquoted keys, single-quoted strings, hexadecimal integers, a leading plus, leading and trailing decimal points, and the `Infinity` and `NaN` literals.
+JsonTape implements the widely-used JSON5 extensions as `ParseOptions` flags under the `strict`, `jsonc`, and `json5` presets: line and block comments, trailing commas, unquoted keys, single-quoted strings, hexadecimal integers, a leading plus, leading and trailing decimal points, and the `Infinity` and `NaN` literals.
 The extended string escapes — `\'`, `\v`, `\0`, `\xHH`, and backslash-newline line continuations — do not have a flag of their own; they ride on `allow_single_quotes`, so enabling that also accepts them inside double-quoted strings.
 
 A few edges are deliberately out of scope, so the crate stays a single strict-scanner file:
